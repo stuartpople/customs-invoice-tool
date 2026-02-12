@@ -17,7 +17,6 @@ out/
 
 # IDE files
 .idea/
-.vscode/settings.json.user
 *.swp
 *.swo
 *~

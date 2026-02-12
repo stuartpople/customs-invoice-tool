@@ -86,7 +86,7 @@ Create a `.vscode/settings.json` file in the project root with recommended setti
   "editor.formatOnSave": true,
   "editor.defaultFormatter": "esbenp.prettier-vscode",
   "editor.codeActionsOnSave": {
-    "source.fixAll.eslint": true
+    "source.fixAll.eslint": "explicit"
   },
   "files.autoSave": "onFocusChange",
   "editor.tabSize": 2,
