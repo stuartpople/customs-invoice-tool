@@ -1,0 +1,12 @@
+{
+  "recommendations": [
+    "dbaeumer.vscode-eslint",
+    "esbenp.prettier-vscode",
+    "eamodio.gitlens",
+    "ritwickdey.LiveServer",
+    "christian-kohler.path-intellisense",
+    "xabikos.JavaScriptSnippets",
+    "streetsidesoftware.code-spell-checker",
+    "ms-vscode.vscode-typescript-next"
+  ]
+}
