@@ -131,7 +131,9 @@ st.header("📋 Step 1: Job Setup")
 col1, col2 = st.columns(2)
 
 with col1:
-    # Username captured automatically from system`n    username = st.session_state.username`n    st.info(f" Logged in as: **{username}**")
+    # Username captured automatically from system
+    username = st.session_state.username
+    st.info(f"👤 Logged in as: **{username}**")
     
     direction = st.selectbox(
         "Trade Direction",
