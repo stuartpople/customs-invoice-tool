@@ -80,7 +80,12 @@ if 'current_job_id' not in st.session_state:
 if 'processing_started' not in st.session_state:
     st.session_state.processing_started = False
 if 'username' not in st.session_state:
-    st.session_state.username = ""
+    import getpass
+    import os
+    try:
+        st.session_state.username = getpass.getuser()
+    except:
+        st.session_state.username = os.getenv('USERNAME', os.getenv('USER', 'System User'))
 if 'non_pdf_processed' not in st.session_state:
     st.session_state.non_pdf_processed = False
 if 'line_items' not in st.session_state:
@@ -126,13 +131,7 @@ st.header("📋 Step 1: Job Setup")
 col1, col2 = st.columns(2)
 
 with col1:
-    username = st.text_input(
-        "Username *",
-        value=st.session_state.username,
-        placeholder="Your name (required)",
-        help="Required for audit trail"
-    )
-    st.session_state.username = username
+    # Username captured automatically from system`n    username = st.session_state.username`n    st.info(f" Logged in as: **{username}**")
     
     direction = st.selectbox(
         "Trade Direction",
@@ -1113,3 +1112,6 @@ with st.sidebar:
 
 st.divider()
 st.caption("💡 **Stable Edition Features:** Page-by-page processing | Resumable jobs | Graceful failure handling | No connection timeouts")
+
+
+
