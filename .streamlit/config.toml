@@ -1,0 +1,16 @@
+[server]
+maxUploadSize = 200
+maxMessageSize = 200
+enableXsrfProtection = false
+enableWebsocketCompression = false
+fileWatcherType = "poll"
+
+[runner]
+fastReruns = false
+
+[browser]
+gatherUsageStats = false
+
+[client]
+# Prevent disconnection during long operations
+toolbarMode = "minimal"
