@@ -5,15 +5,124 @@ Handles timeouts and failures gracefully - never blocks the UI
 import os
 import json
 import time
+import re
 import fitz  # PyMuPDF
 from pathlib import Path
 from datetime import datetime
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 import pytesseract
 from PIL import Image
+import numpy as np
 import io
 import threading
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
+
+# Auto-detect Tesseract in local .tesseract folder or use environment variable
+def _setup_tesseract():
+    """Configure pytesseract to find tesseract executable"""
+    # Try local installation first
+    local_tesseract = Path(__file__).parent / ".tesseract" / "tesseract.exe"
+    if local_tesseract.exists():
+        pytesseract.pytesseract.tesseract_cmd = str(local_tesseract)
+        return
+    
+    # Try .env file
+    env_file = Path(__file__).parent / ".env"
+    if env_file.exists():
+        with open(env_file, 'r') as f:
+            for line in f:
+                if line.strip().startswith('TESSERACT_CMD='):
+                    tess_path = line.split('=', 1)[1].strip()
+                    if tess_path and Path(tess_path).exists():
+                        pytesseract.pytesseract.tesseract_cmd = tess_path
+                        return
+    
+    # Try environment variable
+    env_tesseract = os.getenv('TESSERACT_CMD')
+    if env_tesseract and Path(env_tesseract).exists():
+        pytesseract.pytesseract.tesseract_cmd = env_tesseract
+        return
+
+_setup_tesseract()
+
+
+def _detect_skew_angle(image: Image.Image, max_angle: float = 5.0) -> float:
+    """
+    Detect the skew angle of a scanned document using projection profiles.
+    
+    Rotates a small binarized copy at candidate angles and picks the angle
+    where horizontal text lines align best (maximum variance of row sums).
+    Typically completes in < 1s per page.
+    
+    Returns:
+        Detected skew angle in degrees (positive = counter-clockwise)
+    """
+    gray = image.convert('L')
+    
+    # Aggressive downscale to ~400px on longest side for speed
+    w, h = gray.size
+    target = 400
+    if max(w, h) > target:
+        scale = target / max(w, h)
+        gray = gray.resize((int(w * scale), int(h * scale)), Image.BILINEAR)
+    
+    arr = np.array(gray)
+    threshold = np.mean(arr)
+    binary_img = Image.fromarray(((arr < threshold) * 255).astype(np.uint8))
+    
+    def score_angle(angle):
+        rotated = binary_img.rotate(angle, expand=False, fillcolor=0)
+        rot_arr = np.array(rotated)
+        bh, bw = rot_arr.shape
+        # Crop centre 60% to avoid rotation edge artefacts
+        y1, y2 = bh // 5, bh * 4 // 5
+        row_sums = np.sum(rot_arr[y1:y2, :], axis=1)
+        return np.var(row_sums)
+    
+    best_angle = 0.0
+    best_score = -1.0
+    
+    # Pass 1: Coarse search (-5° to +5°, step 0.5°)
+    for a in np.arange(-max_angle, max_angle + 0.5, 0.5):
+        s = score_angle(a)
+        if s > best_score:
+            best_score = s
+            best_angle = a
+    
+    # Pass 2: Fine search (±0.5°, step 0.1°)
+    for a in np.arange(best_angle - 0.5, best_angle + 0.55, 0.1):
+        s = score_angle(a)
+        if s > best_score:
+            best_score = s
+            best_angle = a
+    
+    # Pass 3: Ultra-fine (±0.1°, step 0.02°)
+    for a in np.arange(best_angle - 0.1, best_angle + 0.12, 0.02):
+        s = score_angle(a)
+        if s > best_score:
+            best_score = s
+            best_angle = a
+    
+    return round(best_angle, 2)
+
+
+def deskew_image(image: Image.Image, max_angle: float = 5.0) -> Tuple[Image.Image, float]:
+    """
+    Detect and correct skew in a scanned document image.
+    
+    Returns:
+        Tuple of (corrected PIL Image, detected angle in degrees).
+        Returns the original image unchanged if skew is negligible (< 0.2°).
+    """
+    angle = _detect_skew_angle(image, max_angle=max_angle)
+    
+    if abs(angle) < 0.2:
+        return image, 0.0
+    
+    corrected = image.rotate(angle, expand=True,
+                             fillcolor=(255, 255, 255),
+                             resample=Image.BICUBIC)
+    return corrected, angle
 
 
 class TimeoutException(Exception):
@@ -89,7 +198,7 @@ class JobProcessor:
     
     def convert_pdf_to_images(self, job_id: str, pdf_path: str, dpi: int = 200) -> int:
         """
-        Convert PDF pages to PNG images using PyMuPDF
+        Convert PDF pages to PNG images using PyMuPDF with auto-rotation
         
         Returns:
             Number of pages converted
@@ -105,9 +214,18 @@ class JobProcessor:
         for page_num in range(total_pages):
             page = doc[page_num]
             
-            # Render page as pixmap at specified DPI
+            # Get page rotation and normalize to 0 degrees
+            rotation = page.rotation
+            
+            # Render page as pixmap at specified DPI with rotation correction
             zoom = dpi / 72  # PDF is 72 DPI by default
             mat = fitz.Matrix(zoom, zoom)
+            
+            # Apply rotation correction if page is rotated
+            if rotation != 0:
+                # Rotate to 0 degrees for proper OCR
+                mat = mat.prerotate(-rotation)
+            
             pix = page.get_pixmap(matrix=mat)
             
             # Save as PNG
@@ -126,7 +244,7 @@ class JobProcessor:
         return total_pages
     
     def extract_page_text(self, job_id: str, page_num: int, pdf_path: str, 
-                         ocr_timeout: int = 8, retry_dpi: int = 150) -> Dict:
+                         ocr_timeout: int = 15, retry_dpi: int = 150) -> Dict:
         """
         Extract text from a single page with fallback strategies
         
@@ -160,22 +278,53 @@ class JobProcessor:
             embedded_text = page.get_text("text").strip()
             doc.close()
             
-            # Check if we got meaningful text (>50 chars)
-            if len(embedded_text) > 50:
+            # Check if we got meaningful text (>50 chars) AND no corrupt chars
+            # Some PDFs have fonts that map price digits to Tamil Unicode block
+            # (U+0B00-U+0BFF) – e.g. ௗ (U+0BD7) instead of actual numbers.
+            # In that case, fall through to OCR which reads the rendered glyphs.
+            has_corrupt_chars = any(0x0B00 <= ord(c) <= 0x0BFF for c in embedded_text)
+            
+            if len(embedded_text) > 50 and not has_corrupt_chars:
                 result["status"] = "success"
                 result["method"] = "embedded"
                 result["text"] = embedded_text
                 result["processing_time"] = time.time() - start_time
                 return result
+            elif has_corrupt_chars:
+                result["error"] = "Embedded text has corrupt Unicode (Tamil block) – falling through to OCR"
         except Exception as e:
             result["error"] = f"Embedded extraction failed: {str(e)}"
         
-        # Strategy 2: Try OCR at standard DPI with timeout
+        # Strategy 2: Try OCR at standard DPI with timeout and auto-rotation
         if page_image_path.exists():
             try:
                 def run_ocr():
                     image = Image.open(page_image_path)
-                    return pytesseract.image_to_string(image).strip()
+                    
+                    # Try to detect and correct rotation using Tesseract OSD
+                    try:
+                        osd = pytesseract.image_to_osd(image)
+                        rotation_match = re.search(r'Rotate: (\d+)', osd)
+                        if rotation_match:
+                            rotation_angle = int(rotation_match.group(1))
+                            if rotation_angle != 0:
+                                # Rotate image to correct orientation
+                                image = image.rotate(-rotation_angle, expand=True)
+                    except:
+                        # If OSD fails, try all 4 orientations and pick best
+                        pass
+                    
+                    # Deskew: correct slight skew from scanning
+                    try:
+                        image, skew_angle = deskew_image(image)
+                        if abs(skew_angle) >= 0.2:
+                            # Save the deskewed image back so the UI shows it corrected
+                            image.save(str(page_image_path))
+                    except Exception:
+                        pass  # deskew is best-effort, never block OCR
+                    
+                    # Use PSM 6 (uniform block) to better preserve table layout
+                    return pytesseract.image_to_string(image, config='--psm 6').strip()
                 
                 # Use ThreadPoolExecutor for timeout (thread-safe)
                 with ThreadPoolExecutor(max_workers=1) as executor:
@@ -193,16 +342,28 @@ class JobProcessor:
                         result["error"] = f"OCR timeout at 200 DPI after {ocr_timeout}s"
                         future.cancel()
             except Exception as e:
-                result["error"] = f"OCR failed: {str(e)}"
+                error_msg = str(e)
+                if "tesseract is not installed" in error_msg.lower() or "not in your path" in error_msg.lower():
+                    result["error"] = "Tesseract OCR not found. See INSTALL_TESSERACT.md for setup instructions."
+                else:
+                    result["error"] = f"OCR failed: {error_msg}"
         
-        # Strategy 3: Retry OCR at lower DPI
+        # Strategy 3: Retry OCR at lower DPI with rotation correction
         try:
             def run_ocr_retry():
-                # Re-render page at lower DPI
+                # Re-render page at lower DPI with rotation correction
                 doc = fitz.open(pdf_path)
                 page = doc[page_num - 1]
+                
+                # Get page rotation from PDF metadata and correct it
+                rotation = page.rotation
                 zoom = retry_dpi / 72
                 mat = fitz.Matrix(zoom, zoom)
+                
+                # Apply rotation correction if needed
+                if rotation != 0:
+                    mat = mat.prerotate(-rotation)
+                
                 pix = page.get_pixmap(matrix=mat)
                 
                 # Convert to PIL Image
@@ -210,7 +371,27 @@ class JobProcessor:
                 image = Image.open(io.BytesIO(img_bytes))
                 doc.close()
                 
-                return pytesseract.image_to_string(image).strip()
+                # Try to detect and correct rotation using Tesseract OSD
+                try:
+                    osd = pytesseract.image_to_osd(image)
+                    rotation_match = re.search(r'Rotate: (\d+)', osd)
+                    if rotation_match:
+                        rotation_angle = int(rotation_match.group(1))
+                        if rotation_angle != 0:
+                            # Rotate image to correct orientation
+                            image = image.rotate(-rotation_angle, expand=True)
+                except:
+                    # If OSD fails, continue with current orientation
+                    pass
+                
+                # Deskew: correct slight skew from scanning
+                try:
+                    image, _ = deskew_image(image)
+                except Exception:
+                    pass  # deskew is best-effort
+                
+                # Use PSM 6 (uniform block) to better preserve table layout
+                return pytesseract.image_to_string(image, config='--psm 6').strip()
             
             # Use ThreadPoolExecutor for timeout (thread-safe)
             with ThreadPoolExecutor(max_workers=1) as executor:
@@ -228,7 +409,11 @@ class JobProcessor:
                     result["error"] = f"Retry OCR timeout after {ocr_timeout}s"
                     future.cancel()
         except Exception as e:
-            result["error"] = f"Retry OCR failed: {str(e)}"
+            error_msg = str(e)
+            if "tesseract is not installed" in error_msg.lower() or "not in your path" in error_msg.lower():
+                result["error"] = "Tesseract OCR not found. See INSTALL_TESSERACT.md for setup instructions."
+            else:
+                result["error"] = f"Retry OCR failed: {error_msg}"
         
         # All strategies failed
         result["status"] = "OCR_FAILED"
@@ -333,3 +518,48 @@ class JobProcessor:
         if not self.jobs_dir.exists():
             return []
         return [d.name for d in self.jobs_dir.iterdir() if d.is_dir()]
+
+    def reprocess_ocr(self, job_id: str):
+        """
+        Re-run OCR on all pages of an existing job.
+        Clears pages.json and re-extracts text (with deskewing).
+        Images are preserved; only the OCR text is regenerated.
+        """
+        job_dir = self.get_job_dir(job_id)
+        metadata = self.get_job_metadata(job_id)
+        pdf_path = metadata.get('pdf_path', '')
+        total_pages = metadata.get('total_pages', 0)
+
+        if not pdf_path or total_pages == 0:
+            raise ValueError(f"Job {job_id} has no PDF path or page count")
+
+        pages_json_path = job_dir / "pages.json"
+
+        # Reset
+        pages_data = {"pages": []}
+        self.update_job_metadata(job_id, {
+            "status": "processing",
+            "progress": 0,
+            "pages_processed": 0
+        })
+
+        for page_num in range(1, total_pages + 1):
+            page_result = self.extract_page_text(job_id, page_num, pdf_path)
+            pages_data["pages"].append(page_result)
+
+            # Save every 5 pages
+            if page_num % 5 == 0 or page_num == total_pages:
+                with open(pages_json_path, "w") as f:
+                    json.dump(pages_data, f, indent=2)
+
+            progress = page_num / total_pages * 100
+            self.update_job_metadata(job_id, {
+                "progress": round(progress, 1),
+                "pages_processed": page_num
+            })
+
+        self.update_job_metadata(job_id, {
+            "status": "completed",
+            "completed_at": datetime.now().isoformat(),
+            "progress": 100.0
+        })

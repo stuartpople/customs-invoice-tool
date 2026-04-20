@@ -4,6 +4,7 @@ Creates comprehensive exports with document codes in separate columns
 """
 import pandas as pd
 from openpyxl import Workbook
+from openpyxl.comments import Comment
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils.dataframe import dataframe_to_rows
 from pathlib import Path
@@ -174,8 +175,7 @@ def create_comprehensive_export(
             'Currency',
             'Net Weight (kg)',
             'Gross Weight (kg)',
-            'Country of Destination',
-            'CPC Code'
+            'Country of Origin'
         ]
         
         # Add HMRC columns if data available
@@ -207,7 +207,6 @@ def create_comprehensive_export(
         
         if hmrc_data:
             base_headers.extend([
-                'Preference Code',
                 'CPC Code',
                 'Valuation Method',
                 'VAT Rate',
@@ -289,6 +288,13 @@ def create_comprehensive_export(
             if not description:
                 description = first_item.get('description', '')
             
+            # Collect review notes from any item in the group
+            review_notes = []
+            for gi in group_items:
+                rn = gi.get('review_notes', '')
+                if rn and rn not in review_notes:
+                    review_notes.append(rn)
+
             row_data = {
                 'Description': description,
                 'Commodity Code': commodity_code,
@@ -298,7 +304,8 @@ def create_comprehensive_export(
                 'Currency': first_item.get('currency', 'GBP'),
                 'Weight': total_weight,
                 'Gross Weight': _calculate_gross_weight(total_weight, group_items),
-                'Country': ', '.join(countries) if countries else first_item.get('country_of_origin', '')
+                'Country': ', '.join(countries) if countries else first_item.get('country_of_origin', ''),
+                '_review_notes': '; '.join(review_notes) if review_notes else ''
             }
             
             _write_row(ws, row_num, row_data, hmrc_data.get(commodity_code) if hmrc_data else None, 
@@ -326,7 +333,8 @@ def create_comprehensive_export(
                 'Currency': item.get('currency', 'GBP'),
                 'Weight': net_wt,
                 'Gross Weight': gross_wt,
-                'Country': item.get('country_of_origin', '')
+                'Country': item.get('country_of_origin', ''),
+                '_review_notes': item.get('review_notes', '')
             }
             
             _write_row(ws, row_num, row_data, hmrc_data.get(commodity_code) if hmrc_data else None,
@@ -335,34 +343,34 @@ def create_comprehensive_export(
     
     # Adjust column widths
     column_widths = {
-        'A': 40,  # Description
-        'B': 15,  # Commodity Code
+        'A': 18,  # Commodity Code
+        'B': 40,  # Description
         'C': 12,  # Quantity
         'D': 8,   # UOM
         'E': 12,  # Value
         'F': 10,  # Currency
-        'G': 15,  # Weight
-        'H': 20,  # Country
+        'G': 15,  # Net Weight
+        'H': 15,  # Gross Weight
+        'I': 20,  # Country
     }
     
-    # HMRC columns
+    # HMRC columns (start at J for both directions)
     if hmrc_data:
         if direction == 'export':
             column_widths.update({
-                'I': 20,   # Supp Units
-                'J': 12,   # Doc Code 1
-                'K': 50,   # Doc Code 1 Req
-                'L': 12,   # Doc Code 2
-                'M': 50,   # Doc Code 2 Req
-                'N': 12,   # Doc Code 3
-                'O': 50,   # Doc Code 3 Req
-                'P': 12,   # Doc Code 4
-                'Q': 50,   # Doc Code 4 Req
-                'R': 40,   # Notes
+                'J': 20,   # Supp Units
+                'K': 12,   # Doc Code 1
+                'L': 50,   # Doc Code 1 Req
+                'M': 12,   # Doc Code 2
+                'N': 50,   # Doc Code 2 Req
+                'O': 12,   # Doc Code 3
+                'P': 50,   # Doc Code 3 Req
+                'Q': 12,   # Doc Code 4
+                'R': 50,   # Doc Code 4 Req
+                'S': 40,   # Notes
             })
         else:
             column_widths.update({
-                'I': 12,   # Preference Code
                 'J': 12,   # CPC Code
                 'K': 15,   # Valuation Method
                 'L': 15,   # VAT
@@ -398,7 +406,15 @@ def _write_row(ws, row_num: int, row_data: Dict, hmrc_info: Optional[Dict],
     metadata = metadata or {}
     
     # Write base columns (Commodity Code first, then Description)
-    ws.cell(row=row_num, column=1).value = row_data.get('Commodity Code', '')
+    cc_cell = ws.cell(row=row_num, column=1)
+    cc_cell.value = row_data.get('Commodity Code', '')
+
+    # Highlight and add comment if review notes exist
+    review_notes = row_data.get('_review_notes', '')
+    if review_notes:
+        cc_cell.fill = PatternFill(start_color='FFFF00', end_color='FFFF00', fill_type='solid')
+        cc_cell.comment = Comment(review_notes, 'Auto-Review')
+
     ws.cell(row=row_num, column=2).value = row_data.get('Description', '')
     ws.cell(row=row_num, column=3).value = row_data.get('Quantity', '')
     ws.cell(row=row_num, column=4).value = row_data.get('UOM', '')
@@ -408,10 +424,9 @@ def _write_row(ws, row_num: int, row_data: Dict, hmrc_info: Optional[Dict],
     
     col_num = 8
     
-    # For imports, add gross weight column
-    if direction == 'import':
-        ws.cell(row=row_num, column=col_num).value = row_data.get('Gross Weight', '')
-        col_num += 1
+    # Gross weight column (both import and export)
+    ws.cell(row=row_num, column=col_num).value = row_data.get('Gross Weight', '')
+    col_num += 1
     
     ws.cell(row=row_num, column=col_num).value = row_data.get('Country', '')
     col_num += 1
@@ -422,7 +437,7 @@ def _write_row(ws, row_num: int, row_data: Dict, hmrc_info: Optional[Dict],
     if hmrc_info and 'error' not in hmrc_info:
         if direction == 'export':
             # Supplementary units
-            supp_units = hmrc_info.get('supplementary_units', 'Not required')
+            supp_units = hmrc_info.get('supplementary_units') or 'N/A'
             ws.cell(row=row_num, column=col_num).value = supp_units
             col_num += 1
             
@@ -465,11 +480,6 @@ def _write_row(ws, row_num: int, row_data: Dict, hmrc_info: Optional[Dict],
             ws.cell(row=row_num, column=col_num).value = '; '.join(notes) if notes else ''
             
         else:  # import
-            # Preference Code (from HMRC API)
-            pref_code = hmrc_info.get('preference_code', '100')
-            ws.cell(row=row_num, column=col_num).value = pref_code
-            col_num += 1
-            
             # CPC Code (Customs Procedure Code)
             cpc_code = metadata.get('cpc_code', '4000')
             ws.cell(row=row_num, column=col_num).value = cpc_code
@@ -489,7 +499,7 @@ def _write_row(ws, row_num: int, row_data: Dict, hmrc_info: Optional[Dict],
             col_num += 1
             
             # Supplementary units
-            supp_units = hmrc_info.get('supplementary_units', 'Not required')
+            supp_units = hmrc_info.get('supplementary_units') or 'N/A'
             ws.cell(row=row_num, column=col_num).value = supp_units
             col_num += 1
             
@@ -523,10 +533,6 @@ def _write_row(ws, row_num: int, row_data: Dict, hmrc_info: Optional[Dict],
             notes = []
             if len(doc_codes) > 3:
                 notes.append(f"More doc codes: {', '.join(list(doc_codes.keys())[3:])}")
-            
-            pref_duties = hmrc_info.get('preferential_duty', {})
-            if pref_duties:
-                notes.append(f"Pref. rates available")
             
             ws.cell(row=row_num, column=col_num).value = '; '.join(notes) if notes else ''
     

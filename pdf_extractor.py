@@ -211,7 +211,8 @@ def parse_line_items(text: str, trade_direction: str = "export") -> List[Dict]:
     value_patterns = [
         r'(?:amount|total|value|price|unit\s*price|cost)[\s:]*[£$€¥]?\s*(\d+[,\d]*\.?\d+)',
         r'[£$€¥]\s*(\d+[,\d]*\.?\d+)',
-        r'\b(\d+\.\d{2})\b(?!\s*(?:kg|g|mm|cm|m|ea|pcs))',
+        r'(?<![,\d])(\d{1,3}(?:,\d{3})+\.\d{2})\b(?!\s*(?:kg|g|mm|cm|m|ea|pcs))',  # Comma-separated: 22,025.00
+        r'\b(\d+\.\d{2})\b(?!\s*(?:kg|g|mm|cm|m|ea|pcs))',  # Simple decimal: 195.00
     ]
     
     # Weight patterns (net weight)
@@ -232,13 +233,16 @@ def parse_line_items(text: str, trade_direction: str = "export") -> List[Dict]:
         line_lower = line.lower()
         
         # Look for explicit HS code declarations
+        # Supports: "HS Code", "HS Export Code", "HS Import Code", "Commodity Code", "HTS Code"
+        # Supports dotted format: 9015.80.8080 or plain digits: 90158080
         hs_code_match = re.search(
-            r'(?:hs\s*export\s*code|hs\s*import\s*code|hs\s*code|commodity\s*code)[\s:]*(\d{6,10})',
+            r'(?:hts\s*code|hs\s*export\s*code|hs\s*import\s*code|hs\s*code|commodity\s*code)[\s:]*(\d[\d.]{5,13})',
             line, re.IGNORECASE
         )
         
         if hs_code_match:
-            hs_code = hs_code_match.group(1)
+            # Strip dots from HS code (e.g. 9015.80.8080 -> 9015808080)
+            hs_code = hs_code_match.group(1).replace('.', '')
             
             # Pad to appropriate length
             if len(hs_code) == 6:
@@ -247,29 +251,76 @@ def parse_line_items(text: str, trade_direction: str = "export") -> List[Dict]:
                 hs_code = hs_code + "00" if pad_to_10 else hs_code
             elif len(hs_code) == 7:
                 hs_code = hs_code + ("000" if pad_to_10 else "0")
+            # 10-digit codes (e.g. HTS 9015.80.8080) - truncate to 8 for exports
+            elif len(hs_code) == 10 and not pad_to_10:
+                hs_code = hs_code[:8]
             
-            # Extract description from line BEFORE HS code (proven approach)
+            # Detect HTS-style format (description comes AFTER HS code, not before)
+            # Pattern: HTS Code -> Goods Manufactured in -> ECCN -> Description Line # X.Y
+            is_hts_format = bool(re.search(r'hts\s*code', line, re.IGNORECASE))
+            
+            # Extract description
             description = None
+            country_origin_forward = None
             
-            # Look 1-3 lines back for description
-            for j in range(1, 4):
-                if i - j >= 0:
-                    prev_line = lines[i - j].strip()
-                    # Valid description: not empty, has substance
-                    if prev_line and len(prev_line) > 5:
-                        # Skip only if it's JUST a header keyword (not part of description)
-                        # Header patterns: "Item No:", "Order No", "Shipment:", "Page 1", but NOT "Item Description Text"
-                        if re.match(r'^\s*(?:item\s*no|item\s*number|item\s*#|order\s*no|shipment\s*no|page\s*\d+)', prev_line, re.IGNORECASE):
-                            continue  # This is a header, try previous line
-                        # Also skip if it's the HS code itself from a multi-line pattern
-                        if re.match(r'^\s*hs[.\s]*(export|import)?\s*code', prev_line, re.IGNORECASE):
+            if is_hts_format:
+                # HTS format: look FORWARD for description (3-6 lines ahead)
+                # Structure: HTS Code / Goods Manufactured in / ECCN / Description Line # X.Y / Product Code / Serial / Qty Price
+                for j in range(1, 8):
+                    if i + j >= len(lines):
+                        break
+                    fwd_line = lines[i + j].strip()
+                    # Stop if we hit another HTS Code
+                    if re.search(r'hts\s*code', fwd_line, re.IGNORECASE):
+                        break
+                    # Extract country of origin from "Goods Manufactured in: XX"
+                    mfg_match = re.search(r'(?:goods\s*)?manufactured\s*in[\s:]*([a-z]+)', fwd_line, re.IGNORECASE)
+                    if mfg_match:
+                        country_origin_forward = mfg_match.group(1).upper()
+                        continue
+                    # Skip ECCN line
+                    if re.match(r'^\s*ECCN[\s:]', fwd_line, re.IGNORECASE):
+                        continue
+                    # Look for the description line (has "Line #" reference or is substantial text)
+                    if fwd_line and len(fwd_line) > 5:
+                        # Skip serial numbers, product codes (short alphanumeric), and empty-ish lines
+                        if re.match(r'^\s*(?:serial\s*numbers?|s/n)[\s:]', fwd_line, re.IGNORECASE):
                             continue
-                        # Valid description found
-                        # Extract description (may include part number)
-                        parts = prev_line.split()
-                        if len(parts) >= 1:
-                            description = ' '.join(parts[:min(len(parts), 12)])
-                            break
+                        # Description line often contains "Line # X.Y"
+                        line_ref = re.search(r'\s*Line\s*#\s*[\d.]+', fwd_line, re.IGNORECASE)
+                        if line_ref:
+                            desc_text = fwd_line[:line_ref.start()].strip()
+                            # Remove leading "oo - " or "pho - " artifacts from OCR
+                            desc_text = re.sub(r'^(?:oo|pho)\s*-\s*', '', desc_text, flags=re.IGNORECASE)
+                            if desc_text and len(desc_text) > 3:
+                                description = desc_text[:120]
+                                break
+                        # If it's a substantial line that's not a number/code, use it as description
+                        elif not re.match(r'^[\d.\-/]+$', fwd_line) and len(fwd_line) > 10:
+                            # Remove OCR artifacts
+                            desc_text = re.sub(r'^(?:oo|pho)\s*-\s*', '', fwd_line, flags=re.IGNORECASE)
+                            if desc_text and len(desc_text) > 3:
+                                description = desc_text[:120]
+                                break
+            
+            if not description:
+                # Standard format: look 1-3 lines BACK for description
+                for j in range(1, 4):
+                    if i - j >= 0:
+                        prev_line = lines[i - j].strip()
+                        # Valid description: not empty, has substance
+                        if prev_line and len(prev_line) > 5:
+                            # Skip only if it's JUST a header keyword (not part of description)
+                            if re.match(r'^\s*(?:item\s*no|item\s*number|item\s*#|order\s*no|shipment\s*no|page\s*\d+)', prev_line, re.IGNORECASE):
+                                continue
+                            # Also skip if it's the HS/HTS code itself from a multi-line pattern
+                            if re.match(r'^\s*(?:hs|hts)[.\s]*(export|import)?\s*code', prev_line, re.IGNORECASE):
+                                continue
+                            # Valid description found
+                            parts = prev_line.split()
+                            if len(parts) >= 1:
+                                description = ' '.join(parts[:min(len(parts), 12)])
+                                break
             
             if not description:
                 # Last resort: try to extract from same line before "HS"
@@ -279,30 +330,61 @@ def parse_line_items(text: str, trade_direction: str = "export") -> List[Dict]:
                 else:
                     continue  # Skip items without description
             
-            # Build context from current line and the next 2 lines only (avoid mixing items)
-            context_lines = [line]  # Current line with HS code
-            for j in range(1, 3):  # Next 2 lines (usually contain qty, value, weight)
+            # Build context from current line and following lines (avoid mixing items)
+            # HTS format needs more context lines (description + serial + qty/price are further down)
+            context_range = 8 if is_hts_format else 3
+            context_lines = []
+            for j in range(0 if not is_hts_format else 1, context_range):
                 if i + j < len(lines):
                     next_line = lines[i + j].strip()
-                    # Stop if we hit another HS code or empty multi-line gap
-                    if re.search(r'hs\s*(?:export|import)?\s*code', next_line, re.IGNORECASE):
+                    # Stop if we hit another HS/HTS code or empty multi-line gap
+                    if j > 0 and re.search(r'(?:hts|hs)\s*(?:export|import)?\s*code', next_line, re.IGNORECASE):
                         break
+                    # Stop at totals/subtotals to avoid picking up invoice total as item value
+                    if re.search(r'(?:sub-?\s*total|^total|grand\s*total)', next_line, re.IGNORECASE):
+                        break
+                    # For HTS format, skip metadata lines (Goods Manufactured, ECCN)
+                    if is_hts_format:
+                        if re.match(r'^\s*(?:goods\s*)?manufactured\s*in', next_line, re.IGNORECASE):
+                            continue
+                        if re.match(r'^\s*ECCN[\s:]', next_line, re.IGNORECASE):
+                            continue
                     context_lines.append(next_line)
+                else:
+                    break
+            if not context_lines and not is_hts_format:
+                context_lines = [line]
             context = ' '.join(context_lines)
             
             # Extract quantity and unit
             quantity = ""
             uom = "pcs"
-            for pattern in qty_patterns:
-                match = re.search(pattern, context, re.IGNORECASE)
-                if match:
+            
+            if is_hts_format:
+                # HTS format: data line has "<serial/code> <qty> <unit_price> <extended_price>"
+                # Key: qty is an integer, prices have decimal points (e.g. 22,025.00)
+                # Use pattern that requires prices to have .dd format to avoid serial confusion
+                hts_qty_match = re.search(
+                    r'(?:^|\s)(\d{1,4})\s+[\$]?[\d,]+\.\d{2}\s+[\$]?[\d,]+\.\d{2}',
+                    context
+                )
+                if hts_qty_match:
                     try:
-                        quantity = str(int(float(match.group(1))))
-                        if len(match.groups()) > 1 and match.group(2):
-                            uom = match.group(2).lower()
-                    except (ValueError, IndexError):
+                        quantity = str(int(hts_qty_match.group(1)))
+                    except ValueError:
                         pass
-                    break
+            
+            if not quantity:
+                for pattern in qty_patterns:
+                    match = re.search(pattern, context, re.IGNORECASE)
+                    if match:
+                        try:
+                            quantity = str(int(float(match.group(1))))
+                            if len(match.groups()) > 1 and match.group(2):
+                                uom = match.group(2).lower()
+                        except (ValueError, IndexError):
+                            pass
+                        break
             
             # Extract value
             unit_value = ""
@@ -336,9 +418,19 @@ def parse_line_items(text: str, trade_direction: str = "export") -> List[Dict]:
             
             # Extract Country of Origin
             coo = ""
-            coo_match = re.search(r'c\s*of\s*o[\s:]*([a-z]+)', context, re.IGNORECASE)
-            if coo_match:
-                coo = coo_match.group(1).capitalize()
+            # Use "Goods Manufactured in:" from HTS forward scan if available
+            if country_origin_forward:
+                coo = country_origin_forward
+            else:
+                # Try "Manufactured in:" in context
+                mfg_match = re.search(r'(?:goods\s*)?manufactured\s*in[\s:]*([a-z]+)', context, re.IGNORECASE)
+                if mfg_match:
+                    coo = mfg_match.group(1).upper()
+                else:
+                    # Standard "C of O" pattern
+                    coo_match = re.search(r'c\s*of\s*o[\s:]*([a-z]+)', context, re.IGNORECASE)
+                    if coo_match:
+                        coo = coo_match.group(1).capitalize()
             
             # Extract net weight
             net_weight = ""

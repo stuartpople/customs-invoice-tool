@@ -6,21 +6,38 @@ from collections import defaultdict
 import pandas as pd
 
 
-def group_by_commodity_code(items: List[Dict]) -> Dict[str, List[Dict]]:
+def group_by_commodity_code(items: List[Dict], group_by_origin: bool = False) -> Dict[str, List[Dict]]:
     """
-    Group line items by commodity code.
+    Group line items by commodity code, optionally also by country of origin.
+    Items with blank / missing commodity codes are kept as individual entries
+    (keyed by a unique placeholder) so they are NOT collapsed into one row.
+    
+    When group_by_origin=True, the key is "HS_CODE|COUNTRY" so that the same
+    HS code from different countries produces separate declaration lines.
     
     Args:
         items: List of line item dictionaries
+        group_by_origin: If True, also split groups by country of origin
         
     Returns:
-        Dictionary mapping commodity codes to lists of items
+        Dictionary mapping commodity codes (or code|country) to lists of items
     """
     grouped = defaultdict(list)
+    blank_counter = 0
     
     for item in items:
-        commodity_code = item.get('commodity_code', 'UNKNOWN')
-        grouped[commodity_code].append(item)
+        commodity_code = item.get('commodity_code', '').strip()
+        if commodity_code and commodity_code != 'UNKNOWN':
+            if group_by_origin:
+                country = item.get('country_of_origin', '').strip()
+                key = f"{commodity_code}|{country}" if country else commodity_code
+            else:
+                key = commodity_code
+            grouped[key].append(item)
+        else:
+            # Give each blank-code item its own unique key so it isn't merged
+            blank_counter += 1
+            grouped[f'__BLANK_{blank_counter}__'].append(item)
     
     return dict(grouped)
 

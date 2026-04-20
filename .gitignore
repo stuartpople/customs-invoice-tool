@@ -1,4 +1,4 @@
-# Environment variables and secrets
+﻿# Environment variables and secrets
 .env
 .env.local
 .env.*.local
@@ -40,6 +40,7 @@ venv/
 ENV/
 env/
 .venv
+.miniconda/
 
 # IDEs
 .vscode/
@@ -55,10 +56,13 @@ env/
 # Job data (contains processed invoices - may have sensitive data)
 jobs/
 *.pdf
-*.xlsx
-*.xls
 *.docx
 *.doc
+
+# Excel uploads/outputs - but keep the CDS template
+*.xlsx
+*.xls
+!templates/*.xlsx
 
 # Logs
 *.log
@@ -74,3 +78,59 @@ htmlcov/
 # OS
 Thumbs.db
 .DS_Store
+
+# Windows Tesseract local install (use packages.txt on Linux/Cloud)
+tesseract.exe
+tesseract-uninstall.exe
+tessdata/
+*.dll
+doc/
+
+# Windows executables and man pages from Tesseract
+*.1.html
+*.5.html
+ambiguous_words.*
+classifier_tester.*
+cntraining.*
+combine_lang_model.*
+combine_tessdata.*
+dawg2wordlist.*
+lstmeval.*
+lstmtraining.*
+merge_unicharsets.*
+mftraining.*
+set_unicharset_properties.*
+shapeclustering.*
+text2image.*
+unicharset_extractor.*
+wordlist2dawg.*
+winpath.*
+
+# Package managers
+nuget.exe
+.nuget/
+
+# Launcher scripts
+*.bat
+*.vbs
+
+# Local test/debug/diagnostic scripts
+test_*.py
+check_*.py
+debug_*.py
+diag_*.py
+trace_*.py
+verify_*.py
+reextract_*.py
+reprocess_*.txt
+
+# Debug images
+*.png
+test_job/
+test_job_rs605/
+
+# Cache files
+countries_cache.json
+
+# Miniconda installer
+Miniconda3-*.exe

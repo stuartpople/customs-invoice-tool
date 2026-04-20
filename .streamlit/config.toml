@@ -14,3 +14,10 @@ gatherUsageStats = false
 [client]
 # Prevent disconnection during long operations
 toolbarMode = "minimal"
+
+[theme]
+primaryColor = "#00b4d8"
+backgroundColor = "#ffffff"
+secondaryBackgroundColor = "#e8f4fb"
+textColor = "#0a1628"
+font = "sans serif"
