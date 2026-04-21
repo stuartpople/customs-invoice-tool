@@ -18,10 +18,10 @@ from hmrc_api import HMRCTariffAPI
 from countries import COUNTRIES, COMMON_COUNTRIES, COUNTRY_TO_ISO
 from file_extractor import extract_from_file
 import shutil
-from streamlit_autorefresh import st_autorefresh # type: ignore
+
 
 # Version tracking for cache busting
-APP_VERSION = "v3.8-editable"
+APP_VERSION = "v3.9"
 
 st.set_page_config(
     page_title="LogistiCore | CDS Customs Invoice Tool",
@@ -185,11 +185,13 @@ if st.session_state.processing_started and st.session_state.current_job_id:
         status = progress_data.get('status', '')
         if status in ["processing", "pending", "created"]:
             # Auto-refresh every 2 seconds while processing
-            st_autorefresh(interval=2000, limit=1000, key="auto_refresh")
+            time.sleep(2)
+            st.rerun()
     except Exception as e:
         # Continue refreshing even if there's an error checking status
         if st.session_state.processing_started:
-            st_autorefresh(interval=2000, limit=1000, key="auto_refresh")
+            time.sleep(2)
+            st.rerun()
 
 st.divider()
 
