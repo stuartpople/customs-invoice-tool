@@ -329,7 +329,21 @@ def parse_line_items(text: str, trade_direction: str = "export") -> List[Dict]:
                     description = before_hs[:100]
                 else:
                     continue  # Skip items without description
-            
+
+            # ---- RS Components SITPRO format detection ----
+            # Item line: "[PartNo] [Description] [Qty][Unit] [UnitPrice.4dp] [Total.2dp]"
+            # e.g. "7064711 FATMAX BACKPACK 2EA 51.1450 102.29"
+            _rs_qty = _rs_uom = _rs_total = None
+            _rs = re.match(
+                r'^\d{5,8}\s+(.+?)\s+(\d{1,4})\s*([A-Z]{2,5})\s+\d+\.\d{4}\s+(\d+\.\d{2})\s*$',
+                description, re.IGNORECASE
+            )
+            if _rs:
+                description = _rs.group(1).strip()
+                _rs_qty  = _rs.group(2)
+                _rs_uom  = _rs.group(3).lower()
+                _rs_total = _rs.group(4)
+
             # Build context from current line and following lines (avoid mixing items)
             # HTS format needs more context lines (description + serial + qty/price are further down)
             context_range = 8 if is_hts_format else 3
@@ -357,9 +371,9 @@ def parse_line_items(text: str, trade_direction: str = "export") -> List[Dict]:
             context = ' '.join(context_lines)
             
             # Extract quantity and unit
-            quantity = ""
-            uom = "pcs"
-            
+            quantity = _rs_qty or ""
+            uom = _rs_uom or "pcs"
+
             if is_hts_format:
                 # HTS format: data line has "<serial/code> <qty> <unit_price> <extended_price>"
                 # Key: qty is an integer, prices have decimal points (e.g. 22,025.00)
@@ -415,6 +429,8 @@ def parse_line_items(text: str, trade_direction: str = "export") -> List[Dict]:
                     total_value = str(found_values[-1])
                 else:
                     total_value = str(found_values[0])
+            if not total_value and _rs_total:
+                total_value = _rs_total
             
             # Extract Country of Origin
             coo = ""
@@ -571,18 +587,30 @@ def extract_invoice_metadata(text: str) -> Dict:
             metadata['package_type'] = 'Pallet'
     
     # Extract invoice number
-    inv_patterns = [
-        r'(?:invoice\s*(?:no|number|#))[\s:]*([A-Z0-9-]+)',
-        r'invoice[\s:]*([A-Z0-9-]+)',
-    ]
-    for pattern in inv_patterns:
-        match = re.search(pattern, text, re.IGNORECASE)
-        if match:
-            metadata['invoice_number'] = match.group(1)
-            break
-    
+    # RS Components: "Invoice number" label appears as a column header; the actual
+    # number (10 digits) appears on the next line. Use re.DOTALL so \D spans newlines.
+    _inv_stop_words = {'RECHNUNG', 'FACTURE', 'FACTURA', 'NUMBER', 'DATE', 'REF'}
+    inv_number = None
+    # Pattern 1: 10-digit invoice number within 120 chars of the label (spans newlines via re.DOTALL)
+    # Uses non-greedy .{0,120}? to find the first 10-digit number after the label
+    # RS Components format: label is on line 1, actual number appears after VAT reg on line 2
+    m = re.search(r'(?:invoice\s*(?:no|number|#)).{0,120}?(\b\d{10}\b)', text, re.IGNORECASE | re.DOTALL)
+    if m and m.group(1).upper() not in _inv_stop_words:
+        inv_number = m.group(1)
+    if not inv_number:
+        # Pattern 2: alphanumeric ID immediately after the label
+        m = re.search(r'(?:invoice\s*(?:no|number|#))[\s:]*([A-Z0-9-]{3,})', text, re.IGNORECASE)
+        if m and m.group(1).upper() not in _inv_stop_words:
+            inv_number = m.group(1)
+    if not inv_number:
+        m = re.search(r'invoice[\s:]*([A-Z0-9-]{3,})', text, re.IGNORECASE)
+        if m and m.group(1).upper() not in _inv_stop_words:
+            inv_number = m.group(1)
+    metadata['invoice_number'] = inv_number
+
     # Extract invoice date
     date_patterns = [
+        r'(?:invoice\s*date|date)[\s:]*(\d{1,2}[.][\s]?\d{1,2}[.]\d{2,4})',  # DD.MM.YYYY (RS Components)
         r'(?:invoice\s*date|date)[\s:]*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})',
         r'(?:invoice\s*date|date)[\s:]*(\d{4}[/-]\d{1,2}[/-]\d{1,2})',
     ]
