@@ -122,6 +122,15 @@ st.markdown("""
     [data-testid="stSidebar"] { background: #0a1628; }
     [data-testid="stSidebar"] * { color: #e0eef5 !important; }
     [data-testid="stSidebar"] .stSelectbox label { color: #a8c8d8 !important; }
+    [data-testid="stSidebar"] .stButton>button {
+        background: #1a3a5c;
+        color: #e0eef5 !important;
+        border: 1px solid #2a5a8c;
+    }
+    [data-testid="stSidebar"] .stButton>button:hover {
+        background: #1e4a78;
+        border-color: #00b4d8;
+    }
 </style>
 """, unsafe_allow_html=True)
 
