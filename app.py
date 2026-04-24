@@ -192,10 +192,15 @@ with st.sidebar:
 
         _google_cloud = _get_cloud_secret("GOOGLE_API_KEY")
         _openai_cloud = _get_cloud_secret("OPENAI_API_KEY")
+        _google_session = st.session_state.get("google_api_key_override", "")
+        _openai_session = st.session_state.get("openai_api_key_override", "")
 
-        if _google_cloud:
+        _any_google = _google_cloud or _google_session
+        _any_openai = _openai_cloud or _openai_session
+
+        if _any_google:
             st.success("✅ Google Gemini (free tier) — active")
-        elif _openai_cloud:
+        elif _any_openai:
             st.success("✅ OpenAI GPT-4o-mini — active")
         else:
             st.info("No AI key configured. Enter one below or add to Streamlit Secrets.")
@@ -228,7 +233,7 @@ with st.sidebar:
             st.session_state["openai_api_key_override"] = _o_key
             _os.environ["OPENAI_API_KEY"] = _o_key
 
-        if not _google_cloud and not _openai_cloud and not _g_key and not _o_key:
+        if not _any_google and not _any_openai and not _g_key and not _o_key:
             st.caption("⚙️ No key set — regex parser will be used.")
 
 # Auto-refresh every 2 seconds if processing
