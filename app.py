@@ -1043,7 +1043,7 @@ elif st.session_state.processing_started and st.session_state.current_job_id:
                         filename = metadata.get('pdf_path', '').split('/')[-1]
                         
                         try:
-                            result = parser.parse_job_items(job_dir, direction)
+                            result = parser.parse_job_items(job_id, job_dir, direction)
                             
                             if 'error' in result:
                                 errors.append(f"PDF {idx} ({filename}): {result['error']}")
