@@ -2083,7 +2083,7 @@ class LineItemParser:
         value_patterns = [
             r'(?:amount|total|value|price|unit\s*price|cost)[\s:]*[£$€¥]?\s*(\d+[,\d]*\.?\d+)',
             r'[£$€¥]\s*(\d+[,\d]*\.?\d+)',
-            r'\b(\d+\.\d{2})\b(?!\s*(?:kg|g|mm|cm|m|ea|pcs))',
+            r'\b(\d+\.\d{1,4})\b(?!\s*(?:kg|g|mm|cm|m|ea|pcs))',
         ]
         
         # Weight patterns (net weight)
@@ -2173,14 +2173,25 @@ class LineItemParser:
                         if prev_line and len(prev_line) > 10:
                             # Skip if it looks like a header or metadata
                             if not re.match(r'^\s*(hs|item|order|shipment|page)', prev_line, re.IGNORECASE):
-                                # Check if it has part number + description pattern
-                                # Example: "738480 PANEL SKT RED 50 EA 1.1000 55.00"
                                 parts = prev_line.split()
                                 if len(parts) >= 2:
-                                    # First part might be item/part number, take rest as description
-                                    # But keep first 50 chars
-                                    description = ' '.join(parts[:min(len(parts), 8)])
-                                    break
+                                    # Strip leading part/stock number (pure digits or digits+letters)
+                                    start = 0
+                                    if re.match(r'^\d+[A-Z]?$', parts[0]):
+                                        start = 1
+                                    # Strip trailing price/qty tokens: numbers, EA/PCS/SET, prices, NNea etc.
+                                    end = len(parts)
+                                    while end > start + 1:
+                                        tail = parts[end - 1]
+                                        if (re.match(r'^[\d,\.]+$', tail)
+                                                or tail.upper() in ('EA', 'PCS', 'SET', 'KG', 'M', 'PC')
+                                                or re.match(r'^\d+\s*(EA|PCS|SET|PC)$', tail, re.IGNORECASE)):
+                                            end -= 1
+                                        else:
+                                            break
+                                    description = ' '.join(parts[start:end]).strip()
+                                    if description:
+                                        break
                 
                 if not description:
                     continue
@@ -2218,10 +2229,16 @@ class LineItemParser:
                 if curr_match:
                     currency = curr_match.group(1)
                 
+                # Strip date patterns from context before extracting values
+                # Dates like "09.04.2026" or "09/04/2026" would be misread as prices
+                context_no_dates = re.sub(
+                    r'\b\d{1,2}[./]\d{1,2}[./]\d{2,4}\b', '', context
+                )
+
                 # Find values
                 found_values = []
                 for pattern in value_patterns:
-                    for match in re.finditer(pattern, context, re.IGNORECASE):
+                    for match in re.finditer(pattern, context_no_dates, re.IGNORECASE):
                         try:
                             val_str = match.group(1).replace(',', '')
                             val = float(val_str)
