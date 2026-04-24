@@ -203,7 +203,7 @@ with st.sidebar:
         elif _any_openai:
             st.success("✅ OpenAI GPT-4o-mini — active")
         else:
-            st.info("No AI key configured. Enter one below or add to Streamlit Secrets.")
+            st.caption("ℹ️ Enter an API key below for AI-powered extraction, or the app will use its built-in parser.")
 
         # Google Gemini (free)
         st.caption("**Google Gemini** — free, 1,500 req/day")
