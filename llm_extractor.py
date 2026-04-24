@@ -104,7 +104,7 @@ _MAX_OCR_CHARS = 60_000   # GPT-4o context is 128k tokens; 60k chars ≈ 15k tok
 def extract_with_llm(
     ocr_text: str,
     api_key: str,
-    model: str = "gpt-4o",
+    model: str = "gpt-4o-mini",
 ) -> Tuple[List[Dict], Dict]:
     """
     Send OCR text to GPT-4o and return (items, metadata).
