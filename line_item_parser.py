@@ -52,10 +52,29 @@ class LineItemParser:
         if not all_text:
             return {"error": "No text extracted", "items": []}
 
-        # ── LLM path (GPT-4o) ─────────────────────────────────────────────────
-        # Use when an OpenAI API key is configured — far more accurate than regex
-        # for arbitrary invoice formats.
-        openai_key = self._get_openai_key()
+        # ── LLM path ──────────────────────────────────────────────────────────
+        # Priority: 1) Google Gemini (free tier) → 2) OpenAI → 3) regex fallback
+
+        # 1. Google Gemini Flash — free tier, 1,500 req/day, no credit card needed
+        google_key = self._get_secret("GOOGLE_API_KEY")
+        if google_key:
+            try:
+                from llm_extractor import extract_with_gemini
+                llm_items, llm_meta = extract_with_gemini(all_text, google_key)
+                if llm_items:
+                    return {
+                        "total_items": len(llm_items),
+                        "items": llm_items,
+                        "metadata": llm_meta,
+                        "pages_analyzed": len(pages_data.get("pages", [])),
+                        "direction": direction,
+                        "format_type": "llm_gemini",
+                    }
+            except Exception as _err:
+                print(f"[Gemini extractor] failed, trying OpenAI: {_err}")
+
+        # 2. OpenAI GPT-4o-mini — ~£0.001 per invoice
+        openai_key = self._get_secret("OPENAI_API_KEY")
         if openai_key:
             try:
                 from llm_extractor import extract_with_llm
@@ -67,12 +86,10 @@ class LineItemParser:
                         "metadata": llm_meta,
                         "pages_analyzed": len(pages_data.get("pages", [])),
                         "direction": direction,
-                        "format_type": "llm_gpt4o",
+                        "format_type": "llm_gpt4o_mini",
                     }
-            except Exception as _llm_err:
-                # Log but fall through to regex
-                import traceback
-                print(f"[LLM extractor] failed, falling back to regex: {_llm_err}")
+            except Exception as _err:
+                print(f"[OpenAI extractor] failed, falling back to regex: {_err}")
 
         # ── Regex fallback ────────────────────────────────────────────────────
         # Parse items using the proven logic from pdf_extractor.py
@@ -91,23 +108,23 @@ class LineItemParser:
             "format_type": format_type
         }
 
-    def _get_openai_key(self) -> Optional[str]:
+    def _get_secret(self, key_name: str) -> Optional[str]:
         """
-        Return the OpenAI API key from (in priority order):
-          1. Streamlit secrets  (st.secrets["OPENAI_API_KEY"])
-          2. Environment variable (OPENAI_API_KEY)
+        Return a secret value from (in priority order):
+          1. Streamlit secrets  (st.secrets[key_name])
+          2. Environment variable
         Returns None if not configured.
         """
         # Try Streamlit secrets first (works on Streamlit Cloud)
         try:
             import streamlit as st
-            key = st.secrets.get("OPENAI_API_KEY", "")
+            key = st.secrets.get(key_name, "")
             if key:
                 return key
         except Exception:
             pass
         # Fall back to environment variable (local dev)
-        return os.getenv("OPENAI_API_KEY") or None
+        return os.getenv(key_name) or None
 
     def _postprocess_items(self, items: List[Dict]) -> List[Dict]:
         """Filter out obvious invoice-level rows (totals/terms/etc.) and dedupe.

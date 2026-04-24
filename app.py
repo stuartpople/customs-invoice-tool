@@ -178,38 +178,58 @@ if 'app_version' not in st.session_state or st.session_state.app_version != APP_
 with st.sidebar:
     st.caption(f"Version: {APP_VERSION}")
     st.divider()
-    # ── GPT-4o extraction setting ──────────────────────────────────────────
-    # When an API key is provided, GPT-4o is used instead of regex parsing.
-    # On Streamlit Cloud the key should be stored in Secrets (OPENAI_API_KEY).
-    # Here we allow overriding it per-session for local/testing use.
-    with st.expander("🤖 GPT-4o Extraction", expanded=False):
-        _cloud_key = ""
-        try:
-            _cloud_key = st.secrets.get("OPENAI_API_KEY", "")
-        except Exception:
-            pass
+    # ── AI extraction setting ─────────────────────────────────────────────
+    # Priority: Google Gemini (free) → OpenAI (paid) → regex fallback
+    # On Streamlit Cloud store keys in Settings → Secrets.
+    with st.expander("🤖 AI Extraction", expanded=False):
+        import os as _os
 
-        if _cloud_key:
-            st.success("✅ OpenAI key configured (Streamlit Secrets)")
-            st.caption("GPT-4o will be used for invoice parsing.")
+        def _get_cloud_secret(name):
+            try:
+                return st.secrets.get(name, "")
+            except Exception:
+                return ""
+
+        _google_cloud = _get_cloud_secret("GOOGLE_API_KEY")
+        _openai_cloud = _get_cloud_secret("OPENAI_API_KEY")
+
+        if _google_cloud:
+            st.success("✅ Google Gemini (free tier) — active")
+        elif _openai_cloud:
+            st.success("✅ OpenAI GPT-4o-mini — active")
         else:
-            _session_key = st.text_input(
-                "OpenAI API Key",
-                value=st.session_state.get("openai_api_key_override", ""),
-                type="password",
-                placeholder="sk-…",
-                help="Optional: paste your OpenAI key here to enable GPT-4o parsing. "
-                     "For permanent setup, add OPENAI_API_KEY to Streamlit Secrets.",
-            )
-            if _session_key != st.session_state.get("openai_api_key_override", ""):
-                st.session_state["openai_api_key_override"] = _session_key
-                # Also write to env so line_item_parser can pick it up
-                import os as _os
-                _os.environ["OPENAI_API_KEY"] = _session_key
-            if _session_key:
-                st.success("✅ GPT-4o enabled for this session")
-            else:
-                st.caption("No key — regex parser will be used.")
+            st.info("No AI key configured. Enter one below or add to Streamlit Secrets.")
+
+        # Google Gemini (free)
+        st.caption("**Google Gemini** — free, 1,500 req/day")
+        _g_key = st.text_input(
+            "Google API Key",
+            value=st.session_state.get("google_api_key_override", ""),
+            type="password",
+            placeholder="AIza…",
+            help="Free key from aistudio.google.com/apikey — 1,500 invoices/day at no cost.",
+            key="sidebar_google_key",
+        )
+        if _g_key != st.session_state.get("google_api_key_override", ""):
+            st.session_state["google_api_key_override"] = _g_key
+            _os.environ["GOOGLE_API_KEY"] = _g_key
+
+        # OpenAI (paid fallback)
+        st.caption("**OpenAI GPT-4o-mini** — ~£0.001/invoice fallback")
+        _o_key = st.text_input(
+            "OpenAI API Key",
+            value=st.session_state.get("openai_api_key_override", ""),
+            type="password",
+            placeholder="sk-…",
+            help="Optional fallback. Get a key at platform.openai.com/api-keys.",
+            key="sidebar_openai_key",
+        )
+        if _o_key != st.session_state.get("openai_api_key_override", ""):
+            st.session_state["openai_api_key_override"] = _o_key
+            _os.environ["OPENAI_API_KEY"] = _o_key
+
+        if not _google_cloud and not _openai_cloud and not _g_key and not _o_key:
+            st.caption("⚙️ No key set — regex parser will be used.")
 
 # Auto-refresh every 2 seconds if processing
 if st.session_state.processing_started and st.session_state.current_job_id:
