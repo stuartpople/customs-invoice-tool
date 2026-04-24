@@ -60,13 +60,25 @@ class LineItemParser:
         # ── LLM path ──────────────────────────────────────────────────────────
         # Priority: 1) Google Gemini (free tier) → 2) OpenAI → 3) regex fallback
 
+        def _llm_quality_ok(items_list):
+            """Return True only if the AI result looks trustworthy.
+            Rejects results where none of the items have a commodity_code —
+            that means the AI found items but couldn't identify any HS codes,
+            which happens when it confuses price/value columns for HS codes and
+            the sanity validator strips them all out."""
+            if not items_list:
+                return False
+            codes = [it.get("commodity_code") for it in items_list if it.get("commodity_code")]
+            # At least 30% of items should have an HS code for the result to be trusted
+            return len(codes) / len(items_list) >= 0.3
+
         # 1. Google Gemini Flash — free tier, 1,500 req/day, no credit card needed
         google_key = self._get_secret("GOOGLE_API_KEY")
         if google_key:
             try:
                 from llm_extractor import extract_with_gemini
                 llm_items, llm_meta = extract_with_gemini(all_text, google_key)
-                if llm_items:
+                if _llm_quality_ok(llm_items):
                     return {
                         "total_items": len(llm_items),
                         "items": llm_items,
@@ -75,6 +87,8 @@ class LineItemParser:
                         "direction": direction,
                         "format_type": "llm_gemini",
                     }
+                elif llm_items:
+                    print(f"[Gemini extractor] returned {len(llm_items)} items but too few valid HS codes — falling back to regex")
             except Exception as _err:
                 print(f"[Gemini extractor] failed, trying OpenAI: {_err}")
 
@@ -84,7 +98,7 @@ class LineItemParser:
             try:
                 from llm_extractor import extract_with_llm
                 llm_items, llm_meta = extract_with_llm(all_text, openai_key)
-                if llm_items:
+                if _llm_quality_ok(llm_items):
                     return {
                         "total_items": len(llm_items),
                         "items": llm_items,
@@ -93,6 +107,8 @@ class LineItemParser:
                         "direction": direction,
                         "format_type": "llm_gpt4o_mini",
                     }
+                elif llm_items:
+                    print(f"[OpenAI extractor] returned {len(llm_items)} items but too few valid HS codes — falling back to regex")
             except Exception as _err:
                 print(f"[OpenAI extractor] failed, falling back to regex: {_err}")
 
