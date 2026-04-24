@@ -200,6 +200,34 @@ def parse_line_items(text: str, trade_direction: str = "export") -> List[Dict]:
     # Determine if we should pad codes to 10 digits
     pad_to_10 = (trade_direction.lower() == "import")
     
+    # Pre-scan for document-level Country of Origin.
+    # RS Components SITPRO: CoO is a header field (not per item). The form places
+    # "Country of origin of goods" alongside "Country of destination" and their values
+    # (e.g. "China Azerbaijan") appear on the next OCR line, often mixed with buyer address.
+    # Scan first 3000 chars to find a manufacturing country before resorting to per-item context.
+    doc_coo = None
+    _coo_label_m = re.search(
+        r'(?:country|count\w+)\s+of\s+orig\w*[\s:]*([A-Z][a-z]{2,20})',
+        text, re.IGNORECASE
+    )
+    if _coo_label_m:
+        _cand = _coo_label_m.group(1)
+        if _cand.upper() not in ('OF', 'GOODS', 'ORIGIN', 'DESTINATION', 'THE', 'OIGN'):
+            doc_coo = _cand.capitalize()
+    if not doc_coo:
+        # Fallback: look for a known manufacturing country in the header area.
+        # UK/GB is the exporter, so exclude those. First non-UK country found is likely CoO.
+        _mfg = (
+            r'\b(China|Germany|Japan|Taiwan|France|Italy|India|Vietnam|Malaysia|Thailand|'
+            r'Mexico|Turkey|Poland|Hungary|Belgium|Netherlands|Switzerland|South\s*Korea|'
+            r'Sweden|Spain|Brazil|Singapore|Hong\s*Kong|Israel|Pakistan|Bangladesh|'
+            r'Indonesia|Philippines|Cambodia|Myanmar|Sri\s*Lanka|Romania|Czech\s*Republic|'
+            r'Slovakia|Austria|Denmark|Finland|Norway|Portugal|Greece|Bulgaria|Croatia)\b'
+        )
+        _coo_m2 = re.search(_mfg, text[:3000], re.IGNORECASE)
+        if _coo_m2:
+            doc_coo = _coo_m2.group(1).strip().title()
+
     # Quantity patterns
     qty_patterns = [
         r'(?:qty|quantity|qnty)[\s:]*(\d+(?:\.\d+)?)\s*([a-z]*)',
@@ -333,16 +361,17 @@ def parse_line_items(text: str, trade_direction: str = "export") -> List[Dict]:
             # ---- RS Components SITPRO format detection ----
             # Item line: "[PartNo] [Description] [Qty][Unit] [UnitPrice.4dp] [Total.2dp]"
             # e.g. "7064711 FATMAX BACKPACK 2EA 51.1450 102.29"
-            _rs_qty = _rs_uom = _rs_total = None
+            _rs_qty = _rs_uom = _rs_unit_price = _rs_total = None
             _rs = re.match(
-                r'^\d{5,8}\s+(.+?)\s+(\d{1,4})\s*([A-Z]{2,5})\s+\d+\.\d{4}\s+(\d+\.\d{2})\s*$',
+                r'^\d{5,8}\s+(.+?)\s+(\d{1,4})\s*([A-Z]{2,5})\s+(\d+\.\d{4})\s+(\d+\.\d{2})\s*$',
                 description, re.IGNORECASE
             )
             if _rs:
-                description = _rs.group(1).strip()
-                _rs_qty  = _rs.group(2)
-                _rs_uom  = _rs.group(3).lower()
-                _rs_total = _rs.group(4)
+                description     = _rs.group(1).strip()
+                _rs_qty         = _rs.group(2)
+                _rs_uom         = _rs.group(3).lower()
+                _rs_unit_price  = _rs.group(4)
+                _rs_total       = _rs.group(5)
 
             # Build context from current line and following lines (avoid mixing items)
             # HTS format needs more context lines (description + serial + qty/price are further down)
@@ -471,8 +500,9 @@ def parse_line_items(text: str, trade_direction: str = "export") -> List[Dict]:
                 "description": description,
                 "quantity": float(quantity) if quantity else None,
                 "unit": uom,
+                "unit_price": float(_rs_unit_price) if _rs_unit_price else None,
                 "value": float(total_value) if total_value else None,
-                "country_origin": coo if coo else None,
+                "country_origin": coo if coo else (doc_coo if doc_coo else None),
                 "net_weight": float(net_weight) if net_weight else None
             })
     
@@ -545,7 +575,8 @@ def extract_invoice_metadata(text: str) -> Dict:
     
     # Extract net weight
     net_patterns = [
-        r'(?:total\s*net\s*weight|total\s*n\.?w\.?)[\s:]*([\d,]+\.?\d*)\s*(?:kg|kilograms?)',
+        r'(?:total\s*net\s*(?:weight|wt)\b)[\s\S]{0,40}?([\d,]+\.?\d*)\s*(?:kg|kilograms?)',
+        r'(?:total\s*n\.?w\.?)[\s:]*([\d,]+\.?\d*)\s*(?:kg|kilograms?)',
         r'(?:net\s*weight)[\s:]*([\d,]+\.?\d*)\s*(?:kg)',
     ]
     for pattern in net_patterns:
