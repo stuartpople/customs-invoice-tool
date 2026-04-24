@@ -2195,13 +2195,18 @@ class LineItemParser:
                                 start = 0
                                 if re.match(r'^\d+[A-Z]?$', parts[0]):
                                     start = 1
-                                # Strip trailing price/qty tokens: numbers, EA/PCS/SET, prices, NNea etc.
+                                # Strip trailing price/qty tokens: numbers, EA/PCS/SET/PR/RL/BAG etc.
+                                _UOM_SET = {
+                                    'EA', 'PCS', 'SET', 'KG', 'M', 'PC',
+                                    'PR', 'PAIR', 'PAIRS', 'RL', 'ROLL',
+                                    'BAG', 'BOX', 'KIT', 'TRL',
+                                }
                                 end = len(parts)
                                 while end > start + 1:
                                     tail = parts[end - 1]
                                     if (re.match(r'^[\d,\.]+$', tail)
-                                            or tail.upper() in ('EA', 'PCS', 'SET', 'KG', 'M', 'PC')
-                                            or re.match(r'^\d+\s*(EA|PCS|SET|PC)$', tail, re.IGNORECASE)):
+                                            or tail.upper() in _UOM_SET
+                                            or re.match(r'^\d+\s*(' + '|'.join(_UOM_SET) + r')$', tail, re.IGNORECASE)):
                                         end -= 1
                                     else:
                                         break
@@ -2211,6 +2216,30 @@ class LineItemParser:
                 
                 if not description:
                     continue
+
+                # For explicit_only (RS SITPRO): extract qty directly from item line
+                # which is the prev_line we just found. Format: ... NNN UOM unit_price total_price
+                _rs_qty = ""
+                _rs_uom = ""
+                if explicit_only and prev_line:
+                    _rs_line_m = re.search(
+                        r'(?<![\d.])([\d][\d,]*)\s*'
+                        r'(EA|SET|PR|PAIR|PAIRS|RL|ROLL|TRL|BAG|BOX|PCS|PC|KIT|M)\s+'
+                        r'[\d,]+[.,]\d',
+                        prev_line, re.IGNORECASE
+                    )
+                    if _rs_line_m:
+                        _rs_qty = _rs_line_m.group(1).replace(',', '')
+                        _rs_uom = _rs_line_m.group(2).lower()
+                    else:
+                        # Bare UOM without leading number implies qty=1 (e.g. "TRL 37.12 37.12")
+                        _rs_bare_m = re.search(
+                            r'(?<!\d)\s(TRL|ROLL|RL|BAG|BOX|KIT)\s+[\d,]+[.,]\d',
+                            prev_line, re.IGNORECASE
+                        )
+                        if _rs_bare_m:
+                            _rs_qty = '1'
+                            _rs_uom = _rs_bare_m.group(1).lower()
                 
                 # Build context from surrounding lines for extracting other fields
                 # Include more lines after for country extraction (C of O appears after HS code)
@@ -2234,6 +2263,11 @@ class LineItemParser:
                         except (ValueError, IndexError):
                             pass
                         break
+
+                # RS SITPRO: prefer qty parsed directly from item line
+                if explicit_only and _rs_qty:
+                    quantity = _rs_qty
+                    uom = _rs_uom or uom or "ea"
                 
                 # Extract value
                 unit_value = ""
