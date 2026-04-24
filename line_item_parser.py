@@ -71,7 +71,7 @@ class LineItemParser:
         if _is_rs_sitpro:
             print("[Parser] RS Components SITPRO format detected — using regex parser directly")
             lines = all_text.split('\n')
-            items = self._parse_pattern_format(lines, direction, page_map)
+            items = self._parse_pattern_format(lines, direction, page_map, explicit_only=True)
             items = self._postprocess_items(items)
             return {
                 "total_items": len(items),
@@ -2059,8 +2059,12 @@ class LineItemParser:
         
         return hs_code
     
-    def _parse_pattern_format(self, lines: List[str], direction: str, page_map: Dict) -> List[Dict]:
-        """Parse invoices using pattern matching (original method)"""
+    def _parse_pattern_format(self, lines: List[str], direction: str, page_map: Dict, explicit_only: bool = False) -> List[Dict]:
+        """Parse invoices using pattern matching (original method)
+        
+        explicit_only: if True, only accept codes found via explicit HS keyword labels
+                       (e.g. 'HS export code XXXXXXXX'). Skips the standalone number fallback.
+        """
         items = []
         seen_descriptions = set()  # Track descriptions to avoid duplicates
         
@@ -2115,19 +2119,23 @@ class LineItemParser:
             )
             
             # Fallback: Look for standalone 6-10 digit codes (less strict)
-            if not hs_code_match:
+            # Skipped when explicit_only=True (e.g. RS SITPRO where all codes are labelled)
+            if not hs_code_match and not explicit_only:
                 # Look for patterns like "738480" or "73848000" that could be HS codes
                 # But not preceded/followed by other numbers (to avoid order numbers, SKUs, etc.)
                 standalone_match = re.search(r'(?:^|\s)(\d{6,10})(?:\s|$)', line)
                 if standalone_match:
                     potential_code = standalone_match.group(1)
                     
-                    # Reject if this looks like a postal code, phone number, or address
-                    # Postal codes are usually 5-6 digits and appear near address keywords
-                    if len(potential_code) < 8:
-                        # Check context for address-related keywords
-                        if any(keyword in line_lower for keyword in ['almaty', 'address', 'manchester', 'street', 'business center', 'office', 'floor', 'arkwright', 'parsonage']):
-                            continue
+                    # Reject if line contains address-related keywords (applies to any length)
+                    _addr_kws = [
+                        'almaty', 'address', 'manchester', 'street', 'business center',
+                        'office', 'floor', 'arkwright', 'parsonage',
+                        'azerbaijan', 'baku', 'plaza', 'incorporated', 'llc',
+                        'shipping mark', 'ref.', 'ref ',
+                    ]
+                    if any(kw in line_lower for kw in _addr_kws):
+                        continue
                     
                     # Additional validation: check if context suggests this is a commodity code
                     context_before = ' '.join(lines[max(0, i-2):i+1])
@@ -2171,27 +2179,35 @@ class LineItemParser:
                         prev_line = lines[i - j].strip()
                         # Valid description: not empty, not a header, has substance
                         if prev_line and len(prev_line) > 10:
-                            # Skip if it looks like a header or metadata
-                            if not re.match(r'^\s*(hs|item|order|shipment|page)', prev_line, re.IGNORECASE):
-                                parts = prev_line.split()
-                                if len(parts) >= 2:
-                                    # Strip leading part/stock number (pure digits or digits+letters)
-                                    start = 0
-                                    if re.match(r'^\d+[A-Z]?$', parts[0]):
-                                        start = 1
-                                    # Strip trailing price/qty tokens: numbers, EA/PCS/SET, prices, NNea etc.
-                                    end = len(parts)
-                                    while end > start + 1:
-                                        tail = parts[end - 1]
-                                        if (re.match(r'^[\d,\.]+$', tail)
-                                                or tail.upper() in ('EA', 'PCS', 'SET', 'KG', 'M', 'PC')
-                                                or re.match(r'^\d+\s*(EA|PCS|SET|PC)$', tail, re.IGNORECASE)):
-                                            end -= 1
-                                        else:
-                                            break
-                                    description = ' '.join(parts[start:end]).strip()
-                                    if description:
+                            # Skip if it looks like a header, metadata, or address
+                            if re.match(r'^\s*(hs|item|order|shipment|page)', prev_line, re.IGNORECASE):
+                                continue
+                            # Skip address-like lines (city names, ISO+postal codes, country names)
+                            if re.search(r'\b[A-Z]{2}\d{3,6}\b', prev_line):  # e.g. AZ1065
+                                continue
+                            _addr_desc_kws = ['azerbaijan', 'baku', 'caspian plaza', 'incorporated llc',
+                                              'jabbarli', 'incoterms', 'shipping mark']
+                            if any(kw in prev_line.lower() for kw in _addr_desc_kws):
+                                continue
+                            parts = prev_line.split()
+                            if len(parts) >= 2:
+                                # Strip leading part/stock number (pure digits or digits+letters)
+                                start = 0
+                                if re.match(r'^\d+[A-Z]?$', parts[0]):
+                                    start = 1
+                                # Strip trailing price/qty tokens: numbers, EA/PCS/SET, prices, NNea etc.
+                                end = len(parts)
+                                while end > start + 1:
+                                    tail = parts[end - 1]
+                                    if (re.match(r'^[\d,\.]+$', tail)
+                                            or tail.upper() in ('EA', 'PCS', 'SET', 'KG', 'M', 'PC')
+                                            or re.match(r'^\d+\s*(EA|PCS|SET|PC)$', tail, re.IGNORECASE)):
+                                        end -= 1
+                                    else:
                                         break
+                                description = ' '.join(parts[start:end]).strip()
+                                if description:
+                                    break
                 
                 if not description:
                     continue
