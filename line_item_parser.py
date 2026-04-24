@@ -9,16 +9,18 @@ import re
 from typing import List, Dict, Tuple, Optional
 import json
 from pathlib import Path
+from ocr_utils import clean_ocr_text
 
 
 class LineItemParser:
     """Parse line items from extracted page text using proven patterns"""
     
-    def parse_job_items(self, job_dir: Path, direction: str = "export") -> Dict:
+    def parse_job_items(self, job_id: str, job_dir: Path, direction: str = "export") -> Dict:
         """
         Parse line items from a completed job's pages.json
         
         Args:
+            job_id: ID of the job
             job_dir: Path to job directory
             direction: "export" or "import"
             
@@ -51,6 +53,9 @@ class LineItemParser:
         
         if not all_text:
             return {"error": "No text extracted", "items": []}
+
+        # Clean up OCR text before extraction
+        ocr_text = clean_ocr_text(all_text)
 
         # ── LLM path ──────────────────────────────────────────────────────────
         # Priority: 1) Google Gemini (free tier) → 2) OpenAI → 3) regex fallback
@@ -1542,7 +1547,7 @@ class LineItemParser:
           • Pure-alphabetic tokens (≥3 chars) and pure-numeric tokens (≥3 digit
             chars) both contribute to the score.
           • Delimiter-split 3-digit numbers use a STRICT boundary so that "250"
-            doesn't falsely match "250V" or "100" doesn't match "0-100".
+            doesn't falsely match "250V" or "100" doesn't match "0-100 DEGREE"
           • Alpha-digit-split 3-digit numbers use a LOOSE boundary so that "410"
             (from "410A") correctly matches "410A Series" in a description.
           • Long numbers (≥4 digit chars) use simple substring matching.
@@ -1579,7 +1584,7 @@ class LineItemParser:
                       and sum(c.isdigit() for c in t) >= 4]
 
         # 3-digit numerics from delimiter split: USE STRICT BOUNDARY
-        #   "250" should not match "250V", "100" should not match "0-100"
+        #   "250" should not match "250V", "100" should not match "0-100 DEGREE"
         num_short_strict = [t for t in delim_toks
                             if re.match(r'^\d[\d.]*$', t)
                             and sum(c.isdigit() for c in t) == 3]

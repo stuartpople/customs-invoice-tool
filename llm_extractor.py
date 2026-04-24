@@ -61,54 +61,14 @@ except ImportError:
 
 # ── Shared prompt ─────────────────────────────────────────────────────────────
 
-_SYSTEM_PROMPT = """\
-You are a customs declaration specialist.  You will be given OCR text extracted
-from a commercial invoice (possibly multi-page, possibly garbled by OCR errors).
-
-Your task is to return ONLY a JSON object with two keys:
-  "items"    – array of line items
-  "metadata" – invoice-level fields
-
-RULES:
-- Do NOT invent data.  If a field is absent set it to null.
-- Remove OCR artefacts from descriptions (stray characters, split words).
-- HS/commodity codes are 6–10 digit numbers.  Return them as strings with no dots or spaces.
-- All monetary values must be plain numbers (no currency symbols).
-- net_weight is in KG.  Convert grams to KG if necessary.
-- country_origin is the country where goods were manufactured (not destination).
-- unit should be the unit of measure abbreviation (ea, kg, pcs, set, pr, m, l …).
-- incoterm must be the 3-letter code only (EXW, FOB, CIF …).
-- currency must be the 3-letter ISO code (GBP, USD, EUR …).
-
-JSON schema:
-{
-  "items": [
-    {
-      "commodity_code":  "string or null",
-      "description":     "string",
-      "quantity":        number_or_null,
-      "unit":            "string",
-      "unit_price":      number_or_null,
-      "value":           number_or_null,
-      "country_origin":  "string or null",
-      "net_weight":      number_or_null
-    }
-  ],
-  "metadata": {
-    "invoice_number":      "string or null",
-    "invoice_date":        "string or null",
-    "incoterm":            "string or null",
-    "currency":            "string or null",
-    "total_invoice_value": number_or_null,
-    "total_gross_weight":  number_or_null,
-    "total_net_weight":    number_or_null,
-    "number_of_packages":  integer_or_null,
-    "package_type":        "string or null"
-  }
-}
-
-Return ONLY the JSON — no markdown, no explanation, no preamble.
-"""
+# Prompt tuning for robustness to noisy OCR
+_SYSTEM_PROMPT = (
+    "You are an expert at extracting structured data from messy, scanned, or OCR'd invoices. "
+    "The input may have misaligned columns, extra whitespace, or character errors. "
+    "Infer the correct table structure and fields even if the text is noisy. "
+    "Always return a JSON object with fields: commodity_code, description, quantity, unit, unit_price, value, country_origin, net_weight. "
+    "If a value is missing or ambiguous, use null. Do not hallucinate."
+)
 
 _MAX_OCR_CHARS = 60_000   # 60k chars ≈ 15k tokens — well within both providers' limits
 
@@ -303,64 +263,31 @@ from typing import Dict, List, Optional, Tuple
 
 _OPENAI_AVAILABLE = False
 try:
-    from openai import OpenAI     # openai >= 1.0
+    from openai import OpenAI
     _OPENAI_AVAILABLE = True
 except ImportError:
     pass
 
+_GEMINI_AVAILABLE = False
+try:
+    import google.generativeai as genai
+    _GEMINI_AVAILABLE = True
+except ImportError:
+    pass
 
-# ── Prompt ────────────────────────────────────────────────────────────────────
 
-_SYSTEM_PROMPT = """\
-You are a customs declaration specialist.  You will be given OCR text extracted
-from a commercial invoice (possibly multi-page, possibly garbled by OCR errors).
+# ── Shared prompt ─────────────────────────────────────────────────────────────
 
-Your task is to return ONLY a JSON object with two keys:
-  "items"    – array of line items
-  "metadata" – invoice-level fields
+# Prompt tuning for robustness to noisy OCR
+_SYSTEM_PROMPT = (
+    "You are an expert at extracting structured data from messy, scanned, or OCR'd invoices. "
+    "The input may have misaligned columns, extra whitespace, or character errors. "
+    "Infer the correct table structure and fields even if the text is noisy. "
+    "Always return a JSON object with fields: commodity_code, description, quantity, unit, unit_price, value, country_origin, net_weight. "
+    "If a value is missing or ambiguous, use null. Do not hallucinate."
+)
 
-RULES:
-- Do NOT invent data.  If a field is absent set it to null.
-- Remove OCR artefacts from descriptions (stray characters, split words).
-- HS/commodity codes are 6–10 digit numbers.  Return them as strings with no dots or spaces.
-- All monetary values must be plain numbers (no currency symbols).
-- net_weight is in KG.  Convert grams to KG if necessary.
-- country_origin is the country where goods were manufactured (not destination).
-- unit should be the unit of measure abbreviation (ea, kg, pcs, set, pr, m, l …).
-- incoterm must be the 3-letter code only (EXW, FOB, CIF …).
-- currency must be the 3-letter ISO code (GBP, USD, EUR …).
-
-JSON schema:
-{
-  "items": [
-    {
-      "commodity_code":  "string or null",
-      "description":     "string",
-      "quantity":        number_or_null,
-      "unit":            "string",
-      "unit_price":      number_or_null,
-      "value":           number_or_null,
-      "country_origin":  "string or null",
-      "net_weight":      number_or_null
-    }
-  ],
-  "metadata": {
-    "invoice_number":      "string or null",
-    "invoice_date":        "string or null",
-    "incoterm":            "string or null",
-    "currency":            "string or null",
-    "total_invoice_value": number_or_null,
-    "total_gross_weight":  number_or_null,
-    "total_net_weight":    number_or_null,
-    "number_of_packages":  integer_or_null,
-    "package_type":        "string or null"
-  }
-}
-
-Return ONLY the JSON — no markdown, no explanation, no preamble.
-"""
-
-_MAX_OCR_CHARS = 60_000   # GPT-4o context is 128k tokens; 60k chars ≈ 15k tokens (safe)
+_MAX_OCR_CHARS = 60_000   # 60k chars ≈ 15k tokens — well within both providers' limits
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
