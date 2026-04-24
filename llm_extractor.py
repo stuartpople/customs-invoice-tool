@@ -67,9 +67,18 @@ _SYSTEM_PROMPT = (
     "The input may have misaligned columns, extra whitespace, or character errors. "
     "Infer the correct table structure and fields even if the text is noisy. "
     'You MUST return ONLY a valid JSON object with exactly this structure: {"items": [...], "metadata": {...}}. '
-    "Each object in 'items' must have these fields: commodity_code (HS/tariff code as string), "
-    "description (product name/description), quantity (number), unit (ea/pcs/kg/set etc), "
-    "unit_price (price per unit), value (line total), country_origin (country of manufacture), net_weight (kg). "
+    "Each object in 'items' must have these fields: "
+    "commodity_code: the HS/UK tariff commodity classification code (e.g. 85044000, 84733020). "
+    "This is a customs classification code found in a 'Commodity Code', 'HS Code', or 'Tariff Code' column. "
+    "It is NOT a price, monetary value, part number, stock code, or order number. "
+    "If no genuine HS/tariff code is visible, use null — do not substitute a price or part number. "
+    "description: product name/description. "
+    "quantity: number of units. "
+    "unit: unit of measure (ea/pcs/kg/set etc). "
+    "unit_price: price per single unit (a monetary amount). "
+    "value: total line value (a monetary amount). "
+    "country_origin: country of manufacture. "
+    "net_weight: weight in kg. "
     "The 'metadata' object must have: invoice_number, invoice_date, incoterm, currency, "
     "total_invoice_value, total_gross_weight, total_net_weight, number_of_packages, package_type. "
     "If a value is missing or ambiguous, use null. Do not hallucinate. "
@@ -180,18 +189,59 @@ def _parse_response(raw: str) -> Dict:
     return json.loads(cleaned)
 
 
+# Valid HS chapters are 01–97 and 99
+_VALID_HS_CHAPTERS = set(range(1, 98)) | {99}
+
+
+def _validate_commodity_code(code: Optional[str], value: Optional[float], unit_price: Optional[float]) -> Optional[str]:
+    """Return the code if it looks like a genuine HS code, else None."""
+    if not code:
+        return None
+    digits = re.sub(r'\D', '', code)
+    if not digits:
+        return None
+    # Must be 6–10 digits
+    if not (6 <= len(digits) <= 10):
+        return None
+    # First two digits must be a valid HS chapter
+    chapter = int(digits[:2])
+    if chapter not in _VALID_HS_CHAPTERS:
+        return None
+    # Reject if the numeric value of the code matches the line value or unit_price
+    # (AI sometimes copies a monetary value into the commodity_code field)
+    code_num = int(digits)
+    for monetary in [value, unit_price]:
+        if monetary is None:
+            continue
+        # Compare after removing decimal cents: e.g. 207.35 -> 20735 -> padded to 20735000
+        cents = round(monetary * 100)
+        # Check equality at any common padding level (6,7,8,9,10 digits)
+        for pad in range(6, 11):
+            padded = cents * (10 ** max(0, pad - len(str(cents))))
+            if code_num == padded:
+                return None
+        # Also reject direct equality (e.g. code=20735, value=20735.0)
+        if abs(code_num - monetary) < 0.01:
+            return None
+    return digits
+
+
 def _normalise_items(raw_items: list) -> List[Dict]:
     result = []
     for it in raw_items:
         if not isinstance(it, dict):
             continue
+        value = _float_or_none(it.get("value"))
+        unit_price = _float_or_none(it.get("unit_price"))
+        raw_code = _str_or_none(it.get("commodity_code"))
+        commodity_code = _validate_commodity_code(raw_code, value, unit_price)
         result.append({
-            "commodity_code": _str_or_none(it.get("commodity_code")),
+            "commodity_code": commodity_code,
             "description":    str(it.get("description") or "").strip(),
             "quantity":       _float_or_none(it.get("quantity")),
             "unit":           str(it.get("unit") or "pcs").lower().strip(),
-            "unit_price":     _float_or_none(it.get("unit_price")),
-            "value":          _float_or_none(it.get("value")),
+            "unit_price":     unit_price,
+            "value":          value,
             "country_origin": _str_or_none(it.get("country_origin")),
             "net_weight":     _float_or_none(it.get("net_weight")),
         })
