@@ -1,7 +1,10 @@
 """
 Line Item Parser - Pass 2: Extract structured data from extracted text
 Handles multi-page items and uses proven parsing from pdf_extractor.py
+Uses GPT-4o when an OpenAI API key is available (st.secrets["OPENAI_API_KEY"]
+or the OPENAI_API_KEY environment variable); falls back to regex otherwise.
 """
+import os
 import re
 from typing import List, Dict, Tuple, Optional
 import json
@@ -48,7 +51,30 @@ class LineItemParser:
         
         if not all_text:
             return {"error": "No text extracted", "items": []}
-        
+
+        # ── LLM path (GPT-4o) ─────────────────────────────────────────────────
+        # Use when an OpenAI API key is configured — far more accurate than regex
+        # for arbitrary invoice formats.
+        openai_key = self._get_openai_key()
+        if openai_key:
+            try:
+                from llm_extractor import extract_with_llm
+                llm_items, llm_meta = extract_with_llm(all_text, openai_key)
+                if llm_items:
+                    return {
+                        "total_items": len(llm_items),
+                        "items": llm_items,
+                        "metadata": llm_meta,
+                        "pages_analyzed": len(pages_data.get("pages", [])),
+                        "direction": direction,
+                        "format_type": "llm_gpt4o",
+                    }
+            except Exception as _llm_err:
+                # Log but fall through to regex
+                import traceback
+                print(f"[LLM extractor] failed, falling back to regex: {_llm_err}")
+
+        # ── Regex fallback ────────────────────────────────────────────────────
         # Parse items using the proven logic from pdf_extractor.py
         items, format_type = self._parse_line_items_proven(all_text, direction, page_map)
 
@@ -64,6 +90,24 @@ class LineItemParser:
             "direction": direction,
             "format_type": format_type
         }
+
+    def _get_openai_key(self) -> Optional[str]:
+        """
+        Return the OpenAI API key from (in priority order):
+          1. Streamlit secrets  (st.secrets["OPENAI_API_KEY"])
+          2. Environment variable (OPENAI_API_KEY)
+        Returns None if not configured.
+        """
+        # Try Streamlit secrets first (works on Streamlit Cloud)
+        try:
+            import streamlit as st
+            key = st.secrets.get("OPENAI_API_KEY", "")
+            if key:
+                return key
+        except Exception:
+            pass
+        # Fall back to environment variable (local dev)
+        return os.getenv("OPENAI_API_KEY") or None
 
     def _postprocess_items(self, items: List[Dict]) -> List[Dict]:
         """Filter out obvious invoice-level rows (totals/terms/etc.) and dedupe.

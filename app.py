@@ -177,6 +177,39 @@ if 'app_version' not in st.session_state or st.session_state.app_version != APP_
 # Show version in sidebar
 with st.sidebar:
     st.caption(f"Version: {APP_VERSION}")
+    st.divider()
+    # ── GPT-4o extraction setting ──────────────────────────────────────────
+    # When an API key is provided, GPT-4o is used instead of regex parsing.
+    # On Streamlit Cloud the key should be stored in Secrets (OPENAI_API_KEY).
+    # Here we allow overriding it per-session for local/testing use.
+    with st.expander("🤖 GPT-4o Extraction", expanded=False):
+        _cloud_key = ""
+        try:
+            _cloud_key = st.secrets.get("OPENAI_API_KEY", "")
+        except Exception:
+            pass
+
+        if _cloud_key:
+            st.success("✅ OpenAI key configured (Streamlit Secrets)")
+            st.caption("GPT-4o will be used for invoice parsing.")
+        else:
+            _session_key = st.text_input(
+                "OpenAI API Key",
+                value=st.session_state.get("openai_api_key_override", ""),
+                type="password",
+                placeholder="sk-…",
+                help="Optional: paste your OpenAI key here to enable GPT-4o parsing. "
+                     "For permanent setup, add OPENAI_API_KEY to Streamlit Secrets.",
+            )
+            if _session_key != st.session_state.get("openai_api_key_override", ""):
+                st.session_state["openai_api_key_override"] = _session_key
+                # Also write to env so line_item_parser can pick it up
+                import os as _os
+                _os.environ["OPENAI_API_KEY"] = _session_key
+            if _session_key:
+                st.success("✅ GPT-4o enabled for this session")
+            else:
+                st.caption("No key — regex parser will be used.")
 
 # Auto-refresh every 2 seconds if processing
 if st.session_state.processing_started and st.session_state.current_job_id:
