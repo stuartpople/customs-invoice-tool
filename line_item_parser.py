@@ -57,6 +57,30 @@ class LineItemParser:
         # Clean up OCR text before extraction
         ocr_text = clean_ocr_text(all_text)
 
+        # ── Format pre-detection: skip AI for known regex-handled formats ─────
+        # RS Components SITPRO invoices have "HS export code XXXXXXXX" on its own
+        # line below each item. The regex parser handles this perfectly. AI cannot
+        # reliably distinguish the HS code from item prices in this layout.
+        _is_rs_sitpro = (
+            re.search(r'HS\s+export\s+code\s+\d{6,10}', all_text, re.IGNORECASE) is not None
+            or (
+                'RS Components' in all_text
+                and 'SITPRO' in all_text
+            )
+        )
+        if _is_rs_sitpro:
+            print("[Parser] RS Components SITPRO format detected — using regex parser directly")
+            lines = all_text.split('\n')
+            items = self._parse_pattern_format(lines, direction, page_map)
+            items = self._postprocess_items(items)
+            return {
+                "total_items": len(items),
+                "items": items,
+                "pages_analyzed": len(pages_data.get("pages", [])),
+                "direction": direction,
+                "format_type": "rs_sitpro",
+            }
+
         # ── LLM path ──────────────────────────────────────────────────────────
         # Priority: 1) Google Gemini (free tier) → 2) OpenAI → 3) regex fallback
 
