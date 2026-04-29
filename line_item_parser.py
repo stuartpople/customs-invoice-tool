@@ -145,13 +145,54 @@ class LineItemParser:
         # spurious extra rows.
         items = self._postprocess_items(items)
 
-        return {
+        # ── Last-resort AI retry ──────────────────────────────────────────────
+        # If regex returned nothing but there is substantial OCR text, the format
+        # is unrecognised. Retry AI with a relaxed quality threshold (any items at
+        # all are better than zero). This catches invoices the regex can't handle
+        # even when the first AI pass was skipped or failed quality checks.
+        if not items and len(all_text.strip()) > 800:
+            print(f"[Parser] Regex returned 0 items on {len(all_text)} chars — trying AI last-resort")
+            for _lr_key, _lr_extractor, _lr_label in [
+                (self._get_secret("GOOGLE_API_KEY"), "extract_with_gemini", "llm_gemini_lastresort"),
+                (self._get_secret("OPENAI_API_KEY"),  "extract_with_llm",    "llm_gpt4o_lastresort"),
+            ]:
+                if not _lr_key:
+                    continue
+                try:
+                    from llm_extractor import extract_with_gemini, extract_with_llm
+                    _fn = extract_with_gemini if "gemini" in _lr_label else extract_with_llm
+                    _lr_items, _lr_meta = _fn(all_text, _lr_key)
+                    if _lr_items:
+                        print(f"[Parser] Last-resort {_lr_label} recovered {len(_lr_items)} items")
+                        return {
+                            "total_items": len(_lr_items),
+                            "items": _lr_items,
+                            "metadata": _lr_meta,
+                            "pages_analyzed": len(pages_data.get("pages", [])),
+                            "direction": direction,
+                            "format_type": _lr_label,
+                        }
+                except Exception as _lr_err:
+                    print(f"[Parser] Last-resort {_lr_label} failed: {_lr_err}")
+
+        # Build result — include a parse_warning when we got nothing so the UI
+        # can surface a prominent, actionable error rather than a silent empty list.
+        result = {
             "total_items": len(items),
             "items": items,
             "pages_analyzed": len(pages_data.get("pages", [])),
             "direction": direction,
-            "format_type": format_type
+            "format_type": format_type,
         }
+        if not items and len(all_text.strip()) > 800:
+            result["parse_warning"] = (
+                f"No line items could be extracted from this document "
+                f"(format detected: {format_type}, OCR chars: {len(all_text)}). "
+                "The invoice layout may be unrecognised. Configure a Gemini or OpenAI "
+                "API key to enable AI extraction for unknown formats."
+            )
+            result["ocr_text_snippet"] = all_text[:2000]
+        return result
 
     def _get_secret(self, key_name: str) -> Optional[str]:
         """

@@ -1066,9 +1066,18 @@ elif st.session_state.processing_started and st.session_state.current_job_id:
                                 fmt = result.get('format_type', 'unknown')
                                 all_items.extend(items)
                                 if items:
-                                    st.success(f"✅ PDF {idx} ({filename}): {len(items)} items parsed")
+                                    st.success(f"✅ PDF {idx} ({filename}): {len(items)} items parsed (format: {fmt})")
                                 else:
-                                    st.warning(f"⚠️ PDF {idx} ({filename}): No items found")
+                                    pw = result.get('parse_warning')
+                                    if pw:
+                                        st.error(f"❌ PDF {idx} ({filename}): **No items extracted.**")
+                                        st.error(pw)
+                                        snip = result.get('ocr_text_snippet', '')
+                                        if snip:
+                                            with st.expander("📄 Show raw OCR text (first 2000 chars)"):
+                                                st.code(snip, language="text")
+                                    else:
+                                        st.error(f"❌ PDF {idx} ({filename}): No items extracted. The document may be blank or image-only.")
                         except Exception as e:
                             errors.append(f"PDF {idx} ({filename}): Exception - {str(e)}")
                             fmt = 'error'
