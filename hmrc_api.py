@@ -342,10 +342,18 @@ class HMRCTariffAPI:
         
         if len(clean_code) < 10:
             if len(clean_code) == 8:
-                # For 8-digit codes, try common TARIC suffixes first (these are most specific)
-                # 99 = "Other" catch-all, 90/91/80/10 = common specific categories
-                for suffix in ['99', '91', '90', '80', '10', '00']:
-                    code_variants.append(clean_code + suffix)
+                # For export doc-code lookups the standard TARIC leaf for a CN8
+                # code is almost always the xx00 variant, so try that first to
+                # avoid unnecessary API calls and accidentally landing on a
+                # different TARIC variant (e.g. xx99) whose doc codes may differ.
+                # For imports we try specific leaves first (99/91/90…) then 00.
+                if direction.lower() == 'export':
+                    for suffix in ['00', '10', '20', '30', '40', '50',
+                                   '60', '70', '80', '90', '91', '99']:
+                        code_variants.append(clean_code + suffix)
+                else:
+                    for suffix in ['99', '91', '90', '80', '10', '00']:
+                        code_variants.append(clean_code + suffix)
                 # Then try broader levels (heading, chapter)
                 code_variants.append(clean_code[:6] + '0000')  # 6-digit heading
                 code_variants.append(clean_code[:4] + '000000')  # 4-digit chapter
