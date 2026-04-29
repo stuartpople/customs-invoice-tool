@@ -1860,12 +1860,37 @@ class LineItemParser:
             # Tokens after HS code may contain unit/qty/prices in various orders.
             tokens_after = rest_parts[after_idx:]
 
-            # UOM: first token that looks like a unit descriptor
-            uom = "EA"
-            for t in tokens_after[:6]:
-                if re.match(r'^(EA|BAG|SET|PK|PCS|UNIT|KG|REEL|EACH|ITEM|PACK|FA|BOX|CASE|MREEL|BAG)$', t, re.IGNORECASE):
-                    uom = t.upper()
-                    break
+            # Lovibond/DTK ("Tinto") format has HS code BEFORE the description:
+            #   STOCK_CODE  PACK_LINE  HS_CODE  DESCRIPTION...  UOM  QTY  PRICE  TAX  TOTAL  VAT
+            # When this happens desc_end==hs_idx==0 so description is empty.
+            # Recover by scanning tokens_after for the UOM; everything before it is description.
+            _uom_re = re.compile(
+                r'^(EA|BAG|SET|PK|PCS|UNIT|KG|REEL|EACH|ITEM|PACK|FA|BOX|CASE|MREEL)$',
+                re.IGNORECASE
+            )
+            _tinto_fmt = False  # True when HS code precedes description (Lovibond/DTK style)
+            if not description:
+                uom_pos = next(
+                    (t_idx for t_idx, t in enumerate(tokens_after) if _uom_re.match(t)), -1
+                )
+                if uom_pos > 0:
+                    description = ' '.join(tokens_after[:uom_pos]).strip()
+                    uom = tokens_after[uom_pos].upper()
+                    tokens_after = tokens_after[uom_pos + 1:]
+                    _tinto_fmt = True
+                elif uom_pos == 0:
+                    uom = tokens_after[0].upper()
+                    tokens_after = tokens_after[1:]
+                    _tinto_fmt = True
+                else:
+                    uom = "EA"
+            else:
+                # UOM: first token that looks like a unit descriptor
+                uom = "EA"
+                for t in tokens_after[:6]:
+                    if re.match(r'^(EA|BAG|SET|PK|PCS|UNIT|KG|REEL|EACH|ITEM|PACK|FA|BOX|CASE|MREEL|BAG)$', t, re.IGNORECASE):
+                        uom = t.upper()
+                        break
 
             # Extract numeric-looking tokens for qty and prices (with positions)
             num_tokens = []  # list of (idx_in_tokens_after, type, value)
@@ -1898,14 +1923,28 @@ class LineItemParser:
                 ints = [val for idx, typ, val in num_tokens if typ == 'int']
                 if ints:
                     qty_candidate = ints[-1]
+            # Lovibond/Tinto format: qty is expressed as a float (e.g. 1.00, 20.00).
+            # The first round float is the qty; remove it so prices extract correctly.
+            if not qty_candidate and _tinto_fmt:
+                for f_idx, (idx, typ, val) in enumerate(num_tokens):
+                    if typ == 'float':
+                        try:
+                            fv = float(val)
+                            if fv == int(fv) and 0 < int(fv) <= 10000:
+                                qty_candidate = str(int(fv))
+                                num_tokens = num_tokens[:f_idx] + num_tokens[f_idx + 1:]
+                                break
+                        except Exception:
+                            pass
             quantity = qty_candidate or ""
 
-            # unit_value and total_value: first two float-looking tokens (or integers if floats absent)
+            # unit_value: first float; total_value: last float
+            # Using [-1] for total handles formats with a TAX column (0.00) between unit and total.
             floats = [val for idx, typ, val in num_tokens if typ == 'float']
             ints = [val for idx, typ, val in num_tokens if typ == 'int']
             if floats:
                 unit_value = floats[0]
-                total_value = floats[1] if len(floats) > 1 else (floats[0] if floats else '')
+                total_value = floats[-1] if len(floats) > 1 else floats[0]
             else:
                 # fallback to integers (rare) - use last as total
                 if ints:
