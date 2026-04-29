@@ -2119,9 +2119,10 @@ class LineItemParser:
         return country_map.get(country.upper(), country)
     
     def _pad_hs_code(self, hs_code: str, pad_to_10: bool) -> str:
-        """Pad HS code to correct length - 8 for export, 10 for import"""
+        """Normalise HS code length: 8 digits for export, 10 for import.
+        Pads short codes up AND truncates over-length codes down."""
         if pad_to_10:
-            # Import: pad to 10 digits
+            # Import: normalise to 10 digits
             if len(hs_code) == 6:
                 return hs_code + "0000"
             elif len(hs_code) == 7:
@@ -2131,12 +2132,15 @@ class LineItemParser:
             elif len(hs_code) == 9:
                 return hs_code + "0"
         else:
-            # Export: pad to 8 digits
+            # Export: normalise to 8 digits
             if len(hs_code) == 6:
                 return hs_code + "00"
             elif len(hs_code) == 7:
                 return hs_code + "0"
-        
+            elif len(hs_code) >= 9:
+                # Invoices sometimes carry 10-digit TARIC codes — strip to CN8
+                return hs_code[:8]
+
         return hs_code
     
     def _parse_pattern_format(self, lines: List[str], direction: str, page_map: Dict, explicit_only: bool = False) -> List[Dict]:
@@ -2242,13 +2246,8 @@ class LineItemParser:
                 if hs_code.startswith('1'):
                     continue
                 
-                # Pad to appropriate length
-                if len(hs_code) == 6:
-                    hs_code = hs_code + ("0000" if pad_to_10 else "00")
-                elif len(hs_code) == 8:
-                    hs_code = hs_code + "00" if pad_to_10 else hs_code
-                elif len(hs_code) == 7:
-                    hs_code = hs_code + ("000" if pad_to_10 else "0")
+                # Normalise to correct length: 10 digits for import, 8 for export
+                hs_code = self._pad_hs_code(hs_code, pad_to_10)
                 
                 # Extract description from line before HS code
                 description = None

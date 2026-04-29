@@ -124,6 +124,14 @@ class HMRCTariffAPI:
                     "error": f"'{code}' is not a valid format (need 6-10 digits)"}
 
         is_export = direction.lower() == "export"
+
+        # Step 0: For exports, strip any code longer than 8 digits to CN8.
+        # Invoices from some suppliers carry 10-digit TARIC codes; the UK
+        # export tariff only uses 8-digit CN codes so the extra digits are
+        # meaningless and cause false "not declarable" errors.
+        if is_export and len(clean) > 8:
+            clean = clean[:8]
+
         cache_key = f"{clean}_{direction.lower()}"
         if cache_key in self._validation_cache:
             return self._validation_cache[cache_key]
