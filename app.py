@@ -23,6 +23,25 @@ import shutil
 # Version tracking for cache busting
 APP_VERSION = "v3.9"
 
+
+def _apply_selected_doc_codes(hmrc_results: dict) -> dict:
+    """Return a copy of hmrc_results where each code's document_codes dict
+    is replaced by the user's UI selections (selected_document_codes) when
+    selections exist, so the Excel export only shows the chosen doc codes
+    rather than the full unfiltered list from the HMRC API."""
+    if not hmrc_results:
+        return hmrc_results
+    filtered = {}
+    for code, data in hmrc_results.items():
+        selected = data.get('selected_document_codes')
+        if selected:
+            # User made selections — use only those
+            filtered[code] = {**data, 'document_codes': selected}
+        else:
+            # No selections made — keep all (fallback)
+            filtered[code] = data
+    return filtered
+
 st.set_page_config(
     page_title="LogistiCore | CDS Customs Invoice Tool",
     layout="wide",
@@ -826,7 +845,7 @@ if st.session_state.get('non_pdf_processed', False):
                 _inv_meta = {**_inv_meta, 'cpc_code': '1040' if current_direction == 'export' else '4000'}
                 excel_bytes = create_comprehensive_export(
                     items=display_items,
-                    hmrc_data=hmrc_results,
+                    hmrc_data=_apply_selected_doc_codes(hmrc_results),
                     direction=current_direction,
                     country='',
                     consolidate=False,  # Already consolidated above
@@ -852,7 +871,7 @@ if st.session_state.get('non_pdf_processed', False):
                 cds_bytes = create_cds_excel(
                     items=display_items,
                     direction=current_direction,
-                    hmrc_data=hmrc_results,
+                    hmrc_data=_apply_selected_doc_codes(hmrc_results),
                     consolidate=False,  # Items already consolidated by user's choice above
                     metadata=_inv_meta
                 )
@@ -1614,7 +1633,7 @@ elif st.session_state.processing_started and st.session_state.current_job_id:
                             # Create comprehensive Excel export
                             excel_bytes = create_comprehensive_export(
                                 items=items,
-                                hmrc_data=hmrc_results,
+                                hmrc_data=_apply_selected_doc_codes(hmrc_results),
                                 direction=metadata.get('direction', 'export'),
                                 country=metadata.get('country', ''),
                                 consolidate=consolidate,
@@ -1650,7 +1669,7 @@ elif st.session_state.processing_started and st.session_state.current_job_id:
                             cds_bytes = create_cds_excel(
                                 items=export_items,
                                 direction=metadata.get('direction', 'export'),
-                                hmrc_data=hmrc_results,
+                                hmrc_data=_apply_selected_doc_codes(hmrc_results),
                                 consolidate=should_consolidate,
                                 metadata=invoice_metadata
                             )
