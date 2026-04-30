@@ -299,13 +299,20 @@ class LineItemParser:
 
             # Build dedupe key — include stock number when available so that
             # two different products with the same HS/qty/value are not merged.
+            # Also include line_number: the same article can legitimately appear
+            # in multiple shipment bundles on the same invoice (e.g. Solarlux
+            # sections 1(5) and 1(6) both have the same article/qty/total), so
+            # we must not collapse them — but we still want to drop exact
+            # duplicates that arise from multi-page OCR overlap (same line
+            # number + same stock + same values).
             key_parts = []
             cc = (it.get('commodity_code') or '').strip()
             qty = str(it.get('quantity') or '').strip()
             tv = str(it.get('total_value') or '').strip()
             sn = (it.get('stock_number') or '').strip()
+            ln = str(it.get('line_number') or '').strip()
             if sn:
-                key_parts = [sn, qty, tv]
+                key_parts = [sn, qty, tv, ln] if ln else [sn, qty, tv]
             elif cc:
                 key_parts = [cc, qty, tv]
             else:
