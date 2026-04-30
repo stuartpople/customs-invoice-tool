@@ -2368,9 +2368,9 @@ class LineItemParser:
         # UOM is a whitelist to guard against partial matches inside descriptions
         # that contain numbers (e.g. "4,8 x 12,0").
         _tail_re = re.compile(
-            r'(\d+[.,]\d{1,4})\s+'           # qty   e.g. 12.00, 0.80, 2.00
+            r'(\d+[.,]\d{1,4})\s*'            # qty   e.g. 12.00, 0.90  (\s* allows no-space before UOM)
             r'(ST|m|pc|pcs?|ea|stk)\s+'       # UOM   Stück / metre / piece
-            r'[\d.,]+\s*/\s*[\d.,]+\s+'       # unit-price fraction (ignored)
+            r'[\d.,]+(?:\s*/\s*[\d.,]+)?\s+'  # unit-price fraction — "690.34/1" or merged "690.3471"
             r'([\d.,]+)\s+'                   # total price EUR
             r'([\d.,]+)\s+'                   # net weight kg
             r'(\d{8,10})\s+'                  # Comm. code (8-digit HS)
