@@ -311,7 +311,7 @@ with col2:
     
     uploaded_files = st.file_uploader(
         "Upload Invoice Files",
-        type=['pdf', 'xlsx', 'xls', 'docx', 'doc'],
+        type=['pdf', 'xlsx', 'xls', 'xlsm', 'docx', 'doc'],
         accept_multiple_files=True,
         help="Upload multiple PDFs, Excel, or Word files - all will be processed together",
         key=f"file_uploader_{st.session_state.uploader_key}"

@@ -104,6 +104,29 @@ class LineItemParser:
                 "format_type": "solarlux",
             }
 
+        # ── Marlow Ropes / "Item No. … HS Code … UoM" table format ───────────
+        # Invoices with "Item No.", "HS Code", and "UoM" column headers.
+        # Column order: Item No. | Description | Qty | UoM | HS Code | COO |
+        #               Total Item Weight | Unit Price | Total Amount
+        # SOR/PSHPT/POR order-reference lines are interspersed and must be skipped.
+        _is_marlow = (
+            re.search(r'\bHS Code\b', all_text) is not None
+            and re.search(r'\bItem No\.', all_text) is not None
+            and re.search(r'\bUoM\b', all_text) is not None
+        )
+        if _is_marlow:
+            print("[Parser] Marlow Ropes 'HS Code / UoM' table format detected — using dedicated parser")
+            lines = all_text.split('\n')
+            items = self._parse_marlow_format(lines, direction, page_map)
+            items = self._postprocess_items(items)
+            return {
+                "total_items": len(items),
+                "items": items,
+                "pages_analyzed": len(pages_data.get("pages", [])),
+                "direction": direction,
+                "format_type": "marlow",
+            }
+
         # ── LLM path ──────────────────────────────────────────────────────────
         # Priority: 1) Google Gemini (free tier) → 2) OpenAI → 3) regex fallback
 
@@ -2141,6 +2164,175 @@ class LineItemParser:
         }
         return country_map.get(country.upper(), country)
     
+    def _parse_marlow_format(self, lines: List[str], direction: str, page_map: Dict) -> List[Dict]:
+        """Parse Marlow Ropes-style commercial invoices.
+
+        Column order:
+            Item No. | Description | Qty | UoM | HS Code | Country of Origin |
+            Total Item Weight | Unit Price | Total Amount
+
+        Challenges handled:
+        - SOR/PSHPT/POR order-reference lines interspersed between items
+        - Description cells that visually wrap to the next PDF line
+        - Unit price may be a long floating-point that overflows to a
+          continuation line (e.g. 4.1899999999999) — we anchor on the
+          10-digit HS code and take the last money value as total_value
+        - UoM can be "EA" or "M" (metres for lifeline products)
+        """
+        items: List[Dict] = []
+        pad_to_10 = direction.lower() == "import"
+
+        # Item number at line start: 2–3 uppercase letters + 3–4 digits
+        # e.g. PK0357, WTW034, JLN005, FAB114, EDA003
+        _item_re = re.compile(r'^([A-Z]{2,3}\d{3,4})\b')
+
+        # Lines to skip unconditionally
+        _skip_re = re.compile(
+            r'^SOR\d'                           # SOR order references
+            r'|^Page \d+ of'                    # page numbers
+            r'|^Exporter:'
+            r'|^Commercial Invoice'
+            r'|^Our Standard'
+            r'|^Item No\.'                       # column header
+            r'|^VAT No[: ]'
+            r'|^UK EORI:'
+            r'|^EU EORI:'
+            r'|^NI EORI:'
+            r'|^FR VAT'
+            r'|^Marlow Ropes'
+            r'|^Phone:'
+            r'|^Web:'
+            r'|^Invoice Address'
+            r'|^Consignee[: ]'
+            r'|^MARLOW ROPES'
+            r'|^Suite \d'
+            r'|^Plymouth'
+            r'|^Massachusetts'
+            r'|^USA\s*$'
+            r'|^GW:'
+            r'|^Shipping Terms'
+            r'|^Signed'
+            r'|^Account No'
+            r'|^Invoice No'
+            r'|^Invoice Date'
+            r'|^Payment Terms'
+            r'|^Barclays Bank'
+            r'|^Worcester'
+            r'|^WR\d'
+            r'|^Great Britain'
+            r'|^Tax Exclusive'
+            r'|^VAT Amount'
+            r'|^Total USD'
+            r'|^Comments'
+            r'|^Marlow Ropes USD'
+            r'|---\s*PAGE',
+            re.IGNORECASE,
+        )
+
+        _hs_re = re.compile(r'\b(\d{10})\b')
+        _money_re = re.compile(r'([\d,]+\.\d{2})')
+
+        def _build_item(item_no: str, buf_lines: List[str], line_idx: int) -> Optional[Dict]:
+            all_text = ' '.join(buf_lines)
+            hs_m = _hs_re.search(all_text)
+            if not hs_m:
+                return None
+
+            hs_code_raw = hs_m.group(1)
+            before_hs = all_text[:hs_m.start()].strip()
+            after_hs = all_text[hs_m.end():].strip()
+
+            # before_hs: "DESCRIPTION... QTY UOM"
+            btokens = before_hs.split()
+            uom, qty, desc_end = "EA", "1", len(btokens)
+            for j in range(len(btokens) - 1, max(-1, len(btokens) - 6), -1):
+                t = btokens[j].upper()
+                if t in ('EA', 'M', 'PC', 'PCS'):
+                    uom = t
+                    desc_end = j
+                    if j > 0 and re.match(r'^\d+(?:\.\d+)?$', btokens[j - 1]):
+                        qty = btokens[j - 1]
+                        desc_end = j - 1
+                    break
+            description = ' '.join(btokens[:desc_end])
+
+            # after_hs: "COO  WEIGHT  [unit_price_possibly_overflowing]  TOTAL"
+            atokens = after_hs.split()
+            coo, weight = "", ""
+            idx = 0
+            if idx < len(atokens) and re.match(r'^[A-Z]{2}$', atokens[idx]):
+                coo = atokens[idx]
+                idx += 1
+            if idx < len(atokens) and re.match(r'^[\d.]+$', atokens[idx].replace(',', '')):
+                weight = atokens[idx]
+                idx += 1
+
+            # Remaining tokens may include long float overflow; find money values
+            remaining = ' '.join(atokens[idx:])
+            money_vals = _money_re.findall(remaining)
+            total_value = money_vals[-1].replace(',', '') if money_vals else ""
+            unit_value = money_vals[-2].replace(',', '') if len(money_vals) >= 2 else total_value
+
+            hs_code = self._pad_hs_code(hs_code_raw, pad_to_10)
+            char_pos = sum(len(lines[k]) + 1 for k in range(line_idx))
+            page_num = page_map.get(char_pos, 1)
+
+            return {
+                "line_number": str(len(items) + 1),
+                "stock_number": item_no,
+                "description": description or item_no,
+                "quantity": qty,
+                "uom": uom.upper(),
+                "unit_value": unit_value,
+                "total_value": total_value,
+                "currency": "USD",
+                "commodity_code": hs_code,
+                "country_of_origin": coo.upper() if coo else "GB",
+                "net_weight": weight,
+                "unit_weight": "",
+                "hs_code": hs_code,
+                "pages": [page_num],
+                "confidence": 0.87,
+                "needs_review": False,
+                "raw_text": all_text[:200],
+            }
+
+        pending_no: Optional[str] = None
+        pending_lines: List[str] = []
+        pending_idx: int = 0
+
+        def _flush():
+            nonlocal pending_no, pending_lines
+            if pending_no:
+                it = _build_item(pending_no, pending_lines, pending_idx)
+                if it:
+                    items.append(it)
+            pending_no = None
+            pending_lines = []
+
+        for i, raw_line in enumerate(lines):
+            line = raw_line.strip()
+            if not line:
+                continue
+
+            if _skip_re.search(line):
+                # A SOR/header line acts as a natural item boundary
+                _flush()
+                continue
+
+            item_m = _item_re.match(line)
+            if item_m:
+                _flush()
+                pending_no = item_m.group(1)
+                pending_lines = [line[item_m.end():].strip()]
+                pending_idx = i
+            elif pending_no:
+                # Continuation: description overflow or numeric overflow
+                pending_lines.append(line)
+
+        _flush()
+        return items
+
     def _parse_solarlux_format(self, lines: List[str], direction: str, page_map: Dict) -> List[Dict]:
         """Parse Solarlux-style invoices with 'Article no.' and 'Comm. code' columns.
 
