@@ -81,6 +81,29 @@ class LineItemParser:
                 "format_type": "rs_sitpro",
             }
 
+        # ── Solarlux / "Comm. code" table format ──────────────────────────────
+        # Invoices with "Article no." and "Comm. code" column headers use a
+        # table layout: Article no. | Description | Qty | Unit price EUR |
+        # Total price EUR | Net weight (kg) | Comm. code | Country of origin
+        # e.g. SOLARLUX GmbH invoices. All numeric data sits on the same line
+        # as the article number; descriptions may wrap to subsequent lines.
+        _is_solarlux = (
+            re.search(r'Comm\.?\s*code', all_text, re.IGNORECASE) is not None
+            and re.search(r'Article\s+no\.?', all_text, re.IGNORECASE) is not None
+        )
+        if _is_solarlux:
+            print("[Parser] Solarlux 'Comm. code' table format detected — using dedicated parser")
+            lines = all_text.split('\n')
+            items = self._parse_solarlux_format(lines, direction, page_map)
+            items = self._postprocess_items(items)
+            return {
+                "total_items": len(items),
+                "items": items,
+                "pages_analyzed": len(pages_data.get("pages", [])),
+                "direction": direction,
+                "format_type": "solarlux",
+            }
+
         # ── LLM path ──────────────────────────────────────────────────────────
         # Priority: 1) Google Gemini (free tier) → 2) OpenAI → 3) regex fallback
 
@@ -2118,6 +2141,144 @@ class LineItemParser:
         }
         return country_map.get(country.upper(), country)
     
+    def _parse_solarlux_format(self, lines: List[str], direction: str, page_map: Dict) -> List[Dict]:
+        """Parse Solarlux-style invoices with 'Article no.' and 'Comm. code' columns.
+
+        Column layout:
+            Article no. | Description | Quantity | Unit price EUR |
+            Total price EUR | Net weight (kg) | Comm. code | Country of origin
+
+        PyMuPDF typically outputs each table row on one line:
+            56-702-1269-900 Version 2022 // brochure 12.00 ST 56.43 / 12 56.43 11.52 49111090 DE *
+
+        The unit price column uses a "total/n" fraction (e.g. 56.43 / 12) which
+        is skipped; unit value is derived as total ÷ quantity instead.
+
+        Multi-line descriptions produce plain continuation lines after the data
+        line — those are appended to the previous item's description when the
+        tail (numeric columns) was already found on the main line.
+        """
+        items: List[Dict] = []
+        pad_to_10 = direction.lower() == "import"
+
+        # Article number at start of line: starts with digits, 2–4 hyphen-digit groups
+        # e.g. 56-702-1269-900, 3-1250-1002-001, 15-0-1135-900
+        _art_re = re.compile(r'^\s*(\d+(?:-\d+){2,4})\b')
+
+        # Numeric tail: QTY  UOM  PRICE/N  TOTAL  WEIGHT  HS_CODE  COO
+        # UOM is a whitelist to guard against partial matches inside descriptions
+        # that contain numbers (e.g. "4,8 x 12,0").
+        _tail_re = re.compile(
+            r'(\d+[.,]\d{1,4})\s+'           # qty   e.g. 12.00, 0.80, 2.00
+            r'(ST|m|pc|pcs?|ea|stk)\s+'       # UOM   Stück / metre / piece
+            r'[\d.,]+\s*/\s*[\d.,]+\s+'       # unit-price fraction (ignored)
+            r'([\d.,]+)\s+'                   # total price EUR
+            r'([\d.,]+)\s+'                   # net weight kg
+            r'(\d{8,10})\s+'                  # Comm. code (8-digit HS)
+            r'([A-Z]{2})',                     # Country of origin
+            re.IGNORECASE,
+        )
+
+        # Lines to skip unconditionally
+        _skip_re = re.compile(
+            r'^\s*\d+\s*\(\d+\)\s*$'          # section headers: "1  (1)", "1  (2)"
+            r'|^\s*Article\s+no'              # column header row
+            r'|^\s*Total\s+gross'             # totals row
+            r'|^---\s*PAGE',                  # page-break markers inserted by parser
+            re.IGNORECASE,
+        )
+
+        pending_art: Optional[str] = None
+        pending_desc: List[str] = []
+        pending_line_idx: int = 0
+
+        def _emit(article: str, desc: str, tail_m, raw: str, line_i: int) -> None:
+            qty_s, uom, total_s, weight_s, hs_raw, coo = tail_m.groups()
+            qty_s = qty_s.replace(',', '.')
+            total_s = total_s.replace(',', '')
+            weight_s = weight_s.replace(',', '')
+            hs_code = hs_raw.replace('.', '').replace(',', '')
+
+            try:
+                qty_f = float(qty_s)
+                # Remove unnecessary trailing zeros: 12.00 → "12", 0.80 → "0.8"
+                quantity = str(int(qty_f)) if qty_f == int(qty_f) else str(qty_f)
+            except Exception:
+                quantity = qty_s
+
+            try:
+                qty_for_unit = float(quantity) if quantity and float(quantity) != 0 else 1.0
+                unit_v = str(round(float(total_s) / qty_for_unit, 4))
+            except Exception:
+                unit_v = total_s
+
+            hs_code = self._pad_hs_code(hs_code, pad_to_10)
+
+            # Approximate page lookup via cumulative character offset
+            char_pos = sum(len(lines[k]) + 1 for k in range(line_i))
+            page_num = page_map.get(char_pos, 1)
+
+            items.append({
+                "line_number": str(len(items) + 1),
+                "stock_number": article,
+                "description": desc or article,
+                "quantity": quantity,
+                "uom": uom.upper(),
+                "unit_value": unit_v,
+                "total_value": total_s,
+                "currency": "EUR",
+                "commodity_code": hs_code,
+                "country_of_origin": coo.upper(),
+                "net_weight": weight_s,
+                "unit_weight": "",
+                "hs_code": hs_code,
+                "pages": [page_num],
+                "confidence": 0.88,
+                "needs_review": False,
+                "raw_text": raw[:200],
+            })
+
+        for i, raw_line in enumerate(lines):
+            line = raw_line.strip()
+            if not line or _skip_re.search(line):
+                continue
+
+            art_m = _art_re.match(line)
+            if art_m:
+                article = art_m.group(1)
+                rest = line[art_m.end():].strip()
+
+                tail_m = _tail_re.search(rest)
+                if tail_m:
+                    # All data on one line — emit immediately
+                    desc = rest[:tail_m.start()].strip()
+                    _emit(article, desc, tail_m, line, i)
+                    pending_art = None
+                    pending_desc = []
+                else:
+                    # Article + (partial) description; tail arrives on later line(s)
+                    pending_art = article
+                    pending_desc = [rest] if rest else []
+                    pending_line_idx = i
+
+            elif pending_art:
+                # No new article — look for tail on this continuation line
+                tail_m = _tail_re.search(line)
+                if tail_m:
+                    prefix = line[:tail_m.start()].strip()
+                    if prefix:
+                        pending_desc.append(prefix)
+                    desc = ' '.join(d for d in pending_desc if d).strip()
+                    raw = ' '.join(filter(None, pending_desc)) + ' ' + line
+                    _emit(pending_art, desc, tail_m, raw, pending_line_idx)
+                    pending_art = None
+                    pending_desc = []
+                else:
+                    # More description continuation
+                    pending_desc.append(line)
+
+        return items
+
     def _pad_hs_code(self, hs_code: str, pad_to_10: bool) -> str:
         """Normalise HS code length: 8 digits for export, 10 for import.
         Pads short codes up AND truncates over-length codes down."""
