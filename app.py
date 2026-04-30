@@ -1200,6 +1200,19 @@ elif st.session_state.processing_started and st.session_state.current_job_id:
                 }
                 fmt_label = fmt_labels.get(fmt_type, fmt_labels['unknown'])
                 st.caption(f"Format detected: {fmt_label}")
+
+                # Show raw items in a collapsible expander (useful for debugging)
+                with st.expander("📋 View raw parsed items (before consolidation)", expanded=False):
+                    df_raw = pd.DataFrame([{
+                        'stock_number': it.get('stock_number', ''),
+                        'description': it.get('description', '')[:50],
+                        'quantity': it.get('quantity', ''),
+                        'uom': it.get('uom', ''),
+                        'total_value': it.get('total_value', ''),
+                        'commodity_code': it.get('commodity_code', ''),
+                        'country_of_origin': it.get('country_of_origin', ''),
+                    } for it in items])
+                    st.dataframe(df_raw, use_container_width=True, height=250)
                 
                 if len(items) == 0:
                     st.warning(
