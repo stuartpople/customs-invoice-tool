@@ -1189,6 +1189,13 @@ elif st.session_state.processing_started and st.session_state.current_job_id:
                     'vertical_table': '📋 Vertical table (e.g. ATI-style multi-page invoices)',
                     'horizontal_table': '📋 Horizontal table (standard row-per-item invoices)',
                     'pattern': '🔍 Pattern-based (free-form text layout)',
+                    'rs_sitpro': '📋 RS Components SITPRO format',
+                    'solarlux': '📋 Solarlux / Comm.code table format',
+                    'marlow': '📋 Marlow Ropes table format',
+                    'llm_gemini': '🤖 AI extraction (Gemini)',
+                    'llm_gpt4o_mini': '🤖 AI extraction (GPT-4o mini)',
+                    'llm_gemini_lastresort': '🤖 AI extraction (Gemini — last resort)',
+                    'llm_gpt4o_lastresort': '🤖 AI extraction (GPT-4o — last resort)',
                     'unknown': '❓ Unknown format'
                 }
                 fmt_label = fmt_labels.get(fmt_type, fmt_labels['unknown'])
