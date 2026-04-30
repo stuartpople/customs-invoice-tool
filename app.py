@@ -1067,6 +1067,7 @@ elif st.session_state.processing_started and st.session_state.current_job_id:
                 with st.spinner(f"Parsing line items from {len(pdf_job_ids)} PDF file(s)..."):
                     all_items = []
                     errors = []
+                    fmt = 'unknown'
                     
                     # Parse each PDF and combine items
                     for idx, job_id in enumerate(pdf_job_ids, 1):
