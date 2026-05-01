@@ -127,6 +127,25 @@ class LineItemParser:
                 "format_type": "marlow",
             }
 
+        # ── Arrow Export / (cc:XXXXXXXXXX) bracket HS code format ─────────────
+        # Invoices from Arrow Export (and similar) embed HS codes inline as
+        # "(cc:8204120000)". PyMuPDF extracts the columns in an unusual order:
+        #   TOTAL_PRICE → ITEM_NUM. → UNIT_PRICE → description lines →
+        #   (cc:HS_CODE) → UOM → QTY
+        _is_arrow_export = re.search(r'\(cc:\d{8,10}\)', all_text) is not None
+        if _is_arrow_export:
+            print("[Parser] Arrow Export '(cc:...)' bracket HS code format detected — using dedicated parser")
+            lines = all_text.split('\n')
+            items = self._parse_arrow_export_format(lines, direction, page_map)
+            items = self._postprocess_items(items)
+            return {
+                "total_items": len(items),
+                "items": items,
+                "pages_analyzed": len(pages_data.get("pages", [])),
+                "direction": direction,
+                "format_type": "arrow_export",
+            }
+
         # ── LLM path ──────────────────────────────────────────────────────────
         # Priority: 1) Google Gemini (free tier) → 2) OpenAI → 3) regex fallback
 
@@ -2475,6 +2494,118 @@ class LineItemParser:
                 else:
                     # More description continuation
                     pending_desc.append(line)
+
+        return items
+
+    def _parse_arrow_export_format(self, lines: List[str], direction: str, page_map: Dict) -> List[Dict]:
+        """Parse Arrow Export-style invoices where HS codes appear as (cc:XXXXXXXXXX).
+
+        PyMuPDF extracts the multi-column table in an unusual interleaved order:
+            TOTAL_PRICE  (line before the item number)
+            N.           (item number: '1.', '2.', ...)
+            UNIT_PRICE   (line after item number)
+            Description line(s) — possibly ending with (cc:XXXXXXXXXX) inline
+            (cc:XXXXXXXXXX) — on its own line when not inline
+            UOM          (Nos / Pack / Each ...)
+            QTY
+
+        Detection: text contains (cc:\\d{8,10}) anywhere.
+        """
+        items: List[Dict] = []
+        pad_to_10 = direction.lower() == "import"
+
+        # Detect currency from header block
+        currency = "GBP"
+        for line in lines[:40]:
+            l = line.strip()
+            if "British Pound" in l or l == "GBP":
+                currency = "GBP"
+                break
+            if "USD" in l or "US Dollar" in l:
+                currency = "USD"
+                break
+            if "EUR" in l or "Euro" in l:
+                currency = "EUR"
+                break
+
+        # Find item-number lines: standalone "N." (1–3 digits followed by period)
+        item_indices = [
+            i for i, raw in enumerate(lines)
+            if re.match(r'^\d{1,3}\.$', raw.strip())
+        ]
+        if not item_indices:
+            return items
+
+        for k, idx in enumerate(item_indices):
+            # Total price is the line immediately before the item number
+            total_value = ""
+            if idx > 0:
+                prev = lines[idx - 1].strip()
+                if re.match(r'^[\d,]+\.\d{2}$', prev):
+                    total_value = prev.replace(",", "")
+
+            # Unit price is the line immediately after the item number
+            unit_value = ""
+            if idx + 1 < len(lines):
+                nxt = lines[idx + 1].strip()
+                if re.match(r'^[\d,]+\.\d{1,4}$', nxt):
+                    unit_value = nxt.replace(",", "")
+
+            # Item block: idx+2 up to (not including) the total-price line of
+            # the next item; for the last item use end of file.
+            end_idx = item_indices[k + 1] - 1 if k + 1 < len(item_indices) else len(lines)
+            block_lines = [lines[j].strip() for j in range(idx + 2, end_idx) if lines[j].strip()]
+
+            hs_code = ""
+            qty = ""
+            uom = ""
+            desc_parts: List[str] = []
+
+            for bl in block_lines:
+                cc_m = re.search(r'\(cc:(\d{8,10})\)', bl)
+                if cc_m:
+                    hs_code = cc_m.group(1)
+                    desc_before = bl[:cc_m.start()].strip()
+                    if desc_before:
+                        desc_parts.append(desc_before)
+                elif re.match(r'^(Nos|Pack|Each|Set|Kit|Pcs|Pc|EA|Box|Roll)$', bl, re.IGNORECASE):
+                    uom = bl
+                elif re.match(r'^[\d,]+\.?\d*$', bl.replace(",", "")):
+                    if not qty:
+                        qty = bl.replace(",", "")
+                else:
+                    desc_parts.append(bl)
+                # Once all three key fields found we can stop
+                if hs_code and uom and qty:
+                    break
+
+            description = " ".join(desc_parts).strip()
+            if not description or not hs_code or not total_value:
+                continue
+
+            hs_code = self._pad_hs_code(hs_code, pad_to_10)
+            char_pos = sum(len(lines[j]) + 1 for j in range(idx))
+            page_num = page_map.get(char_pos, 1)
+
+            items.append({
+                "line_number": lines[idx].strip().rstrip("."),
+                "stock_number": "",
+                "description": description,
+                "quantity": qty or "1",
+                "uom": uom or "Nos",
+                "unit_value": unit_value,
+                "total_value": total_value,
+                "currency": currency,
+                "commodity_code": hs_code,
+                "country_of_origin": "GB",
+                "net_weight": "",
+                "unit_weight": "",
+                "hs_code": hs_code,
+                "pages": [page_num],
+                "confidence": 0.85,
+                "needs_review": False,
+                "raw_text": " ".join(block_lines)[:200],
+            })
 
         return items
 

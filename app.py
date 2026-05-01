@@ -1192,6 +1192,7 @@ elif st.session_state.processing_started and st.session_state.current_job_id:
                     'rs_sitpro': '📋 RS Components SITPRO format',
                     'solarlux': '📋 Solarlux / Comm.code table format',
                     'marlow': '📋 Marlow Ropes table format',
+                    'arrow_export': '📋 Arrow Export (cc: bracket HS code format)',
                     'llm_gemini': '🤖 AI extraction (Gemini)',
                     'llm_gpt4o_mini': '🤖 AI extraction (GPT-4o mini)',
                     'llm_gemini_lastresort': '🤖 AI extraction (Gemini — last resort)',
