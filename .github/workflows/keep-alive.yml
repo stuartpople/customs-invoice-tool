@@ -1,0 +1,50 @@
+name: Keep Streamlit App Awake
+
+# Runs every 3 hours around the clock.
+# Streamlit Community Cloud sleeps after ~7 days of no real traffic;
+# this workflow opens a genuine browser session (WebSocket + JS execution)
+# which Streamlit counts as an active viewer — preventing the sleep.
+on:
+  schedule:
+    - cron: '0 */3 * * *'   # every 3 hours
+  workflow_dispatch:         # allow manual trigger from GitHub Actions UI
+
+jobs:
+  wake-app:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Install Playwright + Chromium
+        run: |
+          pip install playwright
+          playwright install chromium --with-deps
+
+      - name: Open Streamlit app (establishes WebSocket)
+        env:
+          APP_URL: ${{ secrets.STREAMLIT_APP_URL }}
+        run: |
+          python - <<'EOF'
+          import os, time
+          from playwright.sync_api import sync_playwright
+
+          url = os.environ.get("APP_URL", "").strip()
+          if not url:
+              print("ERROR: STREAMLIT_APP_URL secret is not set.")
+              exit(1)
+
+          print(f"Waking: {url}")
+          with sync_playwright() as p:
+              browser = p.chromium.launch()
+              page = browser.new_page()
+              # Navigate and wait for Streamlit's root element to appear
+              page.goto(url, timeout=60000)
+              # Wait up to 30 s for the app to finish loading
+              try:
+                  page.wait_for_selector("div[data-testid='stApp']", timeout=30000)
+                  print("App loaded successfully — WebSocket session established.")
+              except Exception:
+                  print("Timed out waiting for stApp — app may still be waking.")
+              time.sleep(5)   # hold connection briefly so Streamlit registers it
+              browser.close()
+          EOF
