@@ -21,18 +21,12 @@ jobs:
           playwright install chromium --with-deps
 
       - name: Open Streamlit app (establishes WebSocket)
-        env:
-          APP_URL: ${{ secrets.STREAMLIT_APP_URL }}
         run: |
           python - <<'EOF'
-          import os, time
+          import time
           from playwright.sync_api import sync_playwright
 
-          url = os.environ.get("APP_URL", "").strip()
-          if not url:
-              print("ERROR: STREAMLIT_APP_URL secret is not set.")
-              exit(1)
-
+          url = "https://uscnappjlbdwmvemivjxzm4.streamlit.app/"
           print(f"Waking: {url}")
           with sync_playwright() as p:
               browser = p.chromium.launch()
