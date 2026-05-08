@@ -2553,26 +2553,45 @@ class LineItemParser:
         # Also fall back to inline if standalone produces no usable items.
         use_inline = len(inline_indices) >= len(standalone_indices) and inline_indices
 
+        # Two-number price pair pattern used for Layout C within-block prices
+        _price_pair_re = re.compile(r'([\d,]+\.\d{2})\s+([\d,]+\.\d{2})')
+
         if standalone_indices and not use_inline:
-            # ── Layout A: item number alone on its own line ───────────────────
+            # ── Layout A / C: item number alone on its own line ───────────────
+            # Layout A (INV00017249): total price is a standalone line immediately
+            #   BEFORE the item number; unit price is the line AFTER; block idx+2.
+            # Layout C (INV00017252): no price before item; prices appear as a
+            #   "UNIT  TOTAL" pair on one line WITHIN the block; block starts idx+1.
             for k, idx in enumerate(standalone_indices):
-                # Total price is the line immediately before the item number
+                # Try Layout A: standalone total price on line before item number
                 total_value = ""
+                unit_value = ""
                 if idx > 0:
                     prev = lines[idx - 1].strip()
                     if re.match(r'^[\d,]+\.\d{2}$', prev):
                         total_value = prev.replace(",", "")
 
-                # Unit price is the line immediately after the item number
-                unit_value = ""
-                if idx + 1 < len(lines):
+                # Block boundary:
+                # Layout A: exclude the price line sitting before the next item
+                # Layout C: no such price line — go all the way to next item number
+                if k + 1 < len(standalone_indices):
+                    next_idx = standalone_indices[k + 1]
+                    end_idx = next_idx - 1 if total_value else next_idx
+                else:
+                    end_idx = len(lines)
+
+                # Layout A: unit price is the line right after item number (idx+1)
+                #           and the rest of the block starts at idx+2
+                # Layout C: idx+1 is qty, not unit price — block starts at idx+1
+                if total_value and idx + 1 < len(lines):
                     nxt = lines[idx + 1].strip()
                     if re.match(r'^[\d,]+\.\d{1,4}$', nxt):
                         unit_value = nxt.replace(",", "")
+                    start_of_block = idx + 2
+                else:
+                    start_of_block = idx + 1  # Layout C: idx+1 is qty
 
-                # Block between this item and the total-price line of the next
-                end_idx = standalone_indices[k + 1] - 1 if k + 1 < len(standalone_indices) else len(lines)
-                block_lines = [lines[j].strip() for j in range(idx + 2, end_idx) if lines[j].strip()]
+                block_lines = [lines[j].strip() for j in range(start_of_block, end_idx) if lines[j].strip()]
 
                 hs_code = ""
                 qty = ""
@@ -2581,11 +2600,18 @@ class LineItemParser:
 
                 for bl in block_lines:
                     cc_m = re.search(r'\(cc:(\d{8,10})\)', bl)
+                    # Only look for price pair in Layout C (total_value still empty)
+                    pair_m = _price_pair_re.search(bl) if not total_value else None
+
                     if cc_m:
                         hs_code = cc_m.group(1)
-                        desc_before = bl[:cc_m.start()].strip()
-                        if desc_before:
-                            desc_parts.append(desc_before)
+                        desc_text = (bl[:cc_m.start()] + bl[cc_m.end():]).strip()
+                        if desc_text:
+                            desc_parts.append(desc_text)
+                    elif pair_m:
+                        # Layout C price pair: "UNIT_PRICE  TOTAL_PRICE"
+                        unit_value = pair_m.group(1).replace(",", "")
+                        total_value = pair_m.group(2).replace(",", "")
                     elif re.match(r'^(Nos|Pack|Each|Set|Kit|Pcs?|EA|Box|Roll)$', bl, re.IGNORECASE):
                         uom = bl
                     elif re.match(r'^[\d,]+\.?\d*$', bl.replace(",", "")):
@@ -2593,7 +2619,9 @@ class LineItemParser:
                             qty = bl.replace(",", "")
                     else:
                         desc_parts.append(bl)
-                    if hs_code and uom and qty:
+                    # Stop once all four fields are collected — avoids pulling in
+                    # footer lines (Total Ex Works, Packing...) as description text
+                    if hs_code and total_value and qty and uom:
                         break
 
                 description = " ".join(desc_parts).strip()
@@ -2624,8 +2652,7 @@ class LineItemParser:
                     "raw_text": " ".join(block_lines)[:200],
                 })
 
-            # If Layout A produced nothing (e.g. order-ref line sat before item 1
-            # instead of a total-price line), fall through to Layout B
+            # If Layout A/C produced nothing, fall through to Layout B
             if not items and inline_indices:
                 use_inline = True
 
