@@ -2500,14 +2500,17 @@ class LineItemParser:
     def _parse_arrow_export_format(self, lines: List[str], direction: str, page_map: Dict) -> List[Dict]:
         """Parse Arrow Export-style invoices where HS codes appear as (cc:XXXXXXXXXX).
 
-        PyMuPDF extracts the multi-column table in an unusual interleaved order:
-            TOTAL_PRICE  (line before the item number)
-            N.           (item number: '1.', '2.', ...)
-            UNIT_PRICE   (line after item number)
-            Description line(s) — possibly ending with (cc:XXXXXXXXXX) inline
-            (cc:XXXXXXXXXX) — on its own line when not inline
-            UOM          (Nos / Pack / Each ...)
-            QTY
+        Two layouts are handled depending on how PyMuPDF extracts the column-based table:
+
+        Layout A — columns interleaved (INV00017249 style):
+            TOTAL_PRICE  (standalone line before the item number)
+            N.           (item number alone on its own line)
+            UNIT_PRICE   (standalone line after the item number)
+            Description line(s) | (cc:XXXXXXXXXX) | UOM | QTY
+
+        Layout B — row-per-item (INV00017252 style):
+            N. QTY UOM Description... UNIT_PRICE TOTAL_PRICE
+            (cc:XXXXXXXXXX) and/or extra description may overflow to next line(s)
 
         Detection: text contains (cc:\\d{8,10}) anywhere.
         """
@@ -2528,84 +2531,164 @@ class LineItemParser:
                 currency = "EUR"
                 break
 
-        # Find item-number lines: standalone "N." (1–3 digits followed by period)
-        item_indices = [
-            i for i, raw in enumerate(lines)
-            if re.match(r'^\d{1,3}\.$', raw.strip())
-        ]
-        if not item_indices:
-            return items
+        # ── Layout detection ──────────────────────────────────────────────────
+        # Layout A: item number appears alone on its own line ("1.", "2.", ...)
+        # Layout B: item number starts the row ("1. 2.00 Nos Description 9.17 917.00")
+        _standalone_re = re.compile(r'^\d{1,3}\.$')
+        _inline_re = re.compile(
+            r'^\s*(\d{1,3})\.\s+'
+            r'(\d+\.?\d*)\s+'
+            r'(Nos|Pack|Each|Set|Kit|Pcs?|EA|Box|Roll)\s+'
+            r'(.+?)\s+'
+            r'([\d,]+\.\d{2})\s+'
+            r'([\d,]+\.\d{2})\s*$',
+            re.IGNORECASE,
+        )
 
-        for k, idx in enumerate(item_indices):
-            # Total price is the line immediately before the item number
-            total_value = ""
-            if idx > 0:
-                prev = lines[idx - 1].strip()
-                if re.match(r'^[\d,]+\.\d{2}$', prev):
-                    total_value = prev.replace(",", "")
+        standalone_indices = [i for i, raw in enumerate(lines) if _standalone_re.match(raw.strip())]
+        inline_indices     = [i for i, raw in enumerate(lines) if _inline_re.match(raw.strip())]
 
-            # Unit price is the line immediately after the item number
-            unit_value = ""
-            if idx + 1 < len(lines):
-                nxt = lines[idx + 1].strip()
-                if re.match(r'^[\d,]+\.\d{1,4}$', nxt):
-                    unit_value = nxt.replace(",", "")
+        if standalone_indices:
+            # ── Layout A: item number alone on its own line ───────────────────
+            for k, idx in enumerate(standalone_indices):
+                # Total price is the line immediately before the item number
+                total_value = ""
+                if idx > 0:
+                    prev = lines[idx - 1].strip()
+                    if re.match(r'^[\d,]+\.\d{2}$', prev):
+                        total_value = prev.replace(",", "")
 
-            # Item block: idx+2 up to (not including) the total-price line of
-            # the next item; for the last item use end of file.
-            end_idx = item_indices[k + 1] - 1 if k + 1 < len(item_indices) else len(lines)
-            block_lines = [lines[j].strip() for j in range(idx + 2, end_idx) if lines[j].strip()]
+                # Unit price is the line immediately after the item number
+                unit_value = ""
+                if idx + 1 < len(lines):
+                    nxt = lines[idx + 1].strip()
+                    if re.match(r'^[\d,]+\.\d{1,4}$', nxt):
+                        unit_value = nxt.replace(",", "")
 
-            hs_code = ""
-            qty = ""
-            uom = ""
-            desc_parts: List[str] = []
+                # Block between this item and the total-price line of the next
+                end_idx = standalone_indices[k + 1] - 1 if k + 1 < len(standalone_indices) else len(lines)
+                block_lines = [lines[j].strip() for j in range(idx + 2, end_idx) if lines[j].strip()]
 
-            for bl in block_lines:
-                cc_m = re.search(r'\(cc:(\d{8,10})\)', bl)
+                hs_code = ""
+                qty = ""
+                uom = ""
+                desc_parts: List[str] = []
+
+                for bl in block_lines:
+                    cc_m = re.search(r'\(cc:(\d{8,10})\)', bl)
+                    if cc_m:
+                        hs_code = cc_m.group(1)
+                        desc_before = bl[:cc_m.start()].strip()
+                        if desc_before:
+                            desc_parts.append(desc_before)
+                    elif re.match(r'^(Nos|Pack|Each|Set|Kit|Pcs?|EA|Box|Roll)$', bl, re.IGNORECASE):
+                        uom = bl
+                    elif re.match(r'^[\d,]+\.?\d*$', bl.replace(",", "")):
+                        if not qty:
+                            qty = bl.replace(",", "")
+                    else:
+                        desc_parts.append(bl)
+                    if hs_code and uom and qty:
+                        break
+
+                description = " ".join(desc_parts).strip()
+                if not description or not hs_code or not total_value:
+                    continue
+
+                hs_code = self._pad_hs_code(hs_code, pad_to_10)
+                char_pos = sum(len(lines[j]) + 1 for j in range(idx))
+                page_num = page_map.get(char_pos, 1)
+
+                items.append({
+                    "line_number": lines[idx].strip().rstrip("."),
+                    "stock_number": "",
+                    "description": description,
+                    "quantity": qty or "1",
+                    "uom": uom or "Nos",
+                    "unit_value": unit_value,
+                    "total_value": total_value,
+                    "currency": currency,
+                    "commodity_code": hs_code,
+                    "country_of_origin": "GB",
+                    "net_weight": "",
+                    "unit_weight": "",
+                    "hs_code": hs_code,
+                    "pages": [page_num],
+                    "confidence": 0.85,
+                    "needs_review": False,
+                    "raw_text": " ".join(block_lines)[:200],
+                })
+
+        elif inline_indices:
+            # ── Layout B: full row on one line "N. QTY UOM desc... unit total" ─
+            for k, idx in enumerate(inline_indices):
+                m = _inline_re.match(lines[idx].strip())
+                if not m:
+                    continue
+                item_num_s, qty_s, uom, desc_partial, unit_value_raw, total_value_raw = m.groups()
+                total_value = total_value_raw.replace(",", "")
+                unit_value  = unit_value_raw.replace(",", "")
+
+                # Continuation lines: extra description and/or (cc:) code
+                end_idx = inline_indices[k + 1] if k + 1 < len(inline_indices) else len(lines)
+                cont_lines = [lines[j].strip() for j in range(idx + 1, end_idx) if lines[j].strip()]
+
+                hs_code = ""
+                desc_extra: List[str] = []
+
+                # Check if (cc:) is already embedded in the main item line
+                cc_m = re.search(r'\(cc:(\d{8,10})\)', desc_partial)
                 if cc_m:
                     hs_code = cc_m.group(1)
-                    desc_before = bl[:cc_m.start()].strip()
-                    if desc_before:
-                        desc_parts.append(desc_before)
-                elif re.match(r'^(Nos|Pack|Each|Set|Kit|Pcs|Pc|EA|Box|Roll)$', bl, re.IGNORECASE):
-                    uom = bl
-                elif re.match(r'^[\d,]+\.?\d*$', bl.replace(",", "")):
-                    if not qty:
-                        qty = bl.replace(",", "")
-                else:
-                    desc_parts.append(bl)
-                # Once all three key fields found we can stop
-                if hs_code and uom and qty:
-                    break
+                    desc_partial = (desc_partial[:cc_m.start()] + desc_partial[cc_m.end():]).strip()
 
-            description = " ".join(desc_parts).strip()
-            if not description or not hs_code or not total_value:
-                continue
+                # Scan continuation lines for (cc:) and extra description text
+                for cl in cont_lines:
+                    if re.match(r'^(Total|Packing|Signed|We hereby)', cl, re.IGNORECASE):
+                        break
+                    if not hs_code:
+                        cc_m2 = re.search(r'\(cc:(\d{8,10})\)', cl)
+                        if cc_m2:
+                            hs_code = cc_m2.group(1)
+                            before_cc = cl[:cc_m2.start()].strip()
+                            if before_cc:
+                                desc_extra.append(before_cc)
+                            continue
+                    desc_extra.append(cl)
 
-            hs_code = self._pad_hs_code(hs_code, pad_to_10)
-            char_pos = sum(len(lines[j]) + 1 for j in range(idx))
-            page_num = page_map.get(char_pos, 1)
+                description = (desc_partial + " " + " ".join(desc_extra)).strip()
+                if not description or not hs_code or not total_value:
+                    continue
 
-            items.append({
-                "line_number": lines[idx].strip().rstrip("."),
-                "stock_number": "",
-                "description": description,
-                "quantity": qty or "1",
-                "uom": uom or "Nos",
-                "unit_value": unit_value,
-                "total_value": total_value,
-                "currency": currency,
-                "commodity_code": hs_code,
-                "country_of_origin": "GB",
-                "net_weight": "",
-                "unit_weight": "",
-                "hs_code": hs_code,
-                "pages": [page_num],
-                "confidence": 0.85,
-                "needs_review": False,
-                "raw_text": " ".join(block_lines)[:200],
-            })
+                try:
+                    qty_f = float(qty_s)
+                    quantity = str(int(qty_f)) if qty_f == int(qty_f) else str(qty_f)
+                except Exception:
+                    quantity = qty_s
+
+                hs_code = self._pad_hs_code(hs_code, pad_to_10)
+                char_pos = sum(len(lines[j]) + 1 for j in range(idx))
+                page_num = page_map.get(char_pos, 1)
+
+                items.append({
+                    "line_number": item_num_s,
+                    "stock_number": "",
+                    "description": description,
+                    "quantity": quantity,
+                    "uom": uom,
+                    "unit_value": unit_value,
+                    "total_value": total_value,
+                    "currency": currency,
+                    "commodity_code": hs_code,
+                    "country_of_origin": "GB",
+                    "net_weight": "",
+                    "unit_weight": "",
+                    "hs_code": hs_code,
+                    "pages": [page_num],
+                    "confidence": 0.85,
+                    "needs_review": False,
+                    "raw_text": (lines[idx].strip() + " " + " ".join(cont_lines))[:200],
+                })
 
         return items
 
