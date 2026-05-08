@@ -2548,7 +2548,12 @@ class LineItemParser:
         standalone_indices = [i for i, raw in enumerate(lines) if _standalone_re.match(raw.strip())]
         inline_indices     = [i for i, raw in enumerate(lines) if _inline_re.match(raw.strip())]
 
-        if standalone_indices:
+        # Prefer inline layout if it has more candidates — some PDFs produce both
+        # (e.g. a standalone "1." on a page number vs real inline item rows).
+        # Also fall back to inline if standalone produces no usable items.
+        use_inline = len(inline_indices) >= len(standalone_indices) and inline_indices
+
+        if standalone_indices and not use_inline:
             # ── Layout A: item number alone on its own line ───────────────────
             for k, idx in enumerate(standalone_indices):
                 # Total price is the line immediately before the item number
@@ -2619,8 +2624,14 @@ class LineItemParser:
                     "raw_text": " ".join(block_lines)[:200],
                 })
 
-        elif inline_indices:
+            # If Layout A produced nothing (e.g. order-ref line sat before item 1
+            # instead of a total-price line), fall through to Layout B
+            if not items and inline_indices:
+                use_inline = True
+
+        if use_inline or (not standalone_indices and inline_indices):
             # ── Layout B: full row on one line "N. QTY UOM desc... unit total" ─
+            items = []  # reset in case Layout A partially populated
             for k, idx in enumerate(inline_indices):
                 m = _inline_re.match(lines[idx].strip())
                 if not m:
