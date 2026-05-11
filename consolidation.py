@@ -26,10 +26,10 @@ def group_by_commodity_code(items: List[Dict], group_by_origin: bool = False) ->
     blank_counter = 0
     
     for item in items:
-        commodity_code = item.get('commodity_code', '').strip()
+        commodity_code = (item.get('commodity_code') or '').strip()
         if commodity_code and commodity_code != 'UNKNOWN':
             if group_by_origin:
-                country = item.get('country_of_origin', '').strip()
+                country = (item.get('country_of_origin') or '').strip()
                 key = f"{commodity_code}|{country}" if country else commodity_code
             else:
                 key = commodity_code
