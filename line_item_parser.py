@@ -146,6 +146,24 @@ class LineItemParser:
                 "format_type": "arrow_export",
             }
 
+        # ── X-OSIL (Ocean Scientific) / "HS DDDD DDDD DD" spaced HS code format ─
+        # Invoices from Ocean Scientific International have HS codes formatted as
+        # "HS 9015 8080 00" (digit groups separated by spaces). PyMuPDF extracts
+        # the two columns interleaved: all price rows first (unit, total, VAT, qty
+        # as 4 separate lines per item), then all description rows.
+        _is_xosil = re.search(r'HS\s+\d{4}\s+\d{4}\s+\d{2}', all_text) is not None
+        if _is_xosil:
+            print("[Parser] X-OSIL 'HS DDDD DDDD DD' spaced HS code format detected — using dedicated parser")
+            items = self._parse_xosil_format(all_text, direction, page_map)
+            items = self._postprocess_items(items)
+            return {
+                "total_items": len(items),
+                "items": items,
+                "pages_analyzed": len(pages_data.get("pages", [])),
+                "direction": direction,
+                "format_type": "xosil",
+            }
+
         # ── LLM path ──────────────────────────────────────────────────────────
         # Priority: 1) Google Gemini (free tier) → 2) OpenAI → 3) regex fallback
 
@@ -3077,5 +3095,149 @@ class LineItemParser:
                     "raw_text": context[:200]
                 })
         
+        return items
+
+    def _parse_xosil_format(self, all_text: str, direction: str, page_map: Dict) -> List[Dict]:
+        """
+        Parse Ocean Scientific (X-OSIL) commercial invoices.
+
+        PyMuPDF interleaves the two columns per page:
+          1. Price block: consecutive groups of 4 lines — unit_price, total_price,
+             VAT, qty — for all items on that page.
+          2. Description block: each item appears as 'N x description\nHS DDDD DDDD DD[, Origin]'
+             optionally preceded/followed by '13% Reseller Discount' separators.
+
+        Items without a 'HS DDDD DDDD DD' line (e.g. warranty extensions, delivery
+        charges) are silently skipped because they have no commodity code.
+        """
+        items: List[Dict] = []
+        currency = "USD"
+        item_counter = 0
+
+        num_re   = re.compile(r'^[\d,]+\.\d{2}$')
+        hs_re    = re.compile(r'HS\s+(\d{4})\s+(\d{4})\s+(\d{2})(?:,\s*([A-Za-z]+)\s+Origin)?')
+        qty_x_re = re.compile(r'^(\d+)\s*x\s+(.+)', re.IGNORECASE)
+        origin_map = {'UK': 'GB', 'Norwegian': 'NO', 'Norway': 'NO', 'USA': 'US', 'US': 'US'}
+
+        # Split by page markers injected by parse_job_items
+        page_sections = re.split(r'\n?--- PAGE \d+ ---\n?', all_text)
+
+        for page_text in page_sections:
+            if not page_text.strip():
+                continue
+
+            # Each page repeats the column header; find where data starts
+            col_match = re.search(r'Unit Price\s*\nTotal Price\s*\nVAT\s*\n', page_text)
+            if not col_match:
+                continue
+
+            data_text = page_text[col_match.end():]
+            lines = [ln.strip() for ln in data_text.split('\n')]
+
+            # ── Phase 1: extract consecutive price groups (4 lines each) ──────
+            num_buf: List[str] = []
+            split_idx = len(lines)  # index where description block starts
+            for i, ln in enumerate(lines):
+                if num_re.match(ln):
+                    num_buf.append(ln.replace(',', ''))
+                elif num_buf and not ln:
+                    continue  # allow blank lines inside the number block
+                elif num_buf:
+                    split_idx = i
+                    break
+
+            # Groups of 4: unit, total, vat, qty
+            price_groups = []
+            for j in range(0, len(num_buf) - 3, 4):
+                u, t, _v, q = num_buf[j:j+4]
+                price_groups.append({'unit': u, 'total': t, 'qty': q})
+
+            # ── Phase 2: extract description items (forward scan) ─────────────
+            desc_items = []
+            current: Dict = {}
+            in_sub_block = False  # True while inside "each includes the following:"
+
+            for ln in lines[split_idx:]:
+                # Stop at footer boilerplate
+                if any(ln.startswith(p) for p in (
+                    'Payment Terms', 'Ocean Scientific', 'Culkin House',
+                    'Account Name', 'Bank:', 'Sort Code', 'IBAN', 'BIC',
+                    'Total Net', 'Total USD', 'Total VAT',
+                    'Please export', 'Goods IP', 'IP Auth', 'Supervising',
+                    'Net Weight', 'Gross Weight', 'VAT Reg', 'EORI:',
+                    'OSIL Standard', 'V7 280422',
+                )):
+                    break
+
+                if not ln:
+                    continue
+
+                # Separator / discount annotation — skip
+                if re.match(r'^\d+%', ln):
+                    continue
+
+                # Sub-item list header — enter sub-block mode
+                if ln.startswith('each includes'):
+                    in_sub_block = True
+                    continue
+
+                hs_m = hs_re.match(ln)
+                if hs_m:
+                    if current:
+                        hs_digits = hs_m.group(1) + hs_m.group(2) + hs_m.group(3)
+                        origin_word = hs_m.group(4) or 'UK'
+                        current['hs'] = hs_digits
+                        current['country'] = origin_map.get(origin_word, 'GB')
+                        desc_items.append(current)
+                        current = {}
+                    in_sub_block = False
+                    continue
+
+                # While inside a bundle's sub-item list, ignore "N x" lines
+                if in_sub_block:
+                    continue
+
+                qm = qty_x_re.match(ln)
+                if qm:
+                    # Flush previous incomplete item (no HS code = delivery/warranty)
+                    current = {
+                        'qty': qm.group(1),
+                        'description': qm.group(2).strip(),
+                        'hs': None,
+                        'country': 'GB',
+                    }
+                    continue
+
+            # ── Phase 3: zip price groups with description items ──────────────
+            for pg, di in zip(price_groups, desc_items):
+                item_counter += 1
+                hs_code = self._pad_hs_code(di['hs'], True)
+                # Clean asterisk footnote references from description
+                description = re.sub(r'\s*\*#\d+', '', di['description']).strip()
+                # Use price group qty (more reliable for bundles like "2 x")
+                qty_val = pg['qty'].rstrip('0').rstrip('.') if '.' in pg['qty'] else pg['qty']
+                if qty_val == '' or qty_val == '0':
+                    qty_val = di['qty']
+
+                items.append({
+                    'line_number':        str(item_counter),
+                    'stock_number':       '',
+                    'description':        description,
+                    'quantity':           qty_val,
+                    'uom':                'Nos',
+                    'unit_value':         pg['unit'],
+                    'total_value':        pg['total'],
+                    'currency':           currency,
+                    'commodity_code':     hs_code,
+                    'country_of_origin':  di['country'],
+                    'net_weight':         '',
+                    'unit_weight':        '',
+                    'hs_code':            hs_code,
+                    'pages':              [1],
+                    'confidence':         0.85,
+                    'needs_review':       False,
+                    'raw_text':           description[:200],
+                })
+
         return items
 
