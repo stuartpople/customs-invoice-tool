@@ -3618,7 +3618,8 @@ class LineItemParser:
             if _raw_desc:
                 desc = _raw_desc
             elif _sn:
-                desc = f"Item {it['item_num']}: {_sn}"
+                # Use stock number directly; prefix only if too short for _is_valid_item
+                desc = _sn if len(_sn) >= 3 else f"Item {it['item_num']}: {_sn}"
             else:
                 desc = f"Item {it['item_num']}"
             result.append({
