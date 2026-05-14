@@ -3334,15 +3334,17 @@ class LineItemParser:
         """
         import fitz as _fitz  # already imported at module level via job_processor
 
-        LEAD_PT  = 8.0   # descriptions sit ~8pt above their item rows
+        LEAD_PT  = 8.0   # extend covered-items window below a desc block's last line
+        LEAD_BEFORE = 4.0  # lead above desc block start when finding first item
         DATA_MIN_W = 400  # wide data blocks
-        # Description-column bounds — start with ATI 603 defaults, updated per
-        # page when a column header row is found.  Retained across pages so
-        # continuation pages without a header row still work.
-        _desc_x0_lo: float = 50.0    # minimum x0 for a description block
-        _desc_x0_hi: float = 200.0   # maximum x0 for a description block
-        _desc_w_max: float = 220.0   # maximum width for a description block
-        _hdr_y_cutoff: float = 0.0   # skip blocks at/above this y on page 1
+        # Description-column bounds — defaults are generous; narrowed once we
+        # find the actual column header span (and retained across pages).
+        # The key guard is bwidth < DATA_MIN_W: data rows are always ~550pt wide
+        # so anything narrower AND starting in the right x-range is a desc block.
+        _desc_x0_lo: float = 50.0     # minimum x0 for a description block
+        _desc_x0_hi: float = 400.0    # maximum x0 (wide default; refined below)
+        _desc_w_max: float = 350.0    # maximum width — must stay < DATA_MIN_W
+        _hdr_y_cutoff: float = 0.0    # skip blocks at/above this y on page 1
 
         currency = 'GBP'
         all_page_items: List[Dict] = []  # flat list across all pages
@@ -3362,10 +3364,10 @@ class LineItemParser:
             blocks_dict = page.get_text('dict')
 
             # ── 0. Detect description column x-range from column header keywords ─
-            # The ATI column header row contains "Description / HS Code / CofO"
-            # as one of its cells.  Find the SPAN (not the block) that contains
-            # that text — the span's x0 is the left edge of the description column.
-            # Using span-level bbox avoids the block bbox covering the full page.
+            # Find the SPAN (not the block) whose text is "Description / HS Code …".
+            # The span's x0 = left edge, x1 = right edge of the description column
+            # header cell.  We use x0-20 … x1+30 as the allowed x-range for desc
+            # blocks, which correctly adapts to different ATI page layouts.
             for _blk in blocks_dict['blocks']:
                 if _blk['type'] != 0:
                     continue
@@ -3374,17 +3376,15 @@ class LineItemParser:
                     _ltext = ' '.join(s['text'] for s in _ln['spans']).strip()
                     if not re.search(r'Description\s*/\s*HS\s*Code', _ltext, re.IGNORECASE):
                         continue
-                    # Find the span whose text contains "Description"
                     for _sp in _ln['spans']:
                         if re.search(r'\bDescription\b', _sp['text'], re.IGNORECASE):
                             _sp_x0 = _sp['bbox'][0]
+                            _sp_x1 = _sp['bbox'][2]
                             _desc_x0_lo = max(0.0, _sp_x0 - 20)
-                            _desc_x0_hi = _sp_x0 + 80   # description col is ~80pt wide; stay close to its x0
-                            _desc_w_max = 300.0           # allow wider blocks for ATI 606
-                            # Skip anything ABOVE the column header row (company
-                            # header, address, invoice details).  Use the top of
-                            # the header line as the cutoff so item-description
-                            # blocks just below the headers are NOT excluded.
+                            # Use the span's own right edge + margin as the upper
+                            # bound.  This naturally adapts to the column width
+                            # rather than guessing a fixed offset.
+                            _desc_x0_hi = _sp_x1 + 30
                             _hdr_y_cutoff = _ln['bbox'][1] - 5
                             _found = True
                             break
@@ -3400,8 +3400,9 @@ class LineItemParser:
                     continue
                 bx0, by0, bx1, by1 = block['bbox']
                 bwidth = bx1 - bx0
-                # Must be within the description column x-range and not too wide
-                if bx0 < _desc_x0_lo or bx0 > _desc_x0_hi or bwidth > _desc_w_max:
+                # Must start within the description column x-range and not be
+                # as wide as a data row (data rows are ~550pt, desc blocks ~80-200pt)
+                if bx0 < _desc_x0_lo or bx0 > _desc_x0_hi or bwidth >= _desc_w_max:
                     continue
                 # Skip header/address area on page 1
                 if page_idx == 0 and by0 <= _hdr_y_cutoff:
@@ -3496,35 +3497,51 @@ class LineItemParser:
                     hs10 = self._pad_hs_code(hs_code, True)
 
                     page_items.append({
-                        'item_num':   item_num,
-                        'stock_no':   stock_no,
-                        'coc':        coc,
-                        'hs_code':    hs10,
-                        'uom':        uom,
-                        'qty':        qty,
-                        'unit_price': unit_price,
-                        'total':      total,
-                        'unit_wt':    unit_wt,
-                        'country':    country,
-                        'y_block':    by0,
-                        'page':       page_num,
+                        'item_num':    item_num,
+                        'stock_no':    stock_no,
+                        'coc':         coc,
+                        'hs_code':     hs10,
+                        'uom':         uom,
+                        'qty':         qty,
+                        'unit_price':  unit_price,
+                        'total':       total,
+                        'unit_wt':     unit_wt,
+                        'country':     country,
+                        'y_block':     by0,
+                        'y_block_end': by1,  # bottom of data block
+                        'page':        page_num,
                         'description': '',
                     })
 
             page_items.sort(key=lambda x: x['item_num'])
 
             # ── 3. Match description lines to items ───────────────────────────
-            # Per-desc-block midpoint approach:
-            #   For each desc block, find the first item it covers (smallest y_block
-            #   > block_first_line_y - LEAD_PT), then also find all items covered up
-            #   to the block's last line.  Midpoints between consecutive covered items
-            #   are used to split the desc lines correctly across items.
-            y_blocks = sorted(set(it['y_block'] for it in page_items))
-            y_block_to_items: Dict[float, List[Dict]] = {}
-            for it in page_items:
-                y_block_to_items.setdefault(it['y_block'], []).append(it)
+            # Each item gets a *virtual* y position so the midpoint algorithm can
+            # distinguish multiple items that share the same data block (and
+            # therefore the same raw y_block value).  Items within a shared block
+            # are spread evenly across the block's y-range.
+            _shared: Dict[float, List[Dict]] = {}
+            for _it in page_items:
+                _shared.setdefault(_it['y_block'], []).append(_it)
+            for _yb, _grp in _shared.items():
+                _grp.sort(key=lambda x: x['item_num'])
+                _n = len(_grp)
+                if _n == 1:
+                    _grp[0]['y_virtual'] = _yb
+                else:
+                    _yb_end = _grp[0].get('y_block_end', _yb)
+                    if _yb_end <= _yb + 5:
+                        _yb_end = _yb + 14 * _n  # ~14pt per row fallback
+                    for _i, _it in enumerate(_grp):
+                        # Use i/n (block-start per item) not (i+0.5)/n so that
+                        # item[0]'s virtual_y == block top, aligning midpoints
+                        # with where desc lines actually fall in the PDF.
+                        _it['y_virtual'] = _yb + _i / _n * (_yb_end - _yb)
 
-            y_block_descs: Dict[float, List[str]] = {yb: [] for yb in y_blocks}
+            # Build lookup: virtual-y → item (one-to-one after spreading)
+            y_blocks     = sorted(it['y_virtual'] for it in page_items)
+            item_by_vy: Dict[float, Dict] = {it['y_virtual']: it for it in page_items}
+            y_block_descs: Dict[float, List[str]] = {yv: [] for yv in y_blocks}
 
             # Group desc lines by their source block (block_by0)
             from collections import defaultdict as _dd
@@ -3538,9 +3555,9 @@ class LineItemParser:
                 block_line_list.sort(key=lambda x: x[0])
                 block_min_y = block_line_list[0][0]
                 block_max_y = block_line_list[-1][0]
-                threshold = block_min_y - LEAD_PT
+                threshold = block_min_y - LEAD_BEFORE
 
-                # First item covered by this desc block
+                # First virtual-y covered by this desc block
                 first_yb = None
                 for yb in y_blocks:
                     if yb > threshold:
@@ -3551,47 +3568,38 @@ class LineItemParser:
                 if first_yb is None:
                     continue
 
-                # All item y-blocks covered (first_yb up to block_max_y + LEAD_PT)
+                # All item virtual-y values covered up to block_max_y + LEAD_PT
                 covered = [yb for yb in y_blocks
                            if yb >= first_yb and yb <= block_max_y + LEAD_PT]
                 if not covered:
                     covered = [first_yb]
 
-                # Midpoints between consecutive covered items
-                mids = [(covered[k] + covered[k + 1]) / 2.0
-                        for k in range(len(covered) - 1)]
-
-                # Assign each desc line to the appropriate item
-                for line_y, text in block_line_list:
-                    target = covered[0]
-                    for k, mp in enumerate(mids):
-                        if line_y >= mp:
-                            target = covered[k + 1]
-                    y_block_descs[target].append(text)
-
-            # Distribute desc lines within each block to its items sequentially
-            for yb in y_blocks:
-                items_in_block = y_block_to_items[yb]  # already sorted by item_num
-                d_lines = y_block_descs[yb]
-                n = len(items_in_block)
-                m = len(d_lines)
-                if n == 0:
-                    continue
-                if n == 1:
-                    items_in_block[0]['description'] = ' '.join(d_lines).strip()
-                elif m == 0:
-                    pass  # no descriptions — leave blank
-                elif m >= n:
-                    # Distribute: first (m // n) lines each; remainder to last
-                    per = m // n
-                    for j, item in enumerate(items_in_block):
-                        s = j * per
-                        e = s + per if j < n - 1 else m
-                        item['description'] = ' '.join(d_lines[s:e]).strip()
+                n_cov = len(covered)
+                if n_cov == 1:
+                    # Only one item — all lines go to it
+                    for _, text in block_line_list:
+                        y_block_descs[covered[0]].append(text)
+                elif block_max_y < covered[0] - LEAD_PT:
+                    # Desc block is entirely ABOVE all covered items.
+                    # Lines appear in item order → distribute equally.
+                    per = max(1, len(block_line_list) // n_cov)
+                    for _idx, (_, _text) in enumerate(block_line_list):
+                        _ti = min(_idx // per, n_cov - 1)
+                        y_block_descs[covered[_ti]].append(_text)
                 else:
-                    # Fewer desc lines than items — assign one-to-one, rest blank
-                    for j, item in enumerate(items_in_block):
-                        item['description'] = d_lines[j] if j < m else ''
+                    # Desc block spans or is below items → midpoint distribution
+                    mids = [(covered[k] + covered[k + 1]) / 2.0
+                            for k in range(n_cov - 1)]
+                    for line_y, text in block_line_list:
+                        target = covered[0]
+                        for k, mp in enumerate(mids):
+                            if line_y >= mp:
+                                target = covered[k + 1]
+                        y_block_descs[target].append(text)
+
+            # Assign collected desc lines to each item
+            for yv in y_blocks:
+                item_by_vy[yv]['description'] = ' '.join(y_block_descs[yv]).strip()
 
             all_page_items.extend(page_items)
 
