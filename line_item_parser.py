@@ -3552,29 +3552,38 @@ class LineItemParser:
             for block_by0, line_y, text in desc_lines:
                 desc_block_groups[block_by0].append((line_y, text))
 
-            for block_by0, block_line_list in sorted(desc_block_groups.items()):
+            sorted_blks = sorted(desc_block_groups.items())
+            for i_blk, (block_by0, block_line_list) in enumerate(sorted_blks):
                 if not block_line_list:
                     continue
                 block_line_list.sort(key=lambda x: x[0])
                 block_min_y = block_line_list[0][0]
                 block_max_y = block_line_list[-1][0]
 
+                # Don't let a long desc block bleed past the start of the
+                # next desc block — stops WIKA-style blocks from claiming
+                # items that have their own dedicated desc block just after.
+                if i_blk + 1 < len(sorted_blks):
+                    _next_lines = sorted_blks[i_blk + 1][1]
+                    _next_min_y = min(ly for ly, _ in _next_lines) if _next_lines else float('inf')
+                else:
+                    _next_min_y = float('inf')
+                coverage_upper = min(block_max_y + LEAD_PT, _next_min_y - 0.5)
+
                 # First virtual-y covered by this desc block.
-                # Algorithm: find the LAST uncovered item whose y_virtual is
-                # at or up to LEAD_AFTER below block_min_y.
-                # Skipping already-covered items is the key guard: when a
-                # previous desc block has already claimed items 1-3, the WIKA
-                # block (starting just after item 3) won't accidentally grab
-                # item 3 again — it falls back to the first uncovered item
-                # after the block start instead.
-                # LEAD_AFTER of 4 pt also handles ATI 606-style layouts where
-                # the desc block starts a few points below the item's data row.
+                # Find the FIRST uncovered item whose y_virtual is at or up to
+                # LEAD_AFTER below block_min_y. FIRST (not last) is critical:
+                # when item 66 and 67 are both within the tolerance window,
+                # we must assign to item 66 (the earlier one).
+                # Skip already-covered: if a previous desc block already
+                # claimed an item (e.g. items 1-3), it is excluded from
+                # _cands so the WIKA block doesn't re-grab them.
                 LEAD_AFTER = 4.0
                 _cands = [yb for yb in y_blocks
                           if yb <= block_min_y + LEAD_AFTER
                           and not y_block_descs[yb]]   # skip already-assigned
                 if _cands:
-                    first_yb = _cands[-1]
+                    first_yb = _cands[0]
                 elif y_blocks:
                     # All preceding items already have descriptions; use the
                     # first uncovered item at or after the block start.
@@ -3586,9 +3595,9 @@ class LineItemParser:
                 if first_yb is None:
                     continue
 
-                # All item virtual-y values covered up to block_max_y + LEAD_PT
+                # All item virtual-y values covered up to coverage_upper
                 covered = [yb for yb in y_blocks
-                           if yb >= first_yb and yb <= block_max_y + LEAD_PT]
+                           if yb >= first_yb and yb <= coverage_upper]
                 if not covered:
                     covered = [first_yb]
 
