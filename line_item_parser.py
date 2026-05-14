@@ -3336,8 +3336,13 @@ class LineItemParser:
 
         LEAD_PT  = 8.0   # descriptions sit ~8pt above their item rows
         DATA_MIN_W = 400  # wide data blocks
-        DESC_MAX_W = 200  # narrow description blocks
-        DESC_MAX_X0 = 160  # description blocks start near x≈103
+        # Description-column bounds — start with ATI 603 defaults, updated per
+        # page when a column header row is found.  Retained across pages so
+        # continuation pages without a header row still work.
+        _desc_x0_lo: float = 50.0    # minimum x0 for a description block
+        _desc_x0_hi: float = 200.0   # maximum x0 for a description block
+        _desc_w_max: float = 220.0   # maximum width for a description block
+        _hdr_y_cutoff: float = 0.0   # skip blocks at/above this y on page 1
 
         currency = 'GBP'
         all_page_items: List[Dict] = []  # flat list across all pages
@@ -3356,20 +3361,50 @@ class LineItemParser:
             blocks_raw  = page.get_text('blocks')
             blocks_dict = page.get_text('dict')
 
-            # ── 1. Collect description lines from narrow right-column blocks ──
+            # ── 0. Detect description column x-range from column header keywords ─
+            # The ATI column header row contains "Description / HS Code / CofO"
+            # as one of its cells.  Find the SPAN (not the block) that contains
+            # that text — the span's x0 is the left edge of the description column.
+            # Using span-level bbox avoids the block bbox covering the full page.
+            for _blk in blocks_dict['blocks']:
+                if _blk['type'] != 0:
+                    continue
+                _found = False
+                for _ln in _blk['lines']:
+                    _ltext = ' '.join(s['text'] for s in _ln['spans']).strip()
+                    if not re.search(r'Description\s*/\s*HS\s*Code', _ltext, re.IGNORECASE):
+                        continue
+                    # Find the span whose text contains "Description"
+                    for _sp in _ln['spans']:
+                        if re.search(r'\bDescription\b', _sp['text'], re.IGNORECASE):
+                            _sp_x0 = _sp['bbox'][0]
+                            _desc_x0_lo = max(0.0, _sp_x0 - 20)
+                            _desc_x0_hi = _sp_x0 + 80   # description col is ~80pt wide; stay close to its x0
+                            _desc_w_max = 300.0           # allow wider blocks for ATI 606
+                            # Skip anything ABOVE the column header row (company
+                            # header, address, invoice details).  Use the top of
+                            # the header line as the cutoff so item-description
+                            # blocks just below the headers are NOT excluded.
+                            _hdr_y_cutoff = _ln['bbox'][1] - 5
+                            _found = True
+                            break
+                    if _found:
+                        break
+                if _found:
+                    break
+
+            # ── 1. Collect description lines from the description column ──────
             desc_lines: List[tuple] = []  # (block_y0, line_y0, text)
             for block in blocks_dict['blocks']:
                 if block['type'] != 0:
                     continue
                 bx0, by0, bx1, by1 = block['bbox']
                 bwidth = bx1 - bx0
-                if bwidth > DESC_MAX_W or bx0 > DESC_MAX_X0:
+                # Must be within the description column x-range and not too wide
+                if bx0 < _desc_x0_lo or bx0 > _desc_x0_hi or bwidth > _desc_w_max:
                     continue
-                # Skip obviously left-edge item-number slivers (x0 near table left)
-                if bx0 < 50:
-                    continue
-                # Skip header/address area on page 1 (company name, address block)
-                if page_idx == 0 and by0 < 330:
+                # Skip header/address area on page 1
+                if page_idx == 0 and by0 <= _hdr_y_cutoff:
                     continue
                 for line in block['lines']:
                     lt = ' '.join(s['text'] for s in line['spans']).strip()
