@@ -1843,8 +1843,11 @@ class LineItemParser:
         
         desc_lower = description.lower()
         
-        # Rule 2: HARD REJECT - Contains item count indicator "(X items)"
-        if re.search(r'\(\d+\s+items?\)', description, re.IGNORECASE):
+        # Rule 2: HARD REJECT - Description IS just a count indicator "(X items)"
+        # Use a full-string match so that valid product descriptions like
+        # "I-SOF1001173 (3 items)" or "HLCN-M8-A4 (9 items)" are not rejected —
+        # the "(N items)" there indicates a multi-pack qty, not a summary row.
+        if re.match(r'^\s*\(\d+\s+items?\)\s*$', description, re.IGNORECASE):
             return False
         
         # Rule 3: HARD REJECT - Contains summary/header keywords
