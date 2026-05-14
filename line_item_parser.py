@@ -3337,14 +3337,15 @@ class LineItemParser:
         LEAD_PT  = 8.0   # extend covered-items window below a desc block's last line
         LEAD_BEFORE = 4.0  # lead above desc block start when finding first item
         DATA_MIN_W = 400  # wide data blocks
-        # Description-column bounds — defaults are generous; narrowed once we
-        # find the actual column header span (and retained across pages).
-        # The key guard is bwidth < DATA_MIN_W: data rows are always ~550pt wide
-        # so anything narrower AND starting in the right x-range is a desc block.
-        _desc_x0_lo: float = 50.0     # minimum x0 for a description block
-        _desc_x0_hi: float = 400.0    # maximum x0 (wide default; refined below)
-        _desc_w_max: float = 350.0    # maximum width — must stay < DATA_MIN_W
+        # Description-column bounds.
+        # Primary discriminator: desc blocks are NARROW (< ~200pt) while data
+        # blocks are WIDE (~550pt).  We only restrict x0 from the LEFT to avoid
+        # picking up the leftmost item-number slivers.  No x0 upper-bound is
+        # needed — width alone reliably separates desc blocks from data rows.
+        _desc_x0_lo: float = 50.0     # minimum x0 (exclude left-edge slivers)
+        _desc_w_max: float = int(DATA_MIN_W * 0.6)  # max 240pt — must be << DATA_MIN_W
         _hdr_y_cutoff: float = 0.0    # skip blocks at/above this y on page 1
+        _hdr_detected: bool = False
 
         currency = 'GBP'
         all_page_items: List[Dict] = []  # flat list across all pages
@@ -3364,34 +3365,36 @@ class LineItemParser:
             blocks_dict = page.get_text('dict')
 
             # ── 0. Detect description column x-range from column header keywords ─
-            # Find the SPAN (not the block) whose text is "Description / HS Code …".
-            # The span's x0 = left edge, x1 = right edge of the description column
-            # header cell.  We use x0-20 … x1+30 as the allowed x-range for desc
-            # blocks, which correctly adapts to different ATI page layouts.
-            for _blk in blocks_dict['blocks']:
-                if _blk['type'] != 0:
-                    continue
-                _found = False
-                for _ln in _blk['lines']:
-                    _ltext = ' '.join(s['text'] for s in _ln['spans']).strip()
-                    if not re.search(r'Description\s*/\s*HS\s*Code', _ltext, re.IGNORECASE):
+            # Find the SPAN containing "Description / HS Code".  Its x0 sets the
+            # left edge of the description column (so we can exclude the company-
+            # address block which also starts around x=100 on page 1).
+            # We do NOT restrict the right-side x0 bound — width alone discriminates
+            # desc blocks (narrow) from data blocks (wide ~550pt).
+            if not _hdr_detected:
+                for _blk in blocks_dict['blocks']:
+                    if _blk['type'] != 0:
                         continue
-                    for _sp in _ln['spans']:
-                        if re.search(r'\bDescription\b', _sp['text'], re.IGNORECASE):
-                            _sp_x0 = _sp['bbox'][0]
-                            _sp_x1 = _sp['bbox'][2]
-                            _desc_x0_lo = max(0.0, _sp_x0 - 20)
-                            # Use the span's own right edge + margin as the upper
-                            # bound.  This naturally adapts to the column width
-                            # rather than guessing a fixed offset.
-                            _desc_x0_hi = _sp_x1 + 30
-                            _hdr_y_cutoff = _ln['bbox'][1] - 5
-                            _found = True
+                    _found = False
+                    for _ln in _blk['lines']:
+                        _ltext = ' '.join(s['text'] for s in _ln['spans']).strip()
+                        if not re.search(r'Description\s*/\s*HS\s*Code', _ltext, re.IGNORECASE):
+                            continue
+                        for _sp in _ln['spans']:
+                            if re.search(r'\bDescription\b', _sp['text'], re.IGNORECASE):
+                                _sp_x0 = _sp['bbox'][0]
+                                _desc_x0_lo = max(0.0, _sp_x0 - 20)
+                                # y-cutoff: top of the header row (exclude company
+                                # header/address above the column headers on page 1)
+                                _hdr_y_cutoff = _ln['bbox'][1] - 5
+                                _hdr_detected = True
+                                _found = True
+                                break
+                        if _found:
                             break
                     if _found:
                         break
-                if _found:
-                    break
+
+            print(f"[ATI] page {page_num}: desc_x0_lo={_desc_x0_lo:.0f} hdr_y_cutoff={_hdr_y_cutoff:.0f} hdr_detected={_hdr_detected}")
 
             # ── 1. Collect description lines from the description column ──────
             desc_lines: List[tuple] = []  # (block_y0, line_y0, text)
@@ -3400,9 +3403,9 @@ class LineItemParser:
                     continue
                 bx0, by0, bx1, by1 = block['bbox']
                 bwidth = bx1 - bx0
-                # Must start within the description column x-range and not be
-                # as wide as a data row (data rows are ~550pt, desc blocks ~80-200pt)
-                if bx0 < _desc_x0_lo or bx0 > _desc_x0_hi or bwidth >= _desc_w_max:
+                # Must start at or right of the description column left edge, and
+                # be narrow (desc blocks ~80-200pt; data blocks ~550pt).
+                if bx0 < _desc_x0_lo or bwidth >= _desc_w_max:
                     continue
                 # Skip header/address area on page 1
                 if page_idx == 0 and by0 <= _hdr_y_cutoff:
@@ -3414,6 +3417,7 @@ class LineItemParser:
 
             # Sort by block y then line y (preserves description reading order)
             desc_lines.sort(key=lambda x: (x[0], x[1]))
+            print(f"[ATI] page {page_num}: {len(desc_lines)} desc lines collected")
 
             # ── 2. Parse item rows from wide data blocks ──────────────────────
             page_items: List[Dict] = []
