@@ -3335,7 +3335,6 @@ class LineItemParser:
         import fitz as _fitz  # already imported at module level via job_processor
 
         LEAD_PT  = 8.0   # extend covered-items window below a desc block's last line
-        LEAD_BEFORE = 4.0  # lead above desc block start when finding first item
         DATA_MIN_W = 400  # wide data blocks
         # Description-column bounds.
         # Primary discriminator: desc blocks are NARROW (< ~200pt) while data
@@ -3559,16 +3558,31 @@ class LineItemParser:
                 block_line_list.sort(key=lambda x: x[0])
                 block_min_y = block_line_list[0][0]
                 block_max_y = block_line_list[-1][0]
-                threshold = block_min_y - LEAD_BEFORE
 
-                # First virtual-y covered by this desc block
-                first_yb = None
-                for yb in y_blocks:
-                    if yb > threshold:
-                        first_yb = yb
-                        break
-                if first_yb is None:
-                    first_yb = y_blocks[-1] if y_blocks else None
+                # First virtual-y covered by this desc block.
+                # Algorithm: find the LAST uncovered item whose y_virtual is
+                # at or up to LEAD_AFTER below block_min_y.
+                # Skipping already-covered items is the key guard: when a
+                # previous desc block has already claimed items 1-3, the WIKA
+                # block (starting just after item 3) won't accidentally grab
+                # item 3 again — it falls back to the first uncovered item
+                # after the block start instead.
+                # LEAD_AFTER of 4 pt also handles ATI 606-style layouts where
+                # the desc block starts a few points below the item's data row.
+                LEAD_AFTER = 4.0
+                _cands = [yb for yb in y_blocks
+                          if yb <= block_min_y + LEAD_AFTER
+                          and not y_block_descs[yb]]   # skip already-assigned
+                if _cands:
+                    first_yb = _cands[-1]
+                elif y_blocks:
+                    # All preceding items already have descriptions; use the
+                    # first uncovered item at or after the block start.
+                    _later = [yb for yb in y_blocks
+                              if not y_block_descs[yb] and yb > block_min_y - LEAD_AFTER]
+                    first_yb = _later[0] if _later else None
+                else:
+                    first_yb = None
                 if first_yb is None:
                     continue
 
