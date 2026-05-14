@@ -1194,6 +1194,7 @@ elif st.session_state.processing_started and st.session_state.current_job_id:
                     'marlow': '📋 Marlow Ropes table format',
                     'arrow_export': '📋 Arrow Export (cc: bracket HS code format)',
                     'xosil': '📋 X-OSIL / Ocean Scientific (spaced HS code format)',
+                    'ati':   '📋 ATI (Applied Technologies Int. COC/UoM table format)',
                     'llm_gemini': '🤖 AI extraction (Gemini)',
                     'llm_gpt4o_mini': '🤖 AI extraction (GPT-4o mini)',
                     'llm_gemini_lastresort': '🤖 AI extraction (Gemini — last resort)',

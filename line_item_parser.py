@@ -164,6 +164,46 @@ class LineItemParser:
                 "format_type": "xosil",
             }
 
+        # ── ATI (Applied Technologies International) / "COC / HS Code / Unit of Measure" table ──
+        # Invoices with "Description / HS Code / CofO", "COC", "Unit of Measure",
+        # "Unit Weight", "Line Weight" column headers.  PyMuPDF extracts two column
+        # types per page: wide blocks (width≈550) contain item data rows; narrow
+        # blocks (width<200, x0≈103) contain the right-column description text.
+        # Block-level fitz access is required, so we read the original PDF from
+        # job metadata.
+        _is_ati = (
+            re.search(r'Description\s*/\s*HS Code\s*/\s*CofO', all_text) is not None
+            and re.search(r'\bCOC\b', all_text) is not None
+            and re.search(r'Unit of Measure', all_text) is not None
+            and re.search(r'Unit Weight', all_text) is not None
+            and re.search(r'Line Weight', all_text) is not None
+        )
+        if _is_ati:
+            print("[Parser] ATI 'COC / HS Code / Unit of Measure' table format detected — using block parser")
+            # Need original PDF for block-level parsing
+            pdf_path = ""
+            metadata_path = job_dir / "metadata.json"
+            if metadata_path.exists():
+                with open(metadata_path) as _mf:
+                    _meta = json.load(_mf)
+                pdf_path = _meta.get("pdf_path", "")
+            if pdf_path and Path(pdf_path).exists():
+                import fitz as _fitz_ati
+                _ati_doc = _fitz_ati.open(pdf_path)
+                items = self._parse_ati_format(_ati_doc, direction, page_map)
+                _ati_doc.close()
+                items = self._postprocess_items(items)
+                if items:
+                    return {
+                        "total_items": len(items),
+                        "items": items,
+                        "pages_analyzed": len(pages_data.get("pages", [])),
+                        "direction": direction,
+                        "format_type": "ati",
+                    }
+                # If block parser returned nothing, fall through to LLM
+                print("[Parser] ATI block parser found no items — falling back to LLM")
+
         # ── LLM path ──────────────────────────────────────────────────────────
         # Priority: 1) Google Gemini (free tier) → 2) OpenAI → 3) regex fallback
 
@@ -3240,4 +3280,316 @@ class LineItemParser:
                 })
 
         return items
+
+    # ── ATI (Applied Technologies International) block-level parser ───────────
+
+    _ATI_COC_SET = {
+        'UK', 'CN', 'DE', 'NL', 'US', 'DK', 'NO', 'JP', 'FR', 'IT', 'ES',
+        'AU', 'SE', 'BE', 'CH', 'AT', 'FI', 'PL', 'CZ', 'HU', 'RO', 'IN',
+        'SG', 'TW', 'KR', 'BR', 'MX', 'ZA', 'EG', 'AE', 'SA', 'TR', 'TH',
+        'MY', 'ID', 'PH', 'VN', 'NZ', 'CA', 'AR', 'CL', 'UA', 'RU', 'IL',
+        'BG', 'LT', 'LV', 'EE', 'HR', 'SK', 'SI', 'PT', 'GR', 'CY', 'MT',
+        'LU', 'IE', 'IS', 'LI', 'MK', 'RS', 'BA', 'ME', 'AL', 'MD', 'BY',
+        'AZ', 'AM', 'GE', 'KZ', 'UZ', 'TM', 'TJ', 'KG', 'MN', 'HK', 'TN',
+        'MA', 'DZ', 'LY', 'ET', 'KE', 'TZ', 'GH', 'NG', 'ZM', 'ZW',
+    }
+    _ATI_ORIGIN_MAP = {
+        'UK': 'GB', 'CN': 'CN', 'DE': 'DE', 'NL': 'NL', 'US': 'US',
+        'DK': 'DK', 'NO': 'NO', 'JP': 'JP', 'FR': 'FR', 'IT': 'IT',
+        'ES': 'ES', 'AU': 'AU', 'SE': 'SE', 'BE': 'BE', 'CH': 'CH',
+        'AT': 'AT', 'FI': 'FI', 'PL': 'PL', 'IN': 'IN', 'SG': 'SG',
+        'TW': 'TW', 'KR': 'KR', 'BR': 'BR', 'MX': 'MX', 'ZA': 'ZA',
+        'AE': 'AE', 'SA': 'SA', 'TR': 'TR', 'TH': 'TH', 'MY': 'MY',
+        'HK': 'HK', 'CZ': 'CZ', 'HU': 'HU', 'RO': 'RO', 'RU': 'RU',
+    }
+    _ATI_HS_RE  = re.compile(r'^\d{8}$')
+    _ATI_UOM_RE = re.compile(r'^\d+\s+\w+', re.IGNORECASE)
+    _ATI_NUM_RE = re.compile(r'^[\d,]+\.?\d*$')
+    _ATI_HDR_RE = re.compile(
+        r'^(Item|Stock\s+No\.|Description|Unit\s+of\s+Measure|Quantity|Unit\s+Price|'
+        r'Amount|Unit\s+Weight|Line\s+Weight|COC|HS\s+Code|Page\s+\d|INVOICE|'
+        r'PRODUCT\s+INFORMATION|Seller\s+|Invoice\s+|Ship\s+To|Bill\s+|'
+        r'Number\s+&|Dimensions|Weights)',
+        re.IGNORECASE,
+    )
+
+    def _parse_ati_format(self, doc, direction: str, page_map: Dict) -> List[Dict]:
+        """
+        Parse Applied Technologies International (ATI) commercial invoices.
+
+        The PDF has a two-column layout per page:
+        - LEFT  (wide blocks, width≈550): item data rows with 10 fields each —
+          item_num, stock_no (optional), COC (2-letter country), hs_code (8-digit),
+          uom, qty, unit_price, total_price, unit_weight, line_weight
+        - RIGHT (narrow blocks, width<200, x0≈103): product description text,
+          one block per visual "group" of items in the right column.
+
+        Descriptions are matched to items using y-position proximity:
+          for desc line at y_d → item with smallest data-block y0 that is
+          strictly greater than (y_d − LEAD_PT).  Within blocks that cover
+          multiple items the description lines are distributed sequentially.
+        """
+        import fitz as _fitz  # already imported at module level via job_processor
+
+        LEAD_PT  = 8.0   # descriptions sit ~8pt above their item rows
+        DATA_MIN_W = 400  # wide data blocks
+        DESC_MAX_W = 200  # narrow description blocks
+        DESC_MAX_X0 = 160  # description blocks start near x≈103
+
+        currency = 'GBP'
+        all_page_items: List[Dict] = []  # flat list across all pages
+
+        for page_idx in range(len(doc)):
+            page = doc[page_idx]
+            page_num = page_idx + 1
+
+            # Detect currency from page text
+            pt = page.get_text('text')
+            if 'USD' in pt:
+                currency = 'USD'
+            elif 'EUR' in pt or '€' in pt:
+                currency = 'EUR'
+
+            blocks_raw  = page.get_text('blocks')
+            blocks_dict = page.get_text('dict')
+
+            # ── 1. Collect description lines from narrow right-column blocks ──
+            desc_lines: List[tuple] = []  # (block_y0, line_y0, text)
+            for block in blocks_dict['blocks']:
+                if block['type'] != 0:
+                    continue
+                bx0, by0, bx1, by1 = block['bbox']
+                bwidth = bx1 - bx0
+                if bwidth > DESC_MAX_W or bx0 > DESC_MAX_X0:
+                    continue
+                # Skip obviously left-edge item-number slivers (x0 near table left)
+                if bx0 < 50:
+                    continue
+                # Skip header/address area on page 1 (company name, address block)
+                if page_idx == 0 and by0 < 330:
+                    continue
+                for line in block['lines']:
+                    lt = ' '.join(s['text'] for s in line['spans']).strip()
+                    if lt and not self._ATI_HDR_RE.match(lt):
+                        desc_lines.append((by0, line['bbox'][1], lt))
+
+            # Sort by block y then line y (preserves description reading order)
+            desc_lines.sort(key=lambda x: (x[0], x[1]))
+
+            # ── 2. Parse item rows from wide data blocks ──────────────────────
+            page_items: List[Dict] = []
+
+            for block in blocks_raw:
+                bx0, by0, bx1, by1, text, bno, btype = block
+                if btype != 0:
+                    continue
+                bwidth = bx1 - bx0
+                if bwidth < DATA_MIN_W:
+                    continue
+
+                lines = [ln.strip() for ln in text.split('\n') if ln.strip()]
+                i = 0
+                while i < len(lines):
+                    ln = lines[i]
+                    # Item number: 1-3 digit integer < 500
+                    if not re.match(r'^\d{1,3}$', ln) or int(ln) >= 500:
+                        i += 1
+                        continue
+
+                    item_num = int(ln)
+                    i += 1
+
+                    # Collect stock_no — lines until a COC or HS code is found
+                    stock_parts: List[str] = []
+                    while i < len(lines) and len(stock_parts) < 3:
+                        nxt = lines[i]
+                        if nxt in self._ATI_COC_SET:
+                            break
+                        if self._ATI_HS_RE.match(nxt):
+                            break
+                        # UoM line signals no stock no was present
+                        if re.match(r'^\d+\s+(OF|METER|METRE|SET|PACK|KIT|REEL)\b',
+                                    nxt, re.IGNORECASE):
+                            break
+                        stock_parts.append(nxt)
+                        i += 1
+                    stock_no = ' '.join(stock_parts).strip()
+
+                    if i >= len(lines):
+                        break
+
+                    # COC
+                    coc = ''
+                    if lines[i] in self._ATI_COC_SET:
+                        coc = lines[i]
+                        i += 1
+
+                    # HS code (8 digits)
+                    if i >= len(lines) or not self._ATI_HS_RE.match(lines[i]):
+                        continue
+                    hs_code = lines[i]
+                    i += 1
+
+                    # UoM
+                    uom = '1 OF 1'
+                    if i < len(lines) and self._ATI_UOM_RE.match(lines[i]):
+                        uom = lines[i]
+                        i += 1
+
+                    # Collect 4-5 numeric values: qty, unit_price, total, unit_wt, [line_wt]
+                    nums: List[str] = []
+                    while i < len(lines) and len(nums) < 5:
+                        cleaned = lines[i].replace(',', '')
+                        if re.match(r'^\d+\.?\d*$', cleaned):
+                            nums.append(cleaned)
+                            i += 1
+                        else:
+                            break
+
+                    if len(nums) < 3:
+                        continue  # not enough numeric fields
+
+                    qty        = nums[0]
+                    unit_price = nums[1]
+                    total      = nums[2]
+                    unit_wt    = nums[3] if len(nums) > 3 else ''
+
+                    country = self._ATI_ORIGIN_MAP.get(coc, coc)
+                    hs10 = self._pad_hs_code(hs_code, True)
+
+                    page_items.append({
+                        'item_num':   item_num,
+                        'stock_no':   stock_no,
+                        'coc':        coc,
+                        'hs_code':    hs10,
+                        'uom':        uom,
+                        'qty':        qty,
+                        'unit_price': unit_price,
+                        'total':      total,
+                        'unit_wt':    unit_wt,
+                        'country':    country,
+                        'y_block':    by0,
+                        'page':       page_num,
+                        'description': '',
+                    })
+
+            page_items.sort(key=lambda x: x['item_num'])
+
+            # ── 3. Match description lines to items ───────────────────────────
+            # Per-desc-block midpoint approach:
+            #   For each desc block, find the first item it covers (smallest y_block
+            #   > block_first_line_y - LEAD_PT), then also find all items covered up
+            #   to the block's last line.  Midpoints between consecutive covered items
+            #   are used to split the desc lines correctly across items.
+            y_blocks = sorted(set(it['y_block'] for it in page_items))
+            y_block_to_items: Dict[float, List[Dict]] = {}
+            for it in page_items:
+                y_block_to_items.setdefault(it['y_block'], []).append(it)
+
+            y_block_descs: Dict[float, List[str]] = {yb: [] for yb in y_blocks}
+
+            # Group desc lines by their source block (block_by0)
+            from collections import defaultdict as _dd
+            desc_block_groups: Dict[float, List[tuple]] = _dd(list)
+            for block_by0, line_y, text in desc_lines:
+                desc_block_groups[block_by0].append((line_y, text))
+
+            for block_by0, block_line_list in sorted(desc_block_groups.items()):
+                if not block_line_list:
+                    continue
+                block_line_list.sort(key=lambda x: x[0])
+                block_min_y = block_line_list[0][0]
+                block_max_y = block_line_list[-1][0]
+                threshold = block_min_y - LEAD_PT
+
+                # First item covered by this desc block
+                first_yb = None
+                for yb in y_blocks:
+                    if yb > threshold:
+                        first_yb = yb
+                        break
+                if first_yb is None:
+                    first_yb = y_blocks[-1] if y_blocks else None
+                if first_yb is None:
+                    continue
+
+                # All item y-blocks covered (first_yb up to block_max_y + LEAD_PT)
+                covered = [yb for yb in y_blocks
+                           if yb >= first_yb and yb <= block_max_y + LEAD_PT]
+                if not covered:
+                    covered = [first_yb]
+
+                # Midpoints between consecutive covered items
+                mids = [(covered[k] + covered[k + 1]) / 2.0
+                        for k in range(len(covered) - 1)]
+
+                # Assign each desc line to the appropriate item
+                for line_y, text in block_line_list:
+                    target = covered[0]
+                    for k, mp in enumerate(mids):
+                        if line_y >= mp:
+                            target = covered[k + 1]
+                    y_block_descs[target].append(text)
+
+            # Distribute desc lines within each block to its items sequentially
+            for yb in y_blocks:
+                items_in_block = y_block_to_items[yb]  # already sorted by item_num
+                d_lines = y_block_descs[yb]
+                n = len(items_in_block)
+                m = len(d_lines)
+                if n == 0:
+                    continue
+                if n == 1:
+                    items_in_block[0]['description'] = ' '.join(d_lines).strip()
+                elif m == 0:
+                    pass  # no descriptions — leave blank
+                elif m >= n:
+                    # Distribute: first (m // n) lines each; remainder to last
+                    per = m // n
+                    for j, item in enumerate(items_in_block):
+                        s = j * per
+                        e = s + per if j < n - 1 else m
+                        item['description'] = ' '.join(d_lines[s:e]).strip()
+                else:
+                    # Fewer desc lines than items — assign one-to-one, rest blank
+                    for j, item in enumerate(items_in_block):
+                        item['description'] = d_lines[j] if j < m else ''
+
+            all_page_items.extend(page_items)
+
+        # ── 4. Convert to standard output format ─────────────────────────────
+        all_page_items.sort(key=lambda x: x['item_num'])
+        result: List[Dict] = []
+        for it in all_page_items:
+            # Ensure the fallback description has at least 3 letters so it passes
+            # the _is_valid_item letter-count guard even for numeric-only stock codes.
+            _sn = it['stock_no']
+            _raw_desc = it['description']
+            if _raw_desc:
+                desc = _raw_desc
+            elif _sn:
+                desc = f"Item {it['item_num']}: {_sn}"
+            else:
+                desc = f"Item {it['item_num']}"
+            result.append({
+                'line_number':        str(it['item_num']),
+                'stock_number':       it['stock_no'],
+                'description':        desc,
+                'quantity':           it['qty'],
+                'uom':                it['uom'],
+                'unit_value':         it['unit_price'],
+                'total_value':        it['total'],
+                'currency':           currency,
+                'commodity_code':     it['hs_code'],
+                'country_of_origin':  it['country'],
+                'net_weight':         it['unit_wt'],
+                'unit_weight':        it['unit_wt'],
+                'hs_code':            it['hs_code'],
+                'pages':              [it['page']],
+                'confidence':         0.90,
+                'needs_review':       False,
+                'raw_text':           desc[:200],
+            })
+        return result
+
 
