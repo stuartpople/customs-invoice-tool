@@ -85,7 +85,7 @@ def consolidate_items(items: List[Dict]) -> Dict:
                 pass
         
         weight = item.get('net_weight')
-        if weight:
+        if weight is not None:
             try:
                 consolidated['total_net_weight'] += float(weight)
             except (ValueError, TypeError):

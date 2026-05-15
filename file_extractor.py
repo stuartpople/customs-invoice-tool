@@ -220,10 +220,12 @@ def extract_from_excel(file_obj, trade_direction: str = "export") -> List[Dict]:
                         value_columns = [_col]
                         break
             
-            # Weight columns — prefer "total (kg)" over "unit (kg)"
+            # Weight columns — prefer line/total weight over unit weight.
+            # 'Line Weight' is the per-row total (unit_weight * qty) and is
+            # correct even when unit_weight rounds to 0 for very light items.
             weight_columns = _find_columns(df.columns, col_lower, [
-                ['total (kg)', 'total_kg', 'total weight', 'net weight', 'nett weight'],
-                ['net_weight', 'weight (kg)', 'weight_kg'],
+                ['total (kg)', 'total_kg', 'total weight', 'net weight', 'nett weight', 'line weight'],
+                ['net_weight', 'weight (kg)', 'weight_kg', 'line_weight'],
                 ['weight', 'net', 'gross', 'kg'],
             ])
             

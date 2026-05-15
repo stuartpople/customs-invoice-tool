@@ -209,8 +209,8 @@ def create_cds_excel(
         description = _strip_non_ascii('; '.join(descriptions))
 
         total_value = round(consolidated['total_value'], 2) if consolidated['total_value'] else ''
-        net_weight = round(consolidated['total_net_weight'], 3) if consolidated['total_net_weight'] else ''
-        gross_weight = round(consolidated['total_net_weight'] * 1.10, 3) if consolidated['total_net_weight'] else ''
+        net_weight = round(consolidated['total_net_weight'], 3) if consolidated['total_net_weight'] is not None and consolidated['total_net_weight'] != 0 else ''
+        gross_weight = round(consolidated['total_net_weight'] * 1.10, 3) if consolidated['total_net_weight'] is not None and consolidated['total_net_weight'] != 0 else ''
 
         # Country of origin — pick the first (CDS only allows one per line)
         countries = consolidated.get('countries_of_origin', [])
