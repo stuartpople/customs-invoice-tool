@@ -341,6 +341,9 @@ def extract_from_excel(file_obj, trade_direction: str = "export") -> List[Dict]:
                     for col in country_columns:
                         if pd.notna(row[col]):
                             country = str(row[col]).strip()
+                            # Normalise UK → GB (HMRC does not recognise "UK")
+                            if country.upper() == 'UK':
+                                country = 'GB'
                             break
                 
                 uom = None
