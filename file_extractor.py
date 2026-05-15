@@ -231,7 +231,7 @@ def extract_from_excel(file_obj, trade_direction: str = "export") -> List[Dict]:
             
             country_columns = _find_columns(df.columns, col_lower, [
                 ['country of destination', 'country of origin', 'destination', 'origin country'],
-                ['origin', 'country', 'coo', 'c.o.o'],
+                ['origin', 'country', 'coo', 'c.o.o', 'coc'],
             ])
             # Fallback: unnamed column where values look like 2-3 letter country codes
             if not country_columns:
