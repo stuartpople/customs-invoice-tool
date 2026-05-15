@@ -3397,6 +3397,7 @@ class LineItemParser:
 
             # ── 1. Collect description lines from the description column ──────
             desc_lines: List[tuple] = []  # (block_y0, line_y0, text)
+            desc_block_by1: Dict[float, float] = {}  # block_y0 → block bbox y1
             for block in blocks_dict['blocks']:
                 if block['type'] != 0:
                     continue
@@ -3413,6 +3414,11 @@ class LineItemParser:
                     lt = ' '.join(s['text'] for s in line['spans']).strip()
                     if lt and not self._ATI_HDR_RE.match(lt):
                         desc_lines.append((by0, line['bbox'][1], lt))
+                # Record block bottom y so coverage_upper uses bbox y1 not last-line y
+                if any(lt for ln in block['lines']
+                       for lt in [' '.join(s['text'] for s in ln['spans']).strip()]
+                       if lt and not self._ATI_HDR_RE.match(lt)):
+                    desc_block_by1[by0] = by1
 
             # Sort by block y then line y (preserves description reading order)
             desc_lines.sort(key=lambda x: (x[0], x[1]))
@@ -3552,13 +3558,17 @@ class LineItemParser:
             for block_by0, line_y, text in desc_lines:
                 desc_block_groups[block_by0].append((line_y, text))
 
+
             sorted_blks = sorted(desc_block_groups.items())
             for i_blk, (block_by0, block_line_list) in enumerate(sorted_blks):
                 if not block_line_list:
                     continue
                 block_line_list.sort(key=lambda x: x[0])
                 block_min_y = block_line_list[0][0]
-                block_max_y = block_line_list[-1][0]
+                # Use block bbox y1 (bottom of box) not last line's y (top of
+                # last line). Last line top can be several pts above block bottom,
+                # causing items just below the last line to fall outside coverage.
+                block_max_y = desc_block_by1.get(block_by0, block_line_list[-1][0])
 
                 # Don't let a long desc block bleed past the start of the
                 # next desc block — stops WIKA-style blocks from claiming
@@ -3568,7 +3578,13 @@ class LineItemParser:
                     _next_min_y = min(ly for ly, _ in _next_lines) if _next_lines else float('inf')
                 else:
                     _next_min_y = float('inf')
-                coverage_upper = min(block_max_y + LEAD_PT, _next_min_y - 0.5)
+                # Cap coverage at block's physical extent OR the next desc
+                # block's start (whichever is lower). Do NOT add LEAD_PT here —
+                # adding it lets a short desc block (ending at y=498) absorb
+                # the NEXT item (y_virtual=500) into its coverage, which then
+                # marks that item as "already covered" so its own desc block
+                # later assigns its description to item+1 instead.
+                coverage_upper = min(block_max_y, _next_min_y - 0.5)
 
                 # First virtual-y covered by this desc block.
                 # Find the FIRST uncovered item whose y_virtual is at or up to
