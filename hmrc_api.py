@@ -303,7 +303,7 @@ class HMRCTariffAPI:
                 return {
                     'description': (attrs.get('description_plain') or
                                     attrs.get('formatted_description', '')).strip(),
-                    'leaf': attrs.get('leaf', True),
+                    'leaf': attrs.get('leaf', False),
                     'code': attrs.get('goods_nomenclature_item_id', ten_digit_code),
                 }
         except requests.RequestException:
