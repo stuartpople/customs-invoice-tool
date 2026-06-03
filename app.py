@@ -21,7 +21,7 @@ import shutil
 
 
 # Version tracking for cache busting
-APP_VERSION = "v3.10"
+APP_VERSION = "v3.11"
 
 
 def _apply_selected_doc_codes(hmrc_results: dict) -> dict:
@@ -452,7 +452,12 @@ if uploaded_files and username:
                     if items:
                         # Filter out metadata item if present
                         for item in items:
-                            if isinstance(item, dict) and item.get('_excel_metadata'):
+                            if not isinstance(item, dict):
+                                continue
+                            if item.get('error'):
+                                st.error(f"❌ {uploaded_file.name}: {item['error']}")
+                                continue
+                            if item.get('_excel_metadata'):
                                 excel_metadata = {k: v for k, v in item.items() if not k.startswith('_')}
                             else:
                                 actual_items.append(item)
@@ -488,9 +493,16 @@ if uploaded_files and username:
                                 st.session_state.invoice_metadata = metadata
                             st.success(f"✅ Extracted {len(actual_items)} items from {uploaded_file.name}")
                         else:
-                            st.warning(f"⚠️ No data rows extracted from {uploaded_file.name}. Only metadata found.")
+                            st.warning(
+                                f"⚠️ No data rows extracted from {uploaded_file.name}. "
+                                "Only header/metadata found — try Export + destination country, or check column headers."
+                            )
                     else:
-                        st.warning(f"⚠️ No items extracted from {uploaded_file.name}. The file layout may not be recognised. Debug: {text[:200] if text else 'No text'}")
+                        st.warning(
+                            f"⚠️ No items extracted from {uploaded_file.name}. "
+                            "Tried spreadsheet columns and AI fallback. "
+                            f"Preview: {text[:300] if text else 'No text'}"
+                        )
                 except Exception as e:
                     import traceback
                     st.error(f"❌ Error processing {uploaded_file.name}: {e}")

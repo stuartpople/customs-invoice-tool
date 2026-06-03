@@ -3,9 +3,13 @@ Multi-format document extraction module
 Supports PDF, Excel, and Word documents
 """
 from pdf_extractor import extract_text_from_pdf, parse_line_items, extract_invoice_metadata
+import os
+import re
 import pandas as pd
 from typing import List, Dict, Callable, Optional, Tuple
 import io
+
+_EXCEL_EXTENSIONS = frozenset({'xlsx', 'xls', 'xlsm'})
 
 # Excel/Word imports
 try:
@@ -13,6 +17,128 @@ try:
     DOCX_AVAILABLE = True
 except ImportError:
     DOCX_AVAILABLE = False
+
+
+def _get_api_secret(key_name: str) -> Optional[str]:
+    """Streamlit secrets (cloud) then environment variable (local)."""
+    try:
+        import streamlit as st
+        key = st.secrets.get(key_name, "")
+        if key:
+            return key
+    except Exception:
+        pass
+    return os.environ.get(key_name) or None
+
+
+def _excel_workbook_to_text(file_obj) -> str:
+    """Flatten all sheets to tab-separated text for AI / regex fallback parsing."""
+    file_obj.seek(0)
+    excel_file = pd.ExcelFile(file_obj)
+    parts: list[str] = []
+    for sheet_name in excel_file.sheet_names:
+        file_obj.seek(0)
+        df = pd.read_excel(file_obj, sheet_name=sheet_name, header=None)
+        df = df.dropna(how='all')
+        if df.empty:
+            continue
+        parts.append(f"--- SHEET {sheet_name} ---")
+        parts.append(df.to_csv(sep='\t', index=False, header=False))
+    return '\n'.join(parts)
+
+
+def _normalize_hs_code(raw, trade_direction: str) -> Optional[str]:
+    if raw is None or (isinstance(raw, float) and pd.isna(raw)):
+        return None
+    if isinstance(raw, (int, float)):
+        if isinstance(raw, float) and raw == int(raw):
+            code_str = str(int(raw))
+        else:
+            code_str = str(raw).split('.')[0]
+    else:
+        code_str = re.sub(r'\D', '', str(raw).strip())
+    if not code_str.isdigit() or len(code_str) < 6:
+        return None
+    if trade_direction.lower() == 'export':
+        return code_str[:8]
+    if len(code_str) == 8:
+        return code_str + '00'
+    return code_str
+
+
+def _normalize_llm_items(llm_items: list, trade_direction: str) -> List[Dict]:
+    """Map LLM extractor output to spreadsheet item shape."""
+    out: List[Dict] = []
+    for it in llm_items or []:
+        if not isinstance(it, dict):
+            continue
+        code = _normalize_hs_code(it.get('commodity_code'), trade_direction)
+        value = it.get('value')
+        if value is None:
+            value = it.get('total_value')
+        try:
+            value = float(value) if value is not None else None
+        except (TypeError, ValueError):
+            value = None
+        qty = it.get('quantity')
+        try:
+            qty = float(qty) if qty is not None else None
+        except (TypeError, ValueError):
+            qty = None
+        desc = str(it.get('description') or '').strip()
+        if not desc and not code and not value:
+            continue
+        out.append({
+            'commodity_code': code or '',
+            'description': desc or (f'Item {code}' if code else 'Line item'),
+            'quantity': qty,
+            'uom': str(it.get('unit') or 'PCS').strip() or 'PCS',
+            'total_value': value,
+            'country_of_origin': str(it.get('country_origin') or '').strip(),
+            'net_weight': it.get('net_weight'),
+            'currency': str(it.get('currency') or 'GBP').upper()[:3],
+            'needs_review': not bool(code),
+        })
+    return out
+
+
+def _excel_llm_fallback(file_obj, trade_direction: str) -> List[Dict]:
+    """When column-based Excel parsing finds nothing, dump sheets and use Gemini/OpenAI."""
+    text = _excel_workbook_to_text(file_obj)
+    if len(text.strip()) < 40:
+        return []
+    for key_name, extract_fn in (
+        ('GOOGLE_API_KEY', 'extract_with_gemini'),
+        ('OPENAI_API_KEY', 'extract_with_llm'),
+    ):
+        api_key = _get_api_secret(key_name)
+        if not api_key:
+            continue
+        try:
+            from llm_extractor import extract_with_gemini, extract_with_llm
+            fn = extract_with_gemini if extract_fn == 'extract_with_gemini' else extract_with_llm
+            llm_items, _meta = fn(text, api_key)
+            normalized = _normalize_llm_items(llm_items, trade_direction)
+            if normalized:
+                return normalized
+        except Exception:
+            continue
+    # Regex on sheet text (commercial invoices without HS column headers)
+    try:
+        items = parse_line_items(text, trade_direction=trade_direction)
+        if items:
+            return _normalize_llm_items(items, trade_direction)
+    except Exception:
+        pass
+    return []
+
+
+def _excel_data_items(items: List[Dict]) -> List[Dict]:
+    """Line items only — exclude metadata markers and error dicts."""
+    return [
+        i for i in items
+        if isinstance(i, dict) and not i.get('_excel_metadata') and 'error' not in i
+    ]
 
 
 def extract_from_file_with_progress(file_obj, filename: str, trade_direction: str = "export", progress_callback: Optional[Callable] = None):
@@ -35,7 +161,7 @@ def extract_from_file_with_progress(file_obj, filename: str, trade_direction: st
         text = extract_text_from_pdf(file_obj, use_ocr=True, progress_callback=progress_callback)
         
         # Parse items and metadata
-        items = parse_line_items(text, direction=trade_direction)
+        items = parse_line_items(text, trade_direction=trade_direction)
         metadata = extract_invoice_metadata(text)
         
         # Add CDS defaults to metadata based on trade direction
@@ -114,6 +240,7 @@ def extract_from_excel(file_obj, trade_direction: str = "export") -> List[Dict]:
             pass  # Continue without metadata if extraction fails
         
         for sheet_name in excel_file.sheet_names:
+            file_obj.seek(0)
             df = pd.read_excel(file_obj, sheet_name=sheet_name, header=None)
             
             # Skip sheets with very few rows (likely summary/cover sheets)
@@ -125,14 +252,16 @@ def extract_from_excel(file_obj, trade_direction: str = "export") -> List[Dict]:
             # (contains keywords like HS CODE, DESCRIPTION, QTY, etc.)
             header_keywords = {'hs code', 'commodity code', 'tariff', 'description',
                                'qty', 'quantity', 'value', 'weight', 'origin',
-                               'uom', 'unit cost', 'line total', 'total', 'hs'}
+                               'uom', 'unit cost', 'line total', 'total', 'hs',
+                               'part', 'sku', 'article', 'item', 'amount', 'price',
+                               'net', 'gross', 'coo', 'line no', 'line #'}
             header_row = None
             max_scan = min(40, len(df))
             
             for i in range(max_scan):
                 row_vals = [str(v).lower().strip() for v in df.iloc[i] if pd.notna(v)]
                 matches = sum(1 for v in row_vals if any(kw in v for kw in header_keywords))
-                if matches >= 3:  # At least 3 recognised column keywords
+                if matches >= 2:  # At least 2 recognised column keywords
                     header_row = i
                     break
             
@@ -151,16 +280,17 @@ def extract_from_excel(file_obj, trade_direction: str = "export") -> List[Dict]:
             # Normalise column names for matching
             col_lower = {col: str(col).lower().strip() for col in df.columns}
             
-            # --- Skip reference/lookup sheets that have no value AND qty columns ---
-            # Invoice sheets have LINE TOTAL/VALUE + QTY. Reference sheets typically lack one or both.
+            # Invoice sheets usually have value + qty; allow value-only layouts (some templates).
             _value_check = _find_columns(df.columns, col_lower, [
                 ['line total', 'line_total', 'line value'],
                 ['total value', 'total_value', 'invoice value'],
+                ['extended', 'amount'],
                 ['value', 'price'],
                 ['total', 'cost', 'amount'],
             ])
             _qty_check = _find_columns(df.columns, col_lower, [
                 ['qty', 'quantity'],
+                ['units', 'unit'],
             ])
             # Fallback: if value column not found by name, check unnamed columns for numeric data
             # (handles formats like Rhenus where value/price column has no header text)
@@ -173,8 +303,7 @@ def extract_from_excel(file_obj, trade_direction: str = "export") -> List[Dict]:
                     if len(_nums) >= max(3, len(df) * 0.4) and _nums.mean() > 0.01:
                         _value_check = [_col]
                         break
-            if not _value_check or not _qty_check:
-                # Must have BOTH value and quantity columns to be an invoice sheet
+            if not _value_check:
                 continue
             
             # --- Column detection with priority ordering ---
@@ -276,29 +405,11 @@ def extract_from_excel(file_obj, trade_direction: str = "export") -> List[Dict]:
                     for col in code_columns:
                         val = row[col]
                         if pd.notna(val):
-                            # Convert to string and clean
-                            code_str = str(val).replace('.0', '').replace(' ', '').replace('-', '')
-                            if code_str.isdigit() and len(code_str) >= 6:
-                                commodity_code = code_str
+                            commodity_code = _normalize_hs_code(val, trade_direction)
+                            if commodity_code:
                                 break
                 
-                # If no code found, track consecutive empties
-                if not commodity_code:
-                    consecutive_empty += 1
-                    if consecutive_empty >= max_empty_gap:
-                        break  # End of data section
-                    continue
-                
-                # Valid row found — reset gap counter
-                consecutive_empty = 0
-                
-                # Truncate to 8 digits for export, pad to 10 for import
-                if trade_direction.lower() == "export":
-                    commodity_code = commodity_code[:8]
-                elif trade_direction.lower() == "import" and len(commodity_code) == 8:
-                    commodity_code = commodity_code + "00"
-                
-                # Extract other fields
+                # Extract other fields (needed before row skip / description-only path)
                 description = None
                 if desc_columns:
                     for col in desc_columns:
@@ -355,10 +466,37 @@ def extract_from_excel(file_obj, trade_direction: str = "export") -> List[Dict]:
                 
                 # Skip phantom rows: must have a value > 0
                 if not value or value <= 0:
+                    if not commodity_code:
+                        consecutive_empty += 1
+                        if consecutive_empty >= max_empty_gap:
+                            break
                     continue
-                
-                # Create item with normalised field names
-                item = {
+
+                if not commodity_code:
+                    # Commercial invoice rows: description + value but no HS column yet
+                    if not (description and len(description) > 2):
+                        consecutive_empty += 1
+                        if consecutive_empty >= max_empty_gap:
+                            break
+                        continue
+                    consecutive_empty = 0
+                    all_items.append({
+                        "commodity_code": "",
+                        "description": description,
+                        "quantity": quantity,
+                        "uom": uom or "PCS",
+                        "total_value": value,
+                        "country_of_origin": country or "",
+                        "net_weight": weight,
+                        "currency": "GBP",
+                        "needs_review": True,
+                    })
+                    continue
+
+                # Valid coded row — reset gap counter
+                consecutive_empty = 0
+
+                all_items.append({
                     "commodity_code": commodity_code,
                     "description": description if description else f"Item {commodity_code}",
                     "quantity": quantity,
@@ -368,13 +506,27 @@ def extract_from_excel(file_obj, trade_direction: str = "export") -> List[Dict]:
                     "net_weight": weight,
                     "currency": "GBP",
                     "needs_review": False,
-                }
-                
-                all_items.append(item)
-        
+                })
+
+        data_items = _excel_data_items(all_items)
+        if not data_items:
+            file_obj.seek(0)
+            fallback_items = _excel_llm_fallback(file_obj, trade_direction)
+            if fallback_items:
+                if all_items and all_items[0].get('_excel_metadata'):
+                    return [all_items[0]] + fallback_items
+                return fallback_items
+
         return all_items
-        
+
     except Exception as e:
+        file_obj.seek(0)
+        try:
+            fallback_items = _excel_llm_fallback(file_obj, trade_direction)
+            if fallback_items:
+                return fallback_items
+        except Exception:
+            pass
         return [{"error": f"Error reading Excel: {str(e)}"}]
 
 
@@ -505,7 +657,7 @@ def extract_from_file(file_obj, filename: str, trade_direction: str = "export") 
             metadata.update(extract_invoice_metadata(text))
             return text, items, metadata
         
-        elif file_ext in ['xlsx', 'xls']:
+        elif file_ext in _EXCEL_EXTENSIONS:
             items = extract_from_excel(file_obj, trade_direction)
             # Create a text representation for debug view
             text = f"Excel file: {filename}\nExtracted {len(items)} items from spreadsheet"
