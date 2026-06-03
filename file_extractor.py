@@ -3,6 +3,7 @@ Multi-format document extraction module
 Supports PDF, Excel, and Word documents
 """
 from pdf_extractor import extract_text_from_pdf, parse_line_items, extract_invoice_metadata
+from countries import normalize_country_iso, normalize_item_country_fields
 import os
 import re
 import pandas as pd
@@ -94,7 +95,7 @@ def _normalize_llm_items(llm_items: list, trade_direction: str) -> List[Dict]:
             'quantity': qty,
             'uom': str(it.get('unit') or 'PCS').strip() or 'PCS',
             'total_value': value,
-            'country_of_origin': str(it.get('country_origin') or '').strip(),
+            'country_of_origin': normalize_country_iso(it.get('country_origin')),
             'net_weight': it.get('net_weight'),
             'currency': str(it.get('currency') or 'GBP').upper()[:3],
             'needs_review': not bool(code),
@@ -451,10 +452,7 @@ def extract_from_excel(file_obj, trade_direction: str = "export") -> List[Dict]:
                 if country_columns:
                     for col in country_columns:
                         if pd.notna(row[col]):
-                            country = str(row[col]).strip()
-                            # Normalise UK → GB (HMRC does not recognise "UK")
-                            if country.upper() == 'UK':
-                                country = 'GB'
+                            country = normalize_country_iso(str(row[col]).strip())
                             break
                 
                 uom = None
@@ -507,6 +505,10 @@ def extract_from_excel(file_obj, trade_direction: str = "export") -> List[Dict]:
                     "currency": "GBP",
                     "needs_review": False,
                 })
+
+        for item in all_items:
+            if isinstance(item, dict) and not item.get('_excel_metadata'):
+                normalize_item_country_fields(item)
 
         data_items = _excel_data_items(all_items)
         if not data_items:

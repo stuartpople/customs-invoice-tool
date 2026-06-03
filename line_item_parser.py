@@ -401,10 +401,8 @@ class LineItemParser:
                 continue
             seen_keys.add(key)
 
-            # Normalise UK -> GB (HMRC does not recognise "UK" as a country code)
-            for field in ('country_of_origin', 'country_origin'):
-                if it.get(field, '').strip().upper() == 'UK':
-                    it[field] = 'GB'
+            from countries import normalize_item_country_fields
+            normalize_item_country_fields(it)
 
             kept.append(it)
 

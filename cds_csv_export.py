@@ -12,6 +12,7 @@ import unicodedata
 from typing import Dict, List, Optional
 from openpyxl import Workbook, load_workbook
 from consolidation import group_by_commodity_code, consolidate_items
+from countries import normalize_country_iso
 
 # Path to the original CDS template bundled with this tool.
 # Using the template preserves all merged cells, column widths, and borders
@@ -214,7 +215,7 @@ def create_cds_excel(
 
         # Country of origin — pick the first (CDS only allows one per line)
         countries = consolidated.get('countries_of_origin', [])
-        country_orig = countries[0] if countries else ''
+        country_orig = normalize_country_iso(countries[0] if countries else '')
 
         # Supplementary units from HMRC data
         supp_units = ''

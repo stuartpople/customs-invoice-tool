@@ -15,13 +15,13 @@ from consolidation import group_by_commodity_code, create_consolidated_dataframe
 from excel_export import create_comprehensive_export
 from cds_csv_export import create_cds_excel
 from hmrc_api import HMRCTariffAPI
-from countries import COUNTRIES, COMMON_COUNTRIES, COUNTRY_TO_ISO
+from countries import COUNTRIES, COMMON_COUNTRIES, COUNTRY_TO_ISO, normalize_items_country_fields
 from file_extractor import extract_from_file
 import shutil
 
 
 # Version tracking for cache busting
-APP_VERSION = "v3.11"
+APP_VERSION = "v3.12"
 
 
 def _apply_selected_doc_codes(hmrc_results: dict) -> dict:
@@ -551,7 +551,7 @@ if uploaded_files and username:
         
         # Store non-PDF items if any
         if all_items:
-            st.session_state.line_items = all_items
+            st.session_state.line_items = normalize_items_country_fields(all_items)
             st.session_state.non_pdf_processed = True
             st.session_state.process_message = f"✅ Extracted {len(all_items)} items"
         elif non_pdf_files:

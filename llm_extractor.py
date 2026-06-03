@@ -232,6 +232,7 @@ def _validate_commodity_code(code: Optional[str], value: Optional[float], unit_p
 
 
 def _normalise_items(raw_items: list) -> List[Dict]:
+    from countries import normalize_country_iso
     result = []
     for it in raw_items:
         if not isinstance(it, dict):
@@ -247,7 +248,7 @@ def _normalise_items(raw_items: list) -> List[Dict]:
             "unit": str(it.get("unit") or "pcs").lower().strip(),
             "unit_price": unit_price,
             "value": value,
-            "country_origin": _str_or_none(it.get("country_origin")),
+            "country_origin": normalize_country_iso(_str_or_none(it.get("country_origin"))),
             "net_weight": _float_or_none(it.get("net_weight")),
         })
     return result

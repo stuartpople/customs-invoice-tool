@@ -4,6 +4,7 @@ Data consolidation and grouping utilities
 from typing import List, Dict
 from collections import defaultdict
 import pandas as pd
+from countries import normalize_country_iso
 
 
 def group_by_commodity_code(items: List[Dict], group_by_origin: bool = False) -> Dict[str, List[Dict]]:
@@ -29,7 +30,7 @@ def group_by_commodity_code(items: List[Dict], group_by_origin: bool = False) ->
         commodity_code = (item.get('commodity_code') or '').strip()
         if commodity_code and commodity_code != 'UNKNOWN':
             if group_by_origin:
-                country = (item.get('country_of_origin') or '').strip()
+                country = normalize_country_iso(item.get('country_of_origin'))
                 key = f"{commodity_code}|{country}" if country else commodity_code
             else:
                 key = commodity_code
@@ -91,7 +92,7 @@ def consolidate_items(items: List[Dict]) -> Dict:
             except (ValueError, TypeError):
                 pass
         
-        origin = item.get('country_of_origin')
+        origin = normalize_country_iso(item.get('country_of_origin'))
         if origin:
             consolidated['countries_of_origin'].add(origin)
     

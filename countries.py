@@ -147,6 +147,119 @@ if "United Kingdom" not in COUNTRIES:
     COUNTRIES.sort()
 COUNTRY_TO_ISO.setdefault("United Kingdom", "GB")
 
+# ISO 3166-1 alpha-3 → alpha-2 (invoices often show 3-letter codes; HMRC needs 2-letter)
+_ALPHA3_PATH = Path(__file__).parent / "iso_alpha3_to_alpha2.json"
+_ISO_ALPHA3_TO_ALPHA2: dict[str, str] = {}
+try:
+    if _ALPHA3_PATH.exists():
+        _ISO_ALPHA3_TO_ALPHA2 = {
+            k.upper(): v.upper()
+            for k, v in json.loads(_ALPHA3_PATH.read_text()).items()
+        }
+except Exception:
+    pass
+
+# Case-insensitive country name → ISO alpha-2
+_NAME_TO_ISO: dict[str, str] = {}
+for _name, _code in COUNTRY_TO_ISO.items():
+    _NAME_TO_ISO[_name.lower()] = _code
+    _NAME_TO_ISO[_name.lower().replace(',', '')] = _code
+
+# Common aliases not always in HMRC list
+_NAME_ALIASES = {
+    'uk': 'GB', 'u.k.': 'GB', 'great britain': 'GB', 'england': 'GB',
+    'usa': 'US', 'u.s.a.': 'US', 'u.s.': 'US', 'america': 'US',
+    'united states of america': 'US',
+    'china': 'CN', 'prc': 'CN', "people's republic of china": 'CN',
+    'south korea': 'KR', 'korea': 'KR', 'republic of korea': 'KR',
+    'north korea': 'KP',
+    'uae': 'AE', 'united arab emirates': 'AE',
+    'holland': 'NL', 'the netherlands': 'NL',
+    'ivory coast': 'CI', "cote d'ivoire": 'CI', "côte d'ivoire": 'CI',
+    'czechia': 'CZ', 'czech republic': 'CZ',
+    'viet nam': 'VN', 'vietnam': 'VN',
+    'hong kong sar': 'HK', 'taiwan': 'TW',
+    'sint maarten': 'SX',
+}
+_NAME_TO_ISO.update(_NAME_ALIASES)
+
+# Valid HMRC-style 2-letter codes we accept as-is (from tariff geographical areas)
+_VALID_ALPHA2 = set(COUNTRY_TO_ISO.values()) | {
+    'GB', 'XI',  # XI used in some NI trade contexts
+}
+
+
+def normalize_country_iso(value: str | None) -> str:
+    """
+    Normalise country of origin / destination to ISO 3166-1 alpha-2 for HMRC/CDS.
+
+    Handles: 3-letter (CHN→CN), 2-letter (uk→GB), full country names, and common aliases.
+    """
+    if value is None:
+        return ''
+    raw = str(value).strip()
+    if not raw or raw.lower() in ('null', 'none', 'n/a', '-', '—'):
+        return ''
+
+    # Comma-separated (consolidated rows) — normalise each part
+    if ',' in raw:
+        parts = [normalize_country_iso(p.strip()) for p in raw.split(',')]
+        parts = [p for p in parts if p]
+        return ', '.join(dict.fromkeys(parts))  # preserve order, dedupe
+
+    token = raw.upper().replace('.', '').replace('  ', ' ')
+
+    if token in ('UK', 'U K'):
+        return 'GB'
+
+    # Already 2-letter
+    if len(token) == 2 and token.isalpha():
+        if token == 'UK':
+            return 'GB'
+        if token in _VALID_ALPHA2 or token.isalpha():
+            return token
+
+    # 3-letter (ISO alpha-3 on commercial invoices)
+    if len(token) == 3 and token.isalpha():
+        mapped = _ISO_ALPHA3_TO_ALPHA2.get(token)
+        if mapped:
+            return mapped
+        # Unknown 3-letter — return as-is (user can fix) rather than truncate
+        return token
+
+    # Full name (any case)
+    key = raw.lower().strip()
+    if key in _NAME_TO_ISO:
+        return _NAME_TO_ISO[key]
+    key_compact = key.replace(',', '')
+    if key_compact in _NAME_TO_ISO:
+        return _NAME_TO_ISO[key_compact]
+
+    # Title-case retry for ALL CAPS names
+    titled = raw.title()
+    if titled.lower() in _NAME_TO_ISO:
+        return _NAME_TO_ISO[titled.lower()]
+
+    return raw.upper()[:2] if len(raw) >= 2 and raw[:2].isalpha() else raw
+
+
+def normalize_item_country_fields(item: dict) -> dict:
+    """Apply normalize_country_iso to country_of_origin / country_origin on one line item."""
+    if not isinstance(item, dict):
+        return item
+    for field in ('country_of_origin', 'country_origin'):
+        if field in item and item[field]:
+            item[field] = normalize_country_iso(item[field])
+    return item
+
+
+def normalize_items_country_fields(items: list) -> list:
+    """Normalise country fields on every line item (in place)."""
+    for it in items or []:
+        normalize_item_country_fields(it)
+    return items
+
+
 # Common trading partners for quick selection
 COMMON_COUNTRIES = [
     "United Kingdom", "United States", "China", "Germany", "France", "Netherlands",

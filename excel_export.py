@@ -10,6 +10,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 from pathlib import Path
 from typing import Dict, List, Optional
 import io
+from countries import normalize_country_iso
 
 
 def _safe_float(value, default=0.0):
@@ -254,7 +255,7 @@ def create_comprehensive_export(
             # Get all unique countries of origin
             countries = set()
             for item in group_items:
-                coo = item.get('country_of_origin', '')
+                coo = normalize_country_iso(item.get('country_of_origin', ''))
                 if coo:
                     countries.add(coo)
             
@@ -333,7 +334,7 @@ def create_comprehensive_export(
                 'Currency': item.get('currency', 'GBP'),
                 'Weight': net_wt,
                 'Gross Weight': gross_wt,
-                'Country': item.get('country_of_origin', ''),
+                'Country': normalize_country_iso(item.get('country_of_origin', '')),
                 '_review_notes': item.get('review_notes', '')
             }
             
