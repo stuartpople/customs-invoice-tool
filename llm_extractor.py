@@ -41,6 +41,7 @@ Returned metadata shape (matches existing regex-based output):
 from __future__ import annotations
 
 import json
+import os
 import re
 from typing import Dict, List, Optional, Tuple
 
@@ -57,6 +58,9 @@ try:
     _GEMINI_AVAILABLE = True
 except ImportError:
     pass
+
+# gemini-1.5-flash and gemini-2.0-flash are retired; use 2.5 Flash (or lite) on Streamlit secrets.
+DEFAULT_GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
 
 # ── Shared prompt ─────────────────────────────────────────────────────────────
@@ -90,7 +94,7 @@ _SYSTEM_PROMPT = (
     "Extract ALL line items you can find, even if the table is misaligned."
 )
 
-_MAX_OCR_CHARS = 60_000   # 60k chars ≈ 15k tokens — well within both providers' limits
+_MAX_OCR_CHARS = 60_000  # 60k chars ≈ 15k tokens — well within both providers' limits
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
@@ -98,15 +102,15 @@ _MAX_OCR_CHARS = 60_000   # 60k chars ≈ 15k tokens — well within both provid
 def extract_with_gemini(
     ocr_text: str,
     api_key: str,
-    model: str = "gemini-1.5-flash",
+    model: str | None = None,
 ) -> Tuple[List[Dict], Dict]:
     """
     Extract invoice data using Google Gemini Flash (free tier).
 
     Args:
         ocr_text: Combined OCR text from all invoice pages.
-        api_key:  Google AI Studio API key.
-        model:    Gemini model name (default "gemini-1.5-flash").
+        api_key: Google AI Studio API key.
+        model:    Gemini model name (default from GEMINI_MODEL env or gemini-2.5-flash).
 
     Raises:
         RuntimeError: if google-generativeai package is not installed.
@@ -117,6 +121,7 @@ def extract_with_gemini(
             "Add 'google-generativeai>=0.5' to requirements.txt."
         )
 
+    model = model or DEFAULT_GEMINI_MODEL
     text = _truncate(ocr_text)
     genai.configure(api_key=api_key)
     gemini_model = genai.GenerativeModel(
@@ -142,7 +147,7 @@ def extract_with_llm(
 
     Args:
         ocr_text: Combined OCR text from all invoice pages.
-        api_key:  OpenAI API key.
+        api_key: OpenAI API key.
         model:    OpenAI model name.
 
     Raises:
@@ -161,7 +166,7 @@ def extract_with_llm(
         response_format={"type": "json_object"},
         messages=[
             {"role": "system", "content": _SYSTEM_PROMPT},
-            {"role": "user",   "content": text},
+            {"role": "user", "content": text},
         ],
     )
     data = _parse_response(response.choices[0].message.content)
@@ -212,19 +217,15 @@ def _validate_commodity_code(code: Optional[str], value: Optional[float], unit_p
     if chapter not in _VALID_HS_CHAPTERS:
         return None
     # Reject if the numeric value of the code matches the line value or unit_price
-    # (AI sometimes copies a monetary value into the commodity_code field)
     code_num = int(digits)
     for monetary in [value, unit_price]:
         if monetary is None:
             continue
-        # Compare after removing decimal cents: e.g. 207.35 -> 20735 -> padded to 20735000
         cents = round(monetary * 100)
-        # Check equality at any common padding level (6,7,8,9,10 digits)
         for pad in range(6, 11):
             padded = cents * (10 ** max(0, pad - len(str(cents))))
             if code_num == padded:
                 return None
-        # Also reject direct equality (e.g. code=20735, value=20735.0)
         if abs(code_num - monetary) < 0.01:
             return None
     return digits
@@ -241,28 +242,28 @@ def _normalise_items(raw_items: list) -> List[Dict]:
         commodity_code = _validate_commodity_code(raw_code, value, unit_price)
         result.append({
             "commodity_code": commodity_code,
-            "description":    str(it.get("description") or "").strip(),
-            "quantity":       _float_or_none(it.get("quantity")),
-            "unit":           str(it.get("unit") or "pcs").lower().strip(),
-            "unit_price":     unit_price,
-            "value":          value,
+            "description": str(it.get("description") or "").strip(),
+            "quantity": _float_or_none(it.get("quantity")),
+            "unit": str(it.get("unit") or "pcs").lower().strip(),
+            "unit_price": unit_price,
+            "value": value,
             "country_origin": _str_or_none(it.get("country_origin")),
-            "net_weight":     _float_or_none(it.get("net_weight")),
+            "net_weight": _float_or_none(it.get("net_weight")),
         })
     return result
 
 
 def _normalise_metadata(raw: dict) -> Dict:
     return {
-        "invoice_number":      _str_or_none(raw.get("invoice_number")),
-        "invoice_date":        _str_or_none(raw.get("invoice_date")),
-        "incoterm":            _str_or_none(raw.get("incoterm")),
-        "currency":            _str_or_none(raw.get("currency")),
+        "invoice_number": _str_or_none(raw.get("invoice_number")),
+        "invoice_date": _str_or_none(raw.get("invoice_date")),
+        "incoterm": _str_or_none(raw.get("incoterm")),
+        "currency": _str_or_none(raw.get("currency")),
         "total_invoice_value": _float_or_none(raw.get("total_invoice_value")),
-        "total_gross_weight":  _float_or_none(raw.get("total_gross_weight")),
-        "total_net_weight":    _float_or_none(raw.get("total_net_weight")),
-        "number_of_packages":  _int_or_none(raw.get("number_of_packages")),
-        "package_type":        _str_or_none(raw.get("package_type")),
+        "total_gross_weight": _float_or_none(raw.get("total_gross_weight")),
+        "total_net_weight": _float_or_none(raw.get("total_net_weight")),
+        "number_of_packages": _int_or_none(raw.get("number_of_packages")),
+        "package_type": _str_or_none(raw.get("package_type")),
     }
 
 
@@ -288,5 +289,3 @@ def _int_or_none(v) -> Optional[int]:
         return int(float(v))
     except (ValueError, TypeError):
         return None
-
-
