@@ -142,6 +142,28 @@ class LineItemParser:
                 "format_type": "marlow",
             }
 
+        # ── IKF / RS Components vertical table (HS Codes + CofO per line) ─────
+        # PyMuPDF emits one field per line: item#, stock, description, UOM, qty,
+        # prices, weights, 8-digit HS, CofO, country. Must use regex — AI often
+        # treats stock numbers or amounts as commodity codes.
+        _is_ikf_vertical = (
+            re.search(r'\bHS\s+Codes\b', all_text) is not None
+            and re.search(r'\bCofO\b', all_text) is not None
+            and re.search(r'Stock\s+No', all_text, re.IGNORECASE) is not None
+            and re.search(r'\bUnit\s+Price\b', all_text, re.IGNORECASE) is not None
+        )
+        if _is_ikf_vertical:
+            print("[Parser] IKF/RS vertical table detected — using regex parser (skip AI)")
+            items, format_type = self._parse_line_items_proven(all_text, direction, page_map)
+            items = self._postprocess_items(items)
+            return {
+                "total_items": len(items),
+                "items": items,
+                "pages_analyzed": len(pages_data.get("pages", [])),
+                "direction": direction,
+                "format_type": format_type or "vertical_table_ikf",
+            }
+
         # ── Arrow Export / (cc:XXXXXXXXXX) bracket HS code format ─────────────
         # Invoices from Arrow Export (and similar) embed HS codes inline as
         # "(cc:8204120000)". PyMuPDF extracts the columns in an unusual order:
@@ -231,8 +253,16 @@ class LineItemParser:
             if not items_list:
                 return False
             codes = [it.get("commodity_code") for it in items_list if it.get("commodity_code")]
-            # At least 30% of items should have an HS code for the result to be trusted
-            return len(codes) / len(items_list) >= 0.3
+            if not codes:
+                return False
+            if len(codes) / len(items_list) < 0.3:
+                return False
+            # Reject when many codes are short digit strings (stock/part numbers)
+            eight_digit = sum(
+                1 for c in codes
+                if len(re.sub(r'\D', '', str(c))) >= 8
+            )
+            return eight_digit / len(codes) >= 0.5
 
         # 1. Google Gemini Flash — free tier, 1,500 req/day, no credit card needed
         google_key = self._get_secret("GOOGLE_API_KEY")
@@ -416,12 +446,43 @@ class LineItemParser:
                 continue
             seen_keys.add(key)
 
+            self._sanitize_item_commodity_code(it)
+
             from countries import normalize_item_country_fields
             normalize_item_country_fields(it)
 
             kept.append(it)
 
         return kept
+
+    def _sanitize_item_commodity_code(self, item: Dict) -> None:
+        """Drop commodity codes that are stock numbers or other non-tariff digits."""
+        raw = (item.get('commodity_code') or '').strip()
+        if not raw:
+            return
+        digits = re.sub(r'\D', '', raw)
+        if not digits:
+            item['commodity_code'] = ''
+            return
+        stock = re.sub(r'\D', '', str(item.get('stock_number') or ''))
+        if stock and digits == stock:
+            item['commodity_code'] = ''
+            return
+        # Stock/part numbers are usually 5–7 digits; UK export HS is 8 (or 10 import)
+        if len(digits) < 8:
+            item['commodity_code'] = ''
+            return
+        if len(digits) > 10:
+            digits = digits[:10]
+        try:
+            chapter = int(digits[:2])
+        except ValueError:
+            item['commodity_code'] = ''
+            return
+        if chapter < 1 or (chapter > 97 and chapter != 99):
+            item['commodity_code'] = ''
+            return
+        item['commodity_code'] = digits[:8] if len(digits) >= 8 else digits
     
     def _parse_line_items_proven(self, text: str, direction: str, page_map: Dict) -> List[Dict]:
         """Use the proven parsing logic with enhanced table detection"""
@@ -803,11 +864,23 @@ class LineItemParser:
             return True
         return any(m in low for m in _IKF_FOOTER_MARKERS)
 
-    def _find_ikf_hs_index(self, lines: List[str], start: int, limit: int = 12) -> int:
-        for j in range(start, min(start + limit, len(lines))):
-            if re.match(r'^\d{6,10}$', lines[j].strip()):
-                return j
-        return -1
+    def _find_ikf_hs_index(self, lines: List[str], start: int, limit: int = 14) -> int:
+        """HS code is the 8-digit line immediately before 'CofO' in IKF layout."""
+        end = min(start + limit, len(lines))
+        for j in range(start, end):
+            if lines[j].strip() != 'CofO' or j <= start:
+                continue
+            prev = lines[j - 1].strip()
+            if re.match(r'^\d{8}$', prev):
+                return j - 1
+        # Fallback: last 8-digit line in window before first CofO
+        last_eight = -1
+        for j in range(start, end):
+            if lines[j].strip() == 'CofO':
+                return last_eight
+            if re.match(r'^\d{8}$', lines[j].strip()):
+                last_eight = j
+        return last_eight
 
     def _parse_ikf_country_after_hs(
         self, lines: List[str], hs_idx: int, item_num_int: int
