@@ -10,6 +10,21 @@ from typing import List, Dict, Tuple, Optional
 import json
 from pathlib import Path
 from ocr_utils import clean_ocr_text
+from countries import normalize_country_iso
+
+
+_IKF_UOM_TOKENS = frozenset({
+    'EA', 'BAG', 'REEL', 'BOX', 'PK', 'PCS', 'SET', 'PACK', 'M', 'KG',
+    'PAIR', 'PAIRS', 'RL', 'ROLL', 'KIT', 'CAN', 'TUB', 'DRM', 'LOT', 'FA',
+    'CASE', 'MREEL', 'EACH', 'ITEM', 'UNIT', 'ST',
+})
+
+_IKF_FOOTER_MARKERS = (
+    'bank details:', 'please remit', 'total invoice', 'grand total',
+    'payment terms', 'account number', 'goods value', 'freight charge',
+    'name of signatory', 'invoice total', 'product information/packing',
+    'please mention in all correspondence',
+)
 
 
 class LineItemParser:
@@ -755,130 +770,199 @@ class LineItemParser:
         
         return items
     
-    def _parse_vertical_table_ikf(self, lines: List[str], data_start: int, stride: int, 
+    def _is_ikf_stock_number(self, line: str) -> bool:
+        s = (line or '').strip()
+        if not s or len(s) < 5 or ' ' in s:
+            return False
+        return bool(re.match(r'^[A-Za-z0-9][A-Za-z0-9\-]*$', s))
+
+    def _is_ikf_uom_line(self, line: str) -> bool:
+        return (line or '').strip().upper() in _IKF_UOM_TOKENS
+
+    def _is_ikf_quantity_line(self, line: str) -> bool:
+        s = (line or '').strip().replace(' ', '').replace(',', '.')
+        if not s or not re.match(r'^[\d.]+$', s):
+            return False
+        try:
+            v = float(s)
+            return 0 < v <= 100000
+        except ValueError:
+            return False
+
+    def _is_ikf_junk_line(self, line: str) -> bool:
+        low = (line or '').strip().lower()
+        if not low:
+            return True
+        if low == 'cofo':
+            return True
+        if re.match(r'^page\s+\d+\s+of\s+\d+', low):
+            return True
+        if low.startswith('--- page'):
+            return True
+        if low == 'invoice' or 'product information' in low:
+            return True
+        return any(m in low for m in _IKF_FOOTER_MARKERS)
+
+    def _find_ikf_hs_index(self, lines: List[str], start: int, limit: int = 12) -> int:
+        for j in range(start, min(start + limit, len(lines))):
+            if re.match(r'^\d{6,10}$', lines[j].strip()):
+                return j
+        return -1
+
+    def _parse_ikf_country_after_hs(
+        self, lines: List[str], hs_idx: int, item_num_int: int
+    ) -> Tuple[str, int]:
+        """Return (ISO country, index after country block)."""
+        j = hs_idx + 1
+        while j < len(lines):
+            token = lines[j].strip()
+            if token == 'CofO' and j + 1 < len(lines):
+                country_line = lines[j + 1].strip()
+                # Next item number often appears where country would be (e.g. item 39 → "40")
+                if country_line.isdigit():
+                    if int(country_line) == item_num_int + 1:
+                        return '', j + 1
+                    return '', j + 2
+                return normalize_country_iso(country_line), j + 2
+            if token.isdigit() and int(token) == item_num_int + 1:
+                break
+            if self._is_ikf_junk_line(token):
+                return '', j + 1
+            j += 1
+        return '', j
+
+    def _find_next_ikf_item_index(
+        self, lines: List[str], start: int, expected_num: int
+    ) -> int:
+        target = str(expected_num)
+        for j in range(start, len(lines)):
+            if lines[j].strip() != target:
+                continue
+            if j + 1 < len(lines) and self._is_ikf_stock_number(lines[j + 1]):
+                return j
+        return start
+
+    def _parse_vertical_table_ikf(self, lines: List[str], data_start: int, stride: int,
                                    direction: str, page_map: Dict, pad_to_10: bool) -> List[Dict]:
-        """Parse IKF/RS Components vertical format.
-        
-        Layout per item (stride typically 12):
-          +0: item number
-          +1: stock number
-          +2: description
-          +3: UOM (EA, BAG, etc.)
-          +4: quantity
-          +5: unit price
-          +6: amount (total value)
-          +7: unit weight
-          +8: line weight (net weight)
-          +9: HS code (8 digits)
-          +10: "CofO"
-          +11: country name (full, e.g. "China", "United Kingdom")
+        """Parse IKF/RS Components vertical format (variable stride).
+
+        Typical layout: item#, stock, description[, description…], UOM, qty, unit price,
+        amount, unit weight, line weight, HS code, CofO, country name.
         """
         items = []
         i = data_start
         current_page = 1
-        
-        # Country name -> ISO mapping for common names
-        country_name_map = {
-            'china': 'CN', 'united kingdom': 'GB', 'germany': 'DE', 'italy': 'IT',
-            'czech republic': 'CZ', 'taiwan': 'TW', 'romania': 'RO', 'mexico': 'MX',
-            'switzerland': 'CH', 'france': 'FR', 'spain': 'ES', 'japan': 'JP',
-            'south korea': 'KR', 'india': 'IN', 'usa': 'US', 'united states': 'US',
-            'netherlands': 'NL', 'belgium': 'BE', 'poland': 'PL', 'sweden': 'SE',
-            'austria': 'AT', 'denmark': 'DK', 'hungary': 'HU', 'canada': 'CA',
-            'australia': 'AU', 'singapore': 'SG', 'hong kong': 'HK', 'malaysia': 'MY',
-            'thailand': 'TH', 'vietnam': 'VN', 'ireland': 'IE', 'portugal': 'PT',
-            'norway': 'NO', 'finland': 'FI', 'turkey': 'TR', 'brazil': 'BR',
-            'korea, republic of': 'KR', 'great britain': 'GB',
-        }
-        
+
         while i < len(lines):
             line = lines[i].strip()
-            
-            # Track page separators
+
             m_page = re.match(r'^---\s*PAGE\s*(\d+)\s*---', line)
             if m_page:
                 current_page = int(m_page.group(1))
                 i += 1
                 continue
-            
-            # Skip non-item-number lines
-            if not line.isdigit():
+
+            if line == 'CofO':
+                i += 2
+                continue
+
+            if self._is_ikf_junk_line(line):
                 i += 1
                 continue
-            
-            item_num = line
-            
-            # Need enough lines ahead for this item
-            if i + 9 >= len(lines):
-                break
-            
-            # Read fields relative to item number position
-            stock_no = lines[i + 1].strip()
-            description = lines[i + 2].strip()
-            uom = lines[i + 3].strip()
-            
-            # Quantity — handle European comma-as-thousands and plain integers
-            quantity_raw = lines[i + 4].strip().replace(',', '')
-            try:
-                quantity = str(int(float(quantity_raw)))
-            except ValueError:
-                quantity = quantity_raw
-            
-            unit_value = self._parse_monetary_value(lines[i + 5].strip())
-            total_value = self._parse_monetary_value(lines[i + 6].strip())
-            unit_weight = lines[i + 7].strip().replace(',', '.')
-            net_weight = lines[i + 8].strip().replace(',', '.')
-            
-            # HS code — scan from i+9 onward to find the 8-digit code
-            # (in case amounts with spaces pushed lines)
-            hs_code = ''
-            cofo_offset = 0
-            for j in range(i + 9, min(i + stride + 2, len(lines))):
-                candidate = lines[j].strip()
-                if re.match(r'^\d{6,10}$', candidate):
-                    hs_code = candidate
-                    cofo_offset = j - i
-                    break
-            
-            if not hs_code:
-                # No valid HS code found — skip this item
-                i += stride
+
+            if not line.isdigit() or int(line) > 9999:
+                i += 1
                 continue
-            
-            # Country of origin: expect "CofO" then country name after HS code
-            country_iso = ''
-            if cofo_offset + 2 < stride + 3:
-                cofo_line = lines[i + cofo_offset + 1].strip() if i + cofo_offset + 1 < len(lines) else ''
-                country_line = lines[i + cofo_offset + 2].strip() if i + cofo_offset + 2 < len(lines) else ''
-                if cofo_line == 'CofO' and country_line:
-                    country_iso = country_name_map.get(country_line.lower(), country_line[:2].upper())
-            
-            # Check for footer markers
-            combined_text = (stock_no + ' ' + description + ' ' + hs_code).lower()
-            if any(m in combined_text for m in ['bank details:', 'please remit', 'total invoice', 
-                                                 'grand total', 'payment terms', 'account number']):
+
+            item_num = line
+            try:
+                item_num_int = int(item_num)
+                expected_next = item_num_int + 1
+            except ValueError:
+                i += 1
+                continue
+
+            if i + 6 >= len(lines):
                 break
-            
-            # Validate
+
+            stock_no = lines[i + 1].strip()
+            if not self._is_ikf_stock_number(stock_no):
+                i += 1
+                continue
+
+            j = i + 2
+            desc_parts: List[str] = []
+            while j < len(lines):
+                token = lines[j].strip()
+                if self._is_ikf_junk_line(token):
+                    break
+                if token == 'CofO':
+                    break
+                if (
+                    token.isdigit()
+                    and int(token) == expected_next
+                    and j + 1 < len(lines)
+                    and self._is_ikf_stock_number(lines[j + 1])
+                ):
+                    break
+                if self._is_ikf_uom_line(token) and j + 1 < len(lines) and self._is_ikf_quantity_line(lines[j + 1]):
+                    break
+                desc_parts.append(token)
+                j += 1
+
+            if j >= len(lines) or not self._is_ikf_uom_line(lines[j]):
+                i += 1
+                continue
+
+            uom = lines[j].strip()
+            quantity_raw = lines[j + 1].strip()
+            try:
+                quantity = str(int(float(quantity_raw.replace(' ', '').replace(',', '.'))))
+            except ValueError:
+                quantity = quantity_raw.replace(' ', '')
+
+            if j + 6 >= len(lines):
+                break
+
+            unit_value = self._parse_monetary_value(lines[j + 2].strip())
+            total_value = self._parse_monetary_value(lines[j + 3].strip())
+            unit_weight = lines[j + 4].strip().replace(',', '.')
+            net_weight = lines[j + 5].strip().replace(',', '.')
+
+            hs_idx = self._find_ikf_hs_index(lines, j + 6)
+            if hs_idx < 0:
+                i += 1
+                continue
+
+            hs_code = lines[hs_idx].strip()
+            country_iso, after_country = self._parse_ikf_country_after_hs(
+                lines, hs_idx, item_num_int
+            )
+
+            combined_text = (stock_no + ' ' + ' '.join(desc_parts) + ' ' + hs_code).lower()
+            if any(m in combined_text for m in _IKF_FOOTER_MARKERS):
+                break
+
             try:
                 qty_val = float(quantity.replace(',', '.'))
                 if qty_val <= 0 or qty_val > 100000:
-                    i += stride
+                    i = after_country
                     continue
             except ValueError:
-                i += stride
+                i = after_country
                 continue
-            
+
+            description = ' '.join(desc_parts).strip()
             hs_code = self._pad_hs_code(hs_code, pad_to_10)
-            
-            confidence = 0.7  # Higher base — has inline description
+
+            confidence = 0.7
             if total_value:
                 confidence += 0.1
             if country_iso:
                 confidence += 0.1
             if net_weight:
                 confidence += 0.1
-            
+
             items.append({
                 "item_number": item_num,
                 "stock_number": stock_no,
@@ -898,9 +982,10 @@ class LineItemParser:
                 "needs_review": False,
                 "raw_text": f"{item_num} {stock_no} {description}"
             })
-            
-            i += stride
-        
+
+            next_i = self._find_next_ikf_item_index(lines, after_country, expected_next)
+            i = next_i if next_i > i else after_country + 1
+
         return items
 
     def _parse_vertical_table_rs(self, lines: List[str], data_start: int, stride: int,
@@ -2193,28 +2278,29 @@ class LineItemParser:
     
     def _parse_monetary_value(self, value: str) -> str:
         """
-        Parse monetary value string, handling thousands separators.
-        ATI invoices use comma as thousands separator (1,230.00 = 1230.00)
+        Parse monetary value string (US/UK and European IKF layouts).
+
+        Handles space thousands (4 700,76), comma decimals (137,32), and US commas (1,230.00).
         """
         if not value:
             return value
-        
-        # If value has both comma and dot, comma is thousands separator
-        # e.g., "1,230.00" -> "1230.00"
-        if ',' in value and '.' in value:
-            return value.replace(',', '')
-        
-        # If value has only comma and it's followed by 3 digits at end, it's thousands
-        # e.g., "1,230" -> "1230"
-        if ',' in value:
-            parts = value.split(',')
+
+        s = value.strip().replace(' ', '')
+
+        if ',' in s and '.' in s:
+            if s.rfind('.') > s.rfind(','):
+                return s.replace(',', '')
+            return s.replace('.', '').replace(',', '.')
+
+        if ',' in s:
+            parts = s.split(',')
+            if len(parts) == 2 and parts[1].isdigit() and len(parts[1]) in (2, 3):
+                return f"{parts[0]}.{parts[1]}"
             if len(parts) == 2 and len(parts[1]) == 3 and parts[1].isdigit():
-                return value.replace(',', '')
-            # Otherwise comma might be decimal (European format)
-            # e.g., "1,23" -> "1.23"
-            return value.replace(',', '.')
-        
-        return value
+                return s.replace(',', '')
+            return s.replace(',', '.')
+
+        return s
     
     def _country_to_iso(self, country: str) -> str:
         """Convert country name or code to ISO 2-letter code"""

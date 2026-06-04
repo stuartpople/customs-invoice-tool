@@ -21,7 +21,7 @@ import shutil
 
 
 # Version tracking for cache busting
-APP_VERSION = "v3.12"
+APP_VERSION = "v3.13"
 
 
 def _apply_selected_doc_codes(hmrc_results: dict) -> dict:
