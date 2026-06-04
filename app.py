@@ -21,7 +21,30 @@ import shutil
 
 
 # Version tracking for cache busting
-APP_VERSION = "v3.13"
+APP_VERSION = "v3.14"
+
+
+def _coerce_dataframe_for_editor(df: pd.DataFrame) -> pd.DataFrame:
+    """Cast display columns to strings for st.data_editor compatibility."""
+    out = df.copy()
+
+    def _cell_str(val):
+        if val is None:
+            return ''
+        try:
+            if pd.isna(val):
+                return ''
+        except (TypeError, ValueError):
+            pass
+        if isinstance(val, (list, tuple, set)):
+            return ', '.join(str(v) for v in val)
+        if isinstance(val, bool):
+            return 'Yes' if val else ''
+        return str(val)
+
+    for col in out.columns:
+        out[col] = out[col].apply(_cell_str)
+    return out.astype('string')
 
 
 def _apply_selected_doc_codes(hmrc_results: dict) -> dict:
@@ -1518,22 +1541,25 @@ elif st.session_state.processing_started and st.session_state.current_job_id:
                                     'confidence', 'needs_review', 'review_notes', 'pages']
                         
                         display_cols = [c for c in cols_order if c in df_items.columns]
-                        df_display = df_items[display_cols].copy()
+                        df_display = _coerce_dataframe_for_editor(
+                            df_items[display_cols].copy()
+                        )
                         
                         # Editable columns (user can correct these)
                         editable_cols = {'description', 'commodity_code', 'quantity', 'uom',
                                          'unit_value', 'total_value', 'net_weight', 'country_of_origin'}
                         
-                        # Build column config: editable columns get editing enabled,
-                        # all others are disabled (read-only)
+                        # Build column config: all TextColumn (mixed dtypes break data_editor)
                         col_config = {}
                         for col in display_cols:
-                            if col == 'status':
-                                col_config[col] = st.column_config.TextColumn("", disabled=True, width="small")
-                            elif col in editable_cols:
-                                col_config[col] = st.column_config.TextColumn(col.replace('_', ' ').title())
-                            else:
-                                col_config[col] = st.column_config.Column(col.replace('_', ' ').title(), disabled=True)
+                            label = "" if col == 'status' else col.replace('_', ' ').title()
+                            disabled = col not in editable_cols
+                            width = "small" if col == 'status' else None
+                            col_config[col] = st.column_config.TextColumn(
+                                label,
+                                disabled=disabled,
+                                width=width,
+                            )
                         
                         st.caption("✏️ **Click any white cell to edit.** Grey cells are read-only. Changes are used in the export.")
                         edited_df = st.data_editor(
@@ -1542,7 +1568,7 @@ elif st.session_state.processing_started and st.session_state.current_job_id:
                             height=400,
                             num_rows="fixed",
                             column_config=col_config,
-                            key="item_editor"
+                            key=f"pdf_item_editor_{consolidation_mode}",
                         )
                         st.caption("🟢 High confidence (≥0.8) | 🔵 Medium (≥0.6) | 🔴 Low (<0.6) | 🟡 Needs review — see Review Notes column")
                         
