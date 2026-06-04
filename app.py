@@ -21,7 +21,7 @@ import shutil
 
 
 # Version tracking for cache busting
-APP_VERSION = "v3.15"
+APP_VERSION = "v3.16"
 
 
 def _coerce_dataframe_for_editor(df: pd.DataFrame) -> pd.DataFrame:
@@ -64,6 +64,22 @@ def _apply_selected_doc_codes(hmrc_results: dict) -> dict:
             # No selections made — keep all (fallback)
             filtered[code] = data
     return filtered
+
+
+def _hs_codes_from_items(items: list) -> list:
+    return list({
+        it.get('commodity_code', '')
+        for it in (items or [])
+        if it.get('commodity_code')
+    })
+
+
+def _run_hs_validation(items: list, direction: str) -> dict:
+    codes = _hs_codes_from_items(items)
+    if not codes:
+        return {}
+    return hmrc_api.validate_commodity_codes(codes, direction=direction.lower())
+
 
 st.set_page_config(
     page_title="LogistiCore | CDS Customs Invoice Tool",
@@ -294,12 +310,12 @@ if st.session_state.processing_started and st.session_state.current_job_id:
         status = progress_data.get('status', '')
         if status in ["processing", "pending", "created"]:
             # Auto-refresh every 2 seconds while processing
-            time.sleep(2)
+            time.sleep(1)
             st.rerun()
     except Exception as e:
         # Continue refreshing even if there's an error checking status
         if st.session_state.processing_started:
-            time.sleep(2)
+            time.sleep(1)
             st.rerun()
 
 st.divider()
@@ -531,7 +547,6 @@ if uploaded_files and username:
                     st.error(f"❌ Error processing {uploaded_file.name}: {e}")
                     st.code(traceback.format_exc(), language="text")
             progress_bar.progress(100, text="✅ Excel/Word extraction complete!")
-            import time; time.sleep(1)  # Brief pause so user sees completion
         
         # Then, process PDFs (background)
         if pdf_files:
@@ -624,24 +639,27 @@ if st.session_state.get('non_pdf_processed', False):
         with st.expander("📋 View Raw Items (before consolidation)", expanded=False):
             st.dataframe(df_display, use_container_width=True, height=300)
 
-        # ── Auto-validate HS codes against HMRC Trade Tariff ──────────────────
-        hs_validation_key = 'hs_validation_results'
-        if hs_validation_key not in st.session_state:
-            unique_codes = list(set(
-                it.get('commodity_code', '') for it in items
-                if it.get('commodity_code')
-            ))
-            if unique_codes:
-                with st.spinner(f"Validating {len(unique_codes)} HS codes against HMRC tariff..."):
+        # ── Optional HS validation (on demand — keeps parse/display fast) ─────
+        val_btn_col, val_info_col = st.columns([1, 3])
+        with val_btn_col:
+            if st.button(
+                "🔍 Validate HS codes",
+                key="validate_hs_excel",
+                help="Check codes against HMRC Trade Tariff (runs in parallel)",
+            ):
+                n_codes = len(_hs_codes_from_items(items))
+                with st.spinner(f"Validating {n_codes} HS codes…"):
                     try:
-                        validation = hmrc_api.validate_commodity_codes(
-                            unique_codes, direction=direction.lower()
+                        st.session_state['hs_validation_results'] = _run_hs_validation(
+                            items, direction
                         )
-                        st.session_state[hs_validation_key] = validation
                     except Exception:
-                        st.session_state[hs_validation_key] = {}
+                        st.session_state['hs_validation_results'] = {}
+                st.rerun()
+        with val_info_col:
+            st.caption("Validation is optional — click when you want HMRC tariff checks.")
 
-        hs_validation = st.session_state.get(hs_validation_key, {})
+        hs_validation = st.session_state.get('hs_validation_results', {})
 
         def _desc_match_score_xl(item_desc: str, tariff_desc: str) -> float:
             import re as _re
@@ -1259,24 +1277,26 @@ elif st.session_state.processing_started and st.session_state.current_job_id:
                         "support can be added."
                     )
 
-                # Auto-validate HS codes against HMRC Trade Tariff
-                hs_validation_key = 'hs_validation_results'
-                if hs_validation_key not in st.session_state:
-                    unique_codes = list(set(
-                        it.get('commodity_code', '') for it in items
-                        if it.get('commodity_code')
-                    ))
-                    if unique_codes:
-                        with st.spinner(f"Validating {len(unique_codes)} HS codes against HMRC tariff..."):
+                val_btn_col, val_info_col = st.columns([1, 3])
+                with val_btn_col:
+                    if st.button(
+                        "🔍 Validate HS codes",
+                        key="validate_hs_pdf",
+                        help="Check codes against HMRC Trade Tariff (runs in parallel)",
+                    ):
+                        n_codes = len(_hs_codes_from_items(items))
+                        with st.spinner(f"Validating {n_codes} HS codes…"):
                             try:
-                                validation = hmrc_api.validate_commodity_codes(
-                                    unique_codes, direction=direction.lower()
+                                st.session_state['hs_validation_results'] = _run_hs_validation(
+                                    items, direction
                                 )
-                                st.session_state[hs_validation_key] = validation
                             except Exception:
-                                st.session_state[hs_validation_key] = {}
+                                st.session_state['hs_validation_results'] = {}
+                        st.rerun()
+                with val_info_col:
+                    st.caption("Validation is optional — speeds up initial parse.")
 
-                hs_validation = st.session_state.get(hs_validation_key, {})
+                hs_validation = st.session_state.get('hs_validation_results', {})
 
                 # ---------------------------------------------------------
                 # Helper: score how well an item description matches a

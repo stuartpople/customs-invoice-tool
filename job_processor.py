@@ -422,6 +422,60 @@ class JobProcessor:
         
         return result
     
+    def _pdf_has_usable_embedded_text(self, pdf_path: str) -> bool:
+        """True when every page has clean embedded text (skip OCR/image conversion)."""
+        try:
+            doc = fitz.open(pdf_path)
+            try:
+                if len(doc) == 0:
+                    return False
+                for page in doc:
+                    text = page.get_text("text").strip()
+                    if len(text) <= 50:
+                        return False
+                    if any(0x0B00 <= ord(c) <= 0x0BFF for c in text):
+                        return False
+                return True
+            finally:
+                doc.close()
+        except Exception:
+            return False
+
+    def _process_job_embedded_text(self, job_id: str, pdf_path: str) -> int:
+        """Fast path: extract all pages via PyMuPDF text layer (no OCR)."""
+        job_dir = self.get_job_dir(job_id)
+        pages_json_path = job_dir / "pages.json"
+        start = time.time()
+        doc = fitz.open(pdf_path)
+        pages_data = {"pages": []}
+        try:
+            for page_num in range(len(doc)):
+                text = doc[page_num].get_text("text").strip()
+                pages_data["pages"].append({
+                    "page_number": page_num + 1,
+                    "status": "success",
+                    "method": "embedded_bulk",
+                    "text": text,
+                    "processing_time": 0,
+                    "error": None,
+                })
+        finally:
+            doc.close()
+        total_pages = len(pages_data["pages"])
+        with open(pages_json_path, "w") as f:
+            json.dump(pages_data, f, indent=2)
+        elapsed = round(time.time() - start, 2)
+        self.update_job_metadata(job_id, {
+            "total_pages": total_pages,
+            "status": "completed",
+            "completed_at": datetime.now().isoformat(),
+            "progress": 100.0,
+            "pages_processed": total_pages,
+            "extraction_method": "embedded_bulk",
+            "extraction_seconds": elapsed,
+        })
+        return total_pages
+
     def process_job(self, job_id: str, pdf_path: str):
         """
         Process entire job page by page with persistence
@@ -441,8 +495,17 @@ class JobProcessor:
         metadata = self.get_job_metadata(job_id)
         total_pages = metadata.get("total_pages", 0)
         
+        if total_pages == 0 and pages_data.get("pages"):
+            total_pages = len(pages_data["pages"])
+
+        # Fast path for digital PDFs — skip PNG render + Tesseract entirely
+        if not pages_data.get("pages") and self._pdf_has_usable_embedded_text(pdf_path):
+            self.update_job_metadata(job_id, {"status": "processing"})
+            self._process_job_embedded_text(job_id, pdf_path)
+            return
+        
         if total_pages == 0:
-            # Convert PDF to images first
+            # Convert PDF to images first (scanned / image PDFs)
             total_pages = self.convert_pdf_to_images(job_id, pdf_path)
         
         # Determine which pages still need processing

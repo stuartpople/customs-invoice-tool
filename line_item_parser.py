@@ -29,6 +29,20 @@ _IKF_FOOTER_MARKERS = (
 
 class LineItemParser:
     """Parse line items from extracted page text using proven patterns"""
+
+    @staticmethod
+    def _page_at(page_map: Dict, offset: int, default: int = 1) -> int:
+        """Resolve character offset to page number (sparse boundary map)."""
+        bounds = page_map.get("_boundaries") if isinstance(page_map, dict) else None
+        if not bounds:
+            if isinstance(page_map, dict) and offset in page_map:
+                return page_map[offset]
+            return default
+        result = default
+        for start, num in bounds:
+            if offset >= start:
+                result = num
+        return result
     
     def parse_job_items(self, job_id: str, job_dir: Path, direction: str = "export") -> Dict:
         """
@@ -54,17 +68,15 @@ class LineItemParser:
         all_text = ""
         page_map = {}  # Track which page each character position is on
         
+        page_boundaries: List[Tuple[int, int]] = []
         for page in pages_data.get("pages", []):
             if page.get("status") == "success":
                 page_num = page.get("page_number")
                 text = page.get("text", "")
-                start_pos = len(all_text)   
+                start_pos = len(all_text)
+                page_boundaries.append((start_pos, page_num))
                 all_text += f"\n--- PAGE {page_num} ---\n{text}\n"
-                end_pos = len(all_text)
-                
-                # Map every position to this page
-                for pos in range(start_pos, end_pos):
-                    page_map[pos] = page_num
+        page_map = {"_boundaries": page_boundaries}
         
         if not all_text:
             return {"error": "No text extracted", "items": []}
@@ -263,6 +275,28 @@ class LineItemParser:
                 if len(re.sub(r'\D', '', str(c))) >= 8
             )
             return eight_digit / len(codes) >= 0.5
+
+        # Regex-first for speed when layout looks tabular (skip 5–30s AI round-trip)
+        _has_table_hints = (
+            re.search(r'\bHS\s+Codes?\b', all_text, re.IGNORECASE)
+            or re.search(r'\bcommodity\s+code\b', all_text, re.IGNORECASE)
+            or (
+                re.search(r'\bstock\s+no', all_text, re.IGNORECASE)
+                and re.search(r'\bunit\s+price\b', all_text, re.IGNORECASE)
+            )
+        )
+        if _has_table_hints:
+            _rx_items, _rx_fmt = self._parse_line_items_proven(all_text, direction, page_map)
+            _rx_items = self._postprocess_items(_rx_items)
+            if _llm_quality_ok(_rx_items):
+                print(f"[Parser] Regex-first ({_rx_fmt}) — {len(_rx_items)} items, skipping AI")
+                return {
+                    "total_items": len(_rx_items),
+                    "items": _rx_items,
+                    "pages_analyzed": len(pages_data.get("pages", [])),
+                    "direction": direction,
+                    "format_type": _rx_fmt or "regex_first",
+                }
 
         # 1. Google Gemini Flash — free tier, 1,500 req/day, no credit card needed
         google_key = self._get_secret("GOOGLE_API_KEY")
@@ -2341,7 +2375,7 @@ class LineItemParser:
                 "unit_weight": unit_weight,
                 "net_weight": net_weight,
                 "hs_code": hs_code,  # Add explicit hs_code field
-                "pages": [page_map.get(sum(len(l) + 1 for l in lines[:i]), 1)],
+                "pages": [self._page_at(page_map, sum(len(l) + 1 for l in lines[:i]), 1)],
                 "confidence": round(min(confidence, 1.0), 2),
                 "needs_review": confidence < 0.7,
                 "raw_text": line[:200]
@@ -2519,7 +2553,7 @@ class LineItemParser:
 
             hs_code = self._pad_hs_code(hs_code_raw, pad_to_10)
             char_pos = sum(len(lines[k]) + 1 for k in range(line_idx))
-            page_num = page_map.get(char_pos, 1)
+            page_num = self._page_at(page_map, char_pos, 1)
 
             return {
                 "line_number": str(len(items) + 1),
@@ -2652,7 +2686,7 @@ class LineItemParser:
 
             # Approximate page lookup via cumulative character offset
             char_pos = sum(len(lines[k]) + 1 for k in range(line_i))
-            page_num = page_map.get(char_pos, 1)
+            page_num = self._page_at(page_map, char_pos, 1)
 
             items.append({
                 "line_number": str(len(items) + 1),
@@ -2848,7 +2882,7 @@ class LineItemParser:
 
                 hs_code = self._pad_hs_code(hs_code, pad_to_10)
                 char_pos = sum(len(lines[j]) + 1 for j in range(idx))
-                page_num = page_map.get(char_pos, 1)
+                page_num = self._page_at(page_map, char_pos, 1)
 
                 items.append({
                     "line_number": lines[idx].strip().rstrip("."),
@@ -2924,7 +2958,7 @@ class LineItemParser:
 
                 hs_code = self._pad_hs_code(hs_code, pad_to_10)
                 char_pos = sum(len(lines[j]) + 1 for j in range(idx))
-                page_num = page_map.get(char_pos, 1)
+                page_num = self._page_at(page_map, char_pos, 1)
 
                 items.append({
                     "line_number": item_num_s,
@@ -3249,7 +3283,7 @@ class LineItemParser:
                 
                 # Determine pages (from line position in text)
                 line_pos = sum(len(l) + 1 for l in lines[:i])
-                pages = [page_map.get(line_pos, 1)]
+                pages = [self._page_at(page_map, line_pos, 1)]
                 
                 # Calculate confidence
                 confidence = 0.0

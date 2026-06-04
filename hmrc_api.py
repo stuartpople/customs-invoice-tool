@@ -284,12 +284,39 @@ class HMRCTariffAPI:
         return out
 
     def validate_commodity_codes(self, codes: List[str],
-                                 direction: str = "export") -> Dict[str, Dict]:
-        """Batch-validate a list of commodity codes. Returns {code: result}."""
+                                 direction: str = "export",
+                                 max_workers: int = 6) -> Dict[str, Dict]:
+        """Batch-validate commodity codes in parallel. Returns {code: result}."""
+        unique = [
+            c for c in set(codes)
+            if c and _re.match(
+                r'^\d{6,10}$', c.replace(' ', '').replace('-', '').replace('.', '')
+            )
+        ]
+        if not unique:
+            return {}
+        if len(unique) == 1:
+            return {unique[0]: self.validate_commodity_code(unique[0], direction=direction)}
+
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
         results: Dict[str, Dict] = {}
-        for c in set(codes):
-            if c and _re.match(r'^\d{6,10}$', c.replace(' ', '').replace('-', '').replace('.', '')):
-                results[c] = self.validate_commodity_code(c, direction=direction)
+        workers = min(max_workers, len(unique))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {
+                pool.submit(self.validate_commodity_code, c, direction): c
+                for c in unique
+            }
+            for fut in as_completed(futures):
+                code = futures[fut]
+                try:
+                    results[code] = fut.result()
+                except Exception as exc:
+                    results[code] = {
+                        "valid": False,
+                        "code": code,
+                        "error": str(exc),
+                    }
         return results
 
     def _try_commodity(self, ten_digit_code: str) -> Optional[Dict]:
