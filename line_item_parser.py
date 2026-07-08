@@ -213,6 +213,19 @@ class LineItemParser:
                 "format_type": "xosil",
             }
 
+        # ── BAS (British Antarctic Survey) / BoL-grouped vertical commodity table ──
+        if self._is_bas_commercial_invoice(all_text):
+            print("[Parser] BAS commercial invoice detected — using dedicated parser")
+            items = self._parse_bas_commercial_format(all_text.split("\n"), direction, page_map)
+            items = self._postprocess_items(items)
+            return {
+                "total_items": len(items),
+                "items": items,
+                "pages_analyzed": len(pages_data.get("pages", [])),
+                "direction": direction,
+                "format_type": "bas_commercial",
+            }
+
         # ── ATI (Applied Technologies International) / "COC / HS Code / Unit of Measure" table ──
         # Invoices with "Description / HS Code / CofO", "COC", "Unit of Measure",
         # "Unit Weight", "Line Weight" column headers.  PyMuPDF extracts two column
@@ -518,11 +531,28 @@ class LineItemParser:
             return
         item['commodity_code'] = digits[:8] if len(digits) >= 8 else digits
     
+    @staticmethod
+    def _is_bas_commercial_invoice(text: str) -> bool:
+        """British Antarctic Survey commercial invoices (BoL-grouped vertical table)."""
+        lower = (text or "").lower()
+        return (
+            "bas.ac.uk" in lower
+            or (
+                "goods description" in lower
+                and "bol:" in lower
+                and "british antarctic" in lower
+            )
+        )
+
     def _parse_line_items_proven(self, text: str, direction: str, page_map: Dict) -> List[Dict]:
         """Use the proven parsing logic with enhanced table detection"""
         items = []
         lines = text.split('\n')
         self._last_table_format = None
+
+        if self._is_bas_commercial_invoice(text):
+            items = self._parse_bas_commercial_format(lines, direction, page_map)
+            return items, "bas_commercial"
         
         # First, try to detect if this is a tabular invoice format
         # Look for "HS Codes" column header (might be on its own line in vertical format)
@@ -3006,6 +3036,162 @@ class LineItemParser:
                 return hs_code[:8]
 
         return hs_code
+
+    def _parse_bas_commercial_format(self, lines: List[str], direction: str, page_map: Dict) -> List[Dict]:
+        """
+        Parse British Antarctic Survey commercial invoices.
+
+        PyMuPDF / pdfplumber emit either a vertical table per BoL block
+          description → commodity code → qty → value (GBP)
+        or the same fields on one inline line. Headers
+        ``GOODS DESCRIPTION / COMMODITY / QTY / VALUE (GBP)`` and BoL box
+        metadata (dims, weight, cubic metres) sit between sections.
+        """
+        items: List[Dict] = []
+        pad_to_10 = direction.lower() == "import"
+        stripped = [line.strip() for line in lines]
+        skip_exact = {
+            "Commercial", ":", "Date:", "COMMODITY", "QTY", "VALUE (GBP)",
+            "SDA", "Invoice", "Signed for and on behalf of", "Total", "Cube",
+            "(cm3)", "BRITISH ANTARCTIC SURVEY",
+        }
+        skip_prefixes = (
+            "BoL:", "boxtype", "dims", "(cm):", "cubicm", "(cm3):", "weight",
+            "(kg):", "--- PAGE",
+        )
+        metadata_tokens = {
+            "(cm):", "cubicm", "(cm3):", "(kg):", "weight", "dims", ":", "boxtype",
+        }
+        inline_item_re = re.compile(
+            r"^(.+?)\s+(\d{6,10})\s+(\d+)\s+([\d,.]+)\s*$"
+        )
+
+        country_of_origin = ""
+        for idx, line in enumerate(stripped):
+            if line.lower().startswith("country of origin:"):
+                country_of_origin = normalize_country_iso(line.split(":", 1)[-1].strip())
+                break
+            if idx + 1 < len(stripped) and line.lower().startswith("country of origin"):
+                country_of_origin = normalize_country_iso(stripped[idx + 1].strip())
+                break
+
+        item_counter = 0
+        i = 0
+        while i < len(stripped):
+            line = stripped[i]
+            if (
+                "GOODS DESCRIPTION" in line
+                or line in skip_exact
+                or line.lower().startswith("consignee / notify party")
+                or any(line.startswith(prefix) for prefix in skip_prefixes)
+            ):
+                i += 1
+                continue
+
+            inline_match = inline_item_re.match(line)
+            if inline_match and "GOODS DESCRIPTION" not in inline_match.group(1):
+                description = inline_match.group(1).strip()
+                commodity = inline_match.group(2)
+                qty = inline_match.group(3)
+                value = inline_match.group(4)
+                if self._is_valid_item(description, quantity=qty, total_value=value):
+                    item_counter += 1
+                    hs_code = self._pad_hs_code(commodity, pad_to_10)
+                    value_str = value.replace(",", "")
+                    unit_value = ""
+                    try:
+                        qty_f = float(qty)
+                        val_f = float(value_str)
+                        if qty_f > 0:
+                            unit_value = f"{val_f / qty_f:.4f}".rstrip("0").rstrip(".")
+                    except ValueError:
+                        pass
+                    line_pos = sum(len(raw) + 1 for raw in lines[:i])
+                    items.append({
+                        "item_number": str(item_counter),
+                        "description": description,
+                        "quantity": qty,
+                        "uom": "EA",
+                        "unit_value": unit_value,
+                        "total_value": value_str,
+                        "currency": "GBP",
+                        "commodity_code": hs_code,
+                        "country_of_origin": country_of_origin,
+                        "net_weight": "",
+                        "pages": [self._page_at(page_map, line_pos, 1)],
+                        "confidence": 0.9,
+                        "needs_review": False,
+                    })
+                i += 1
+                continue
+
+            if i + 3 < len(stripped):
+                commodity, qty, value = stripped[i + 1], stripped[i + 2], stripped[i + 3]
+                if (
+                    re.fullmatch(r"\d{6,10}", commodity)
+                    and re.fullmatch(r"\d+", qty)
+                    and re.fullmatch(r"[\d,.]+", value)
+                ):
+                    desc_parts = [line]
+                    j = i - 1
+                    while j >= 0:
+                        prev = stripped[j]
+                        if (
+                            prev in skip_exact
+                            or "GOODS DESCRIPTION" in prev
+                            or prev.lower().startswith("consignee / notify party")
+                            or any(prev.startswith(prefix) for prefix in skip_prefixes)
+                        ):
+                            break
+                        if (
+                            re.fullmatch(r"\d{6,10}", prev)
+                            or re.fullmatch(r"\d+", prev)
+                            or re.fullmatch(r"[\d,.]+", prev)
+                            or re.fullmatch(r"[\dXx]+", prev)
+                            or prev in metadata_tokens
+                        ):
+                            break
+                        desc_parts.insert(0, prev)
+                        j -= 1
+
+                    description = " ".join(desc_parts).strip()
+                    if not self._is_valid_item(description, quantity=qty, total_value=value):
+                        i += 4
+                        continue
+
+                    item_counter += 1
+                    hs_code = self._pad_hs_code(commodity, pad_to_10)
+                    value_str = value.replace(",", "")
+                    unit_value = ""
+                    try:
+                        qty_f = float(qty)
+                        val_f = float(value_str)
+                        if qty_f > 0:
+                            unit_value = f"{val_f / qty_f:.4f}".rstrip("0").rstrip(".")
+                    except ValueError:
+                        pass
+
+                    line_pos = sum(len(raw) + 1 for raw in lines[:i])
+                    items.append({
+                        "item_number": str(item_counter),
+                        "description": description,
+                        "quantity": qty,
+                        "uom": "EA",
+                        "unit_value": unit_value,
+                        "total_value": value_str,
+                        "currency": "GBP",
+                        "commodity_code": hs_code,
+                        "country_of_origin": country_of_origin,
+                        "net_weight": "",
+                        "pages": [self._page_at(page_map, line_pos, 1)],
+                        "confidence": 0.9,
+                        "needs_review": False,
+                    })
+                    i += 4
+                    continue
+            i += 1
+
+        return items
     
     def _parse_pattern_format(self, lines: List[str], direction: str, page_map: Dict, explicit_only: bool = False) -> List[Dict]:
         """Parse invoices using pattern matching (original method)
