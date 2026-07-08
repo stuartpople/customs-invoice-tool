@@ -226,6 +226,20 @@ class LineItemParser:
                 "format_type": "bas_commercial",
             }
 
+        # Catch BAS-like tables even when OCR mangled the org name/header
+        if self._looks_like_goods_description_commodity_table(all_text):
+            print("[Parser] GOODS DESCRIPTION / COMMODITY table detected — using BAS-style parser")
+            items = self._parse_bas_commercial_format(all_text.split("\n"), direction, page_map)
+            items = self._postprocess_items(items)
+            if items:
+                return {
+                    "total_items": len(items),
+                    "items": items,
+                    "pages_analyzed": len(pages_data.get("pages", [])),
+                    "direction": direction,
+                    "format_type": "goods_description_commodity",
+                }
+
         # ── ATI (Applied Technologies International) / "COC / HS Code / Unit of Measure" table ──
         # Invoices with "Description / HS Code / CofO", "COC", "Unit of Measure",
         # "Unit Weight", "Line Weight" column headers.  PyMuPDF extracts two column
@@ -269,14 +283,29 @@ class LineItemParser:
         # ── LLM path ──────────────────────────────────────────────────────────
         # Priority: 1) Google Gemini (free tier) → 2) OpenAI → 3) regex fallback
 
-        def _llm_quality_ok(items_list):
+        def _llm_quality_ok(items_list, source_text: str = ""):
             """Return True only if the AI result looks trustworthy.
             Rejects results where none of the items have a commodity_code —
             that means the AI found items but couldn't identify any HS codes,
             which happens when it confuses price/value columns for HS codes and
-            the sanity validator strips them all out."""
+            the sanity validator strips them all out.
+            Also requires descriptions to be grounded in the source OCR text —
+            invented products (e.g. 'Tampons', random Cisco SKUs) must not pass.
+            """
             if not items_list:
                 return False
+            grounded = (
+                self._filter_llm_items_to_source_text(items_list, source_text)
+                if source_text
+                else items_list
+            )
+            if len(grounded) < max(1, int(len(items_list) * 0.6)):
+                print(
+                    f"[Parser] Rejecting AI extract: only {len(grounded)}/{len(items_list)} "
+                    "items grounded in invoice text"
+                )
+                return False
+            items_list[:] = grounded
             codes = [it.get("commodity_code") for it in items_list if it.get("commodity_code")]
             if not codes:
                 return False
@@ -293,6 +322,7 @@ class LineItemParser:
         _has_table_hints = (
             re.search(r'\bHS\s+Codes?\b', all_text, re.IGNORECASE)
             or re.search(r'\bcommodity\s+code\b', all_text, re.IGNORECASE)
+            or self._looks_like_goods_description_commodity_table(all_text)
             or (
                 re.search(r'\bstock\s+no', all_text, re.IGNORECASE)
                 and re.search(r'\bunit\s+price\b', all_text, re.IGNORECASE)
@@ -301,7 +331,7 @@ class LineItemParser:
         if _has_table_hints:
             _rx_items, _rx_fmt = self._parse_line_items_proven(all_text, direction, page_map)
             _rx_items = self._postprocess_items(_rx_items)
-            if _llm_quality_ok(_rx_items):
+            if _llm_quality_ok(_rx_items) or len(_rx_items) >= 5:
                 print(f"[Parser] Regex-first ({_rx_fmt}) — {len(_rx_items)} items, skipping AI")
                 return {
                     "total_items": len(_rx_items),
@@ -317,7 +347,7 @@ class LineItemParser:
             try:
                 from llm_extractor import extract_with_gemini
                 llm_items, llm_meta = extract_with_gemini(all_text, google_key)
-                if _llm_quality_ok(llm_items):
+                if _llm_quality_ok(llm_items, all_text):
                     return {
                         "total_items": len(llm_items),
                         "items": llm_items,
@@ -327,7 +357,7 @@ class LineItemParser:
                         "format_type": "llm_gemini",
                     }
                 elif llm_items:
-                    print(f"[Gemini extractor] returned {len(llm_items)} items but too few valid HS codes — falling back to regex")
+                    print(f"[Gemini extractor] returned {len(llm_items)} items but failed quality/grounding — falling back to regex")
             except Exception as _err:
                 print(f"[Gemini extractor] failed, trying OpenAI: {_err}")
 
@@ -337,7 +367,7 @@ class LineItemParser:
             try:
                 from llm_extractor import extract_with_llm
                 llm_items, llm_meta = extract_with_llm(all_text, openai_key)
-                if _llm_quality_ok(llm_items):
+                if _llm_quality_ok(llm_items, all_text):
                     return {
                         "total_items": len(llm_items),
                         "items": llm_items,
@@ -347,7 +377,7 @@ class LineItemParser:
                         "format_type": "llm_gpt4o_mini",
                     }
                 elif llm_items:
-                    print(f"[OpenAI extractor] returned {len(llm_items)} items but too few valid HS codes — falling back to regex")
+                    print(f"[OpenAI extractor] returned {len(llm_items)} items but failed quality/grounding — falling back to regex")
             except Exception as _err:
                 print(f"[OpenAI extractor] failed, falling back to regex: {_err}")
 
@@ -362,9 +392,8 @@ class LineItemParser:
 
         # ── Last-resort AI retry ──────────────────────────────────────────────
         # If regex returned nothing but there is substantial OCR text, the format
-        # is unrecognised. Retry AI with a relaxed quality threshold (any items at
-        # all are better than zero). This catches invoices the regex can't handle
-        # even when the first AI pass was skipped or failed quality checks.
+        # is unrecognised. Retry AI — but still require grounding so we never
+        # return invented products/commodity codes that are not on the invoice.
         if not items and len(all_text.strip()) > 800:
             print(f"[Parser] Regex returned 0 items on {len(all_text)} chars — trying AI last-resort")
             for _lr_key, _lr_extractor, _lr_label in [
@@ -377,8 +406,9 @@ class LineItemParser:
                     from llm_extractor import extract_with_gemini, extract_with_llm
                     _fn = extract_with_gemini if "gemini" in _lr_label else extract_with_llm
                     _lr_items, _lr_meta = _fn(all_text, _lr_key)
-                    if _lr_items:
-                        print(f"[Parser] Last-resort {_lr_label} recovered {len(_lr_items)} items")
+                    _lr_items = self._filter_llm_items_to_source_text(_lr_items or [], all_text)
+                    if _lr_items and _llm_quality_ok(_lr_items, all_text):
+                        print(f"[Parser] Last-resort {_lr_label} recovered {len(_lr_items)} grounded items")
                         return {
                             "total_items": len(_lr_items),
                             "items": _lr_items,
@@ -532,17 +562,79 @@ class LineItemParser:
         item['commodity_code'] = digits[:8] if len(digits) >= 8 else digits
     
     @staticmethod
+    def _looks_like_goods_description_commodity_table(text: str) -> bool:
+        """Vertical/inline table: GOODS DESCRIPTION + COMMODITY + QTY + VALUE."""
+        lower = (text or "").lower()
+        return (
+            "goods description" in lower
+            and "commodity" in lower
+            and ("value (gbp)" in lower or "value (eur)" in lower or "value (usd)" in lower or "value" in lower)
+            and ("qty" in lower or "quantity" in lower)
+        )
+
+    @staticmethod
     def _is_bas_commercial_invoice(text: str) -> bool:
         """British Antarctic Survey commercial invoices (BoL-grouped vertical table)."""
         lower = (text or "").lower()
         return (
             "bas.ac.uk" in lower
+            or "british antarctic" in lower
             or (
                 "goods description" in lower
                 and "bol:" in lower
-                and "british antarctic" in lower
+                and ("rrs sir david" in lower or "harwich" in lower or "sda" in lower)
             )
         )
+
+    @staticmethod
+    def _filter_llm_items_to_source_text(items: List[Dict], source_text: str) -> List[Dict]:
+        """Drop AI rows whose description/SKU is not present in the invoice OCR text.
+
+        Prevents hallucination like inventing 'Tampons'/96190075 or Cisco SKUs that
+        never appeared on the document. Commodity codes may be normalised (8 vs 10
+        digit), so we ground primarily on description tokens and optional model IDs.
+        """
+        if not items:
+            return []
+        hay = re.sub(r"\s+", " ", (source_text or "")).lower()
+        hay_compact = re.sub(r"[^a-z0-9]+", "", hay)
+        kept: List[Dict] = []
+        for it in items:
+            desc = str(it.get("description") or "").strip()
+            if len(desc) < 3:
+                continue
+            desc_l = desc.lower()
+            # Prefer a distinctive substring of the description
+            probe = desc_l
+            for piece in re.split(r"[,;/\(\)\[\]]+", desc_l):
+                piece = piece.strip()
+                if len(piece) >= 8:
+                    probe = piece
+                    break
+            probe_compact = re.sub(r"[^a-z0-9]+", "", probe)
+            sku_match = re.search(r"\b([A-Z0-9][A-Z0-9._-]{4,})\b", desc)
+            sku_ok = False
+            if sku_match:
+                sku = sku_match.group(1).lower()
+                sku_ok = sku in hay or re.sub(r"[^a-z0-9]+", "", sku) in hay_compact
+            desc_ok = (
+                probe in hay
+                or probe_compact in hay_compact
+                or (len(probe) >= 12 and any(
+                    probe[i : i + 12] in hay for i in range(0, max(1, len(probe) - 11), 4)
+                ))
+            )
+            if desc_ok or sku_ok:
+                code = re.sub(r"\D", "", str(it.get("commodity_code") or ""))
+                if code and len(code) >= 6 and code not in hay_compact and code[:8] not in hay_compact:
+                    # Keep description (it's on the invoice) but clear invented HS code
+                    it = dict(it)
+                    it["commodity_code"] = ""
+                    it["needs_review"] = True
+                kept.append(it)
+            else:
+                print(f"[Parser] Dropping ungrounded AI item: {desc[:80]!r}")
+        return kept
 
     def _parse_line_items_proven(self, text: str, direction: str, page_map: Dict) -> List[Dict]:
         """Use the proven parsing logic with enhanced table detection"""

@@ -89,9 +89,14 @@ _SYSTEM_PROMPT = (
     "net_weight: weight in kg. "
     "The 'metadata' object must have: invoice_number, invoice_date, incoterm, currency, "
     "total_invoice_value, total_gross_weight, total_net_weight, number_of_packages, package_type. "
-    "If a value is missing or ambiguous, use null. Do not hallucinate. "
-    "Be robust to OCR errors — infer values even if text is slightly garbled. "
-    "Extract ALL line items you can find, even if the table is misaligned."
+    "If a value is missing or ambiguous, use null. "
+    "CRITICAL ANTI-HALLUCINATION RULES: "
+    "1) ONLY extract products whose description (or a clear OCR variant of it) appears in the input text. "
+    "2) NEVER invent products, brand names, model numbers, or HS/commodity codes that are not written on the invoice. "
+    "3) If an HS/commodity code is not printed next to a line, set commodity_code to null — do not guess from memory. "
+    "4) Prefer fewer accurate lines over fabricating packing-list style goods. "
+    "Be robust to OCR errors — infer values even if text is slightly garbled, but only for lines that exist. "
+    "Extract ALL genuine line items you can find, even if the table is misaligned."
 )
 
 _MAX_OCR_CHARS = 60_000  # 60k chars ≈ 15k tokens — well within both providers' limits
