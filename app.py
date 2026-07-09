@@ -21,7 +21,7 @@ import shutil
 
 
 # Version tracking for cache busting
-APP_VERSION = "v3.17"
+APP_VERSION = "v3.18"
 
 
 def _coerce_dataframe_for_editor(df: pd.DataFrame) -> pd.DataFrame:
@@ -625,7 +625,7 @@ if st.session_state.get('non_pdf_processed', False):
     items = st.session_state.get('line_items', [])
     
     if items:
-        st.success(f"✅ **Extracted {len(items)} raw items from Excel**")
+        st.success(f"✅ **Extracted {len(items)} raw items from Excel** (direct column read — no AI)")
         
         # Convert to DataFrame and display raw items
         df_items = pd.DataFrame(items)

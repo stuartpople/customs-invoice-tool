@@ -103,11 +103,46 @@ def _normalize_llm_items(llm_items: list, trade_direction: str) -> List[Dict]:
     return out
 
 
+def _filter_items_to_source_text(items: List[Dict], source_text: str) -> List[Dict]:
+    """Drop rows whose description does not appear in the workbook dump."""
+    from line_item_parser import LineItemParser
+    return LineItemParser._filter_llm_items_to_source_text(items, source_text)
+
+
+def _excel_regex_fallback(text: str, trade_direction: str) -> List[Dict]:
+    """Regex parsers for sheet text — no AI."""
+    from line_item_parser import LineItemParser
+    parser = LineItemParser()
+    if parser._should_use_bas_parser(text):
+        items = parser._parse_bas_commercial_format(text.split("\n"), trade_direction, {})
+        items = parser._finalize_parsed_items(items, text)
+        if items:
+            return _normalize_llm_items(items, trade_direction)
+    try:
+        items = parse_line_items(text, trade_direction=trade_direction)
+        if items:
+            normalized = _normalize_llm_items(items, trade_direction)
+            return _filter_items_to_source_text(normalized, text)
+    except Exception:
+        pass
+    return []
+
+
 def _excel_llm_fallback(file_obj, trade_direction: str) -> List[Dict]:
-    """When column-based Excel parsing finds nothing, dump sheets and use Gemini/OpenAI."""
+    """When column-based Excel parsing finds nothing, try regex then grounded AI."""
     text = _excel_workbook_to_text(file_obj)
     if len(text.strip()) < 40:
         return []
+
+    regex_items = _excel_regex_fallback(text, trade_direction)
+    if regex_items:
+        return regex_items
+
+    # BAS-style spreadsheets must not use AI — it invents lines not on the sheet.
+    from line_item_parser import LineItemParser
+    if LineItemParser._should_use_bas_parser(text):
+        return []
+
     for key_name, extract_fn in (
         ('GOOGLE_API_KEY', 'extract_with_gemini'),
         ('OPENAI_API_KEY', 'extract_with_llm'),
@@ -120,17 +155,11 @@ def _excel_llm_fallback(file_obj, trade_direction: str) -> List[Dict]:
             fn = extract_with_gemini if extract_fn == 'extract_with_gemini' else extract_with_llm
             llm_items, _meta = fn(text, api_key)
             normalized = _normalize_llm_items(llm_items, trade_direction)
-            if normalized:
-                return normalized
+            grounded = _filter_items_to_source_text(normalized, text)
+            if grounded:
+                return grounded
         except Exception:
             continue
-    # Regex on sheet text (commercial invoices without HS column headers)
-    try:
-        items = parse_line_items(text, trade_direction=trade_direction)
-        if items:
-            return _normalize_llm_items(items, trade_direction)
-    except Exception:
-        pass
     return []
 
 
@@ -251,8 +280,9 @@ def extract_from_excel(file_obj, trade_direction: str = "export") -> List[Dict]:
             # --- Auto-detect header row ---
             # Scan first 40 rows for one that looks like a column header
             # (contains keywords like HS CODE, DESCRIPTION, QTY, etc.)
-            header_keywords = {'hs code', 'commodity code', 'tariff', 'description',
-                               'qty', 'quantity', 'value', 'weight', 'origin',
+            header_keywords = {'hs code', 'commodity code', 'commodity', 'tariff',
+                               'description', 'goods description', 'goods desc',
+                               'qty', 'quantity', 'value', 'value (gbp)', 'weight', 'origin',
                                'uom', 'unit cost', 'line total', 'total', 'hs',
                                'part', 'sku', 'article', 'item', 'amount', 'price',
                                'net', 'gross', 'coo', 'line no', 'line #'}
