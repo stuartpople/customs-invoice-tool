@@ -214,31 +214,23 @@ class LineItemParser:
             }
 
         # ── BAS (British Antarctic Survey) / BoL-grouped vertical commodity table ──
-        if self._is_bas_commercial_invoice(all_text):
-            print("[Parser] BAS commercial invoice detected — using dedicated parser")
+        # Never fall through to Gemini for this layout — AI invents lines (e.g. tampons).
+        if self._should_use_bas_parser(all_text):
+            print("[Parser] BAS / goods-description table detected — dedicated parser (AI disabled)")
             items = self._parse_bas_commercial_format(all_text.split("\n"), direction, page_map)
-            items = self._postprocess_items(items)
+            items = self._finalize_parsed_items(items, all_text)
+            fmt = (
+                "bas_commercial"
+                if self._is_bas_commercial_invoice(all_text)
+                else "goods_description_commodity"
+            )
             return {
                 "total_items": len(items),
                 "items": items,
                 "pages_analyzed": len(pages_data.get("pages", [])),
                 "direction": direction,
-                "format_type": "bas_commercial",
+                "format_type": fmt,
             }
-
-        # Catch BAS-like tables even when OCR mangled the org name/header
-        if self._looks_like_goods_description_commodity_table(all_text):
-            print("[Parser] GOODS DESCRIPTION / COMMODITY table detected — using BAS-style parser")
-            items = self._parse_bas_commercial_format(all_text.split("\n"), direction, page_map)
-            items = self._postprocess_items(items)
-            if items:
-                return {
-                    "total_items": len(items),
-                    "items": items,
-                    "pages_analyzed": len(pages_data.get("pages", [])),
-                    "direction": direction,
-                    "format_type": "goods_description_commodity",
-                }
 
         # ── ATI (Applied Technologies International) / "COC / HS Code / Unit of Measure" table ──
         # Invoices with "Description / HS Code / CofO", "COC", "Unit of Measure",
@@ -329,9 +321,15 @@ class LineItemParser:
             )
         )
         if _has_table_hints:
-            _rx_items, _rx_fmt = self._parse_line_items_proven(all_text, direction, page_map)
-            _rx_items = self._postprocess_items(_rx_items)
-            if _llm_quality_ok(_rx_items) or len(_rx_items) >= 5:
+            if self._should_use_bas_parser(all_text):
+                _rx_items = self._parse_bas_commercial_format(
+                    all_text.split("\n"), direction, page_map
+                )
+                _rx_fmt = "bas_commercial"
+            else:
+                _rx_items, _rx_fmt = self._parse_line_items_proven(all_text, direction, page_map)
+            _rx_items = self._finalize_parsed_items(_rx_items, all_text)
+            if _llm_quality_ok(_rx_items, all_text):
                 print(f"[Parser] Regex-first ({_rx_fmt}) — {len(_rx_items)} items, skipping AI")
                 return {
                     "total_items": len(_rx_items),
@@ -340,6 +338,19 @@ class LineItemParser:
                     "direction": direction,
                     "format_type": _rx_fmt or "regex_first",
                 }
+
+        # BAS-style invoices must never use AI — it hallucinates plausible tariff lines.
+        if self._should_use_bas_parser(all_text):
+            print("[Parser] BAS-style layout — refusing AI, returning regex-only result")
+            items, format_type = self._parse_line_items_proven(all_text, direction, page_map)
+            items = self._finalize_parsed_items(items, all_text)
+            return {
+                "total_items": len(items),
+                "items": items,
+                "pages_analyzed": len(pages_data.get("pages", [])),
+                "direction": direction,
+                "format_type": format_type or "bas_commercial",
+            }
 
         # 1. Google Gemini Flash — free tier, 1,500 req/day, no credit card needed
         google_key = self._get_secret("GOOGLE_API_KEY")
@@ -388,13 +399,13 @@ class LineItemParser:
         # Post-process extracted items to remove invoice-level noise and
         # apply lightweight deduplication so different formats don't produce
         # spurious extra rows.
-        items = self._postprocess_items(items)
+        items = self._finalize_parsed_items(items, all_text)
 
         # ── Last-resort AI retry ──────────────────────────────────────────────
         # If regex returned nothing but there is substantial OCR text, the format
         # is unrecognised. Retry AI — but still require grounding so we never
         # return invented products/commodity codes that are not on the invoice.
-        if not items and len(all_text.strip()) > 800:
+        if not items and len(all_text.strip()) > 800 and not self._should_use_bas_parser(all_text):
             print(f"[Parser] Regex returned 0 items on {len(all_text)} chars — trying AI last-resort")
             for _lr_key, _lr_extractor, _lr_label in [
                 (self._get_secret("GOOGLE_API_KEY"), "extract_with_gemini", "llm_gemini_lastresort"),
@@ -573,6 +584,42 @@ class LineItemParser:
         )
 
     @staticmethod
+    def _count_bas_style_rows(text: str) -> int:
+        """Count description → commodity → qty → value row sequences (BAS layout)."""
+        lines = [ln.strip() for ln in (text or "").split("\n") if ln.strip()]
+        if not lines:
+            return 0
+        inline_re = re.compile(r"^(.+?)\s+(\d{6,10})\s+(\d+)\s+([\d,.]+)\s*$")
+        skip_prefixes = ("bol:", "dims", "weight", "--- page")
+        count = 0
+        for i, line in enumerate(lines):
+            if any(line.lower().startswith(p) for p in skip_prefixes):
+                continue
+            if inline_re.match(line) and "goods description" not in line.lower():
+                count += 1
+                continue
+            if i + 3 < len(lines):
+                commodity, qty, value = lines[i + 1], lines[i + 2], lines[i + 3]
+                if (
+                    re.fullmatch(r"\d{6,10}", commodity)
+                    and re.fullmatch(r"\d+", qty)
+                    and re.fullmatch(r"[\d,.]+", value)
+                    and len(line) > 2
+                    and "goods description" not in line.lower()
+                ):
+                    count += 1
+        return count
+
+    @classmethod
+    def _should_use_bas_parser(cls, text: str) -> bool:
+        """True when invoice layout matches BAS / goods-description tables."""
+        return (
+            cls._is_bas_commercial_invoice(text)
+            or cls._looks_like_goods_description_commodity_table(text)
+            or cls._count_bas_style_rows(text) >= 15
+        )
+
+    @staticmethod
     def _is_bas_commercial_invoice(text: str) -> bool:
         """British Antarctic Survey commercial invoices (BoL-grouped vertical table)."""
         lower = (text or "").lower()
@@ -636,13 +683,20 @@ class LineItemParser:
                 print(f"[Parser] Dropping ungrounded AI item: {desc[:80]!r}")
         return kept
 
+    def _finalize_parsed_items(self, items: List[Dict], source_text: str) -> List[Dict]:
+        """Post-process and drop any row whose description is not on the invoice."""
+        items = self._postprocess_items(items)
+        if source_text:
+            items = self._filter_llm_items_to_source_text(items, source_text)
+        return items
+
     def _parse_line_items_proven(self, text: str, direction: str, page_map: Dict) -> List[Dict]:
         """Use the proven parsing logic with enhanced table detection"""
         items = []
         lines = text.split('\n')
         self._last_table_format = None
 
-        if self._is_bas_commercial_invoice(text):
+        if self._should_use_bas_parser(text):
             items = self._parse_bas_commercial_format(lines, direction, page_map)
             return items, "bas_commercial"
         

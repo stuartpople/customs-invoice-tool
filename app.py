@@ -21,7 +21,7 @@ import shutil
 
 
 # Version tracking for cache busting
-APP_VERSION = "v3.16"
+APP_VERSION = "v3.17"
 
 
 def _coerce_dataframe_for_editor(df: pd.DataFrame) -> pd.DataFrame:
@@ -1248,6 +1248,8 @@ elif st.session_state.processing_started and st.session_state.current_job_id:
                     'arrow_export': '📋 Arrow Export (cc: bracket HS code format)',
                     'xosil': '📋 X-OSIL / Ocean Scientific (spaced HS code format)',
                     'ati':   '📋 ATI (Applied Technologies Int. COC/UoM table format)',
+                    'bas_commercial': '📋 BAS / goods-description commercial invoice',
+                    'goods_description_commodity': '📋 Goods description + commodity table',
                     'llm_gemini': '🤖 AI extraction (Gemini)',
                     'llm_gpt4o_mini': '🤖 AI extraction (GPT-4o mini)',
                     'llm_gemini_lastresort': '🤖 AI extraction (Gemini — last resort)',
