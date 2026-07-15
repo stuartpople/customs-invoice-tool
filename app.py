@@ -21,7 +21,7 @@ import shutil
 
 
 # Version tracking for cache busting
-APP_VERSION = "v3.18"
+APP_VERSION = "v3.19"
 
 
 def _coerce_dataframe_for_editor(df: pd.DataFrame) -> pd.DataFrame:
@@ -79,6 +79,56 @@ def _run_hs_validation(items: list, direction: str) -> dict:
     if not codes:
         return {}
     return hmrc_api.validate_commodity_codes(codes, direction=direction.lower())
+
+
+def _safe_hs_autocorrections(items: list, hs_validation: dict, direction: str) -> tuple:
+    """Apply only same-CN8 expansions. Never rewrite to a different CN8.
+
+    Description/"Other" catch-all remaps were rewriting invoice codes
+    (e.g. 84212900→84212980, 85044090→85044095) and then HMRC doc-code
+    lookups keyed to the old codes came back empty. Obsolete codes are
+    flagged for review instead.
+    """
+    is_export = direction.lower() == 'export'
+    invalid_codes = {c: v for c, v in (hs_validation or {}).items()
+                     if not v.get('valid', True)}
+    auto_fixed: dict = {}
+    auto_fixed_desc: dict = {}
+    still_invalid: dict = {}
+
+    for code, result in invalid_codes.items():
+        resolved = (result.get('resolved_code') or '').replace(' ', '')
+        clean = (code or '').replace(' ', '').replace('-', '').replace('.', '')
+        if resolved and clean and len(clean) >= 8 and resolved[:8] == clean[:8]:
+            new_code = resolved[:8] if is_export else resolved
+            if new_code != code:
+                auto_fixed[code] = new_code
+                auto_fixed_desc[code] = result.get('description', '')
+        else:
+            still_invalid[code] = result
+
+    if auto_fixed:
+        for item in items:
+            cc = item.get('commodity_code', '')
+            if cc in auto_fixed:
+                old = cc
+                item['commodity_code'] = auto_fixed[cc]
+                note = f"HS code auto-corrected: {old} → {auto_fixed[cc]}"
+                existing = item.get('review_notes', '')
+                if note not in (existing or ''):
+                    item['review_notes'] = f"{existing}; {note}" if existing else note
+
+    for code, result in still_invalid.items():
+        for item in items:
+            if item.get('commodity_code') != code:
+                continue
+            item['needs_review'] = True
+            existing = item.get('review_notes', '')
+            msg = result.get('error', 'HS code needs manual review')
+            if msg not in (existing or ''):
+                item['review_notes'] = f"{existing}; {msg}" if existing else msg
+
+    return auto_fixed, auto_fixed_desc, still_invalid
 
 
 st.set_page_config(
@@ -661,98 +711,12 @@ if st.session_state.get('non_pdf_processed', False):
 
         hs_validation = st.session_state.get('hs_validation_results', {})
 
-        def _desc_match_score_xl(item_desc: str, tariff_desc: str) -> float:
-            import re as _re
-            stop = {'for', 'of', 'or', 'and', 'the', 'a', 'an', 'in',
-                    'to', 'with', 'not', 'more', 'than', 'other', 'use',
-                    'but', 'on', 'by', 'at', 'from', 'no', 'its', 'is'}
-            def _tokens(s):
-                s = _re.sub(r'<[^>]+>', ' ', s)
-                return {w for w in _re.findall(r'[a-z]{2,}', s.lower()) if w not in stop}
-            a = _tokens(item_desc)
-            b = _tokens(tariff_desc)
-            if not a or not b:
-                return 0.0
-            return len(a & b) / min(len(a), len(b))
-
-        invalid_codes = {c: v for c, v in hs_validation.items()
-                         if not v.get('valid', True)}
-        auto_fixed: dict = {}
-        auto_fixed_desc: dict = {}
-        still_invalid: dict = {}
-        is_export_xl = direction.lower() == 'export'
-
-        for code, result in invalid_codes.items():
-            resolved = result.get('resolved_code')
-            if resolved:
-                auto_fixed[code] = resolved[:8] if is_export_xl else resolved
-                auto_fixed_desc[code] = result.get('description', '')
-            else:
-                still_invalid[code] = result
-
-        # Description-based matching for multi-candidate codes
-        desc_resolved_info: dict = {}
-        for code, result in list(still_invalid.items()):
-            candidates = result.get('candidates', [])
-            if not candidates:
-                continue
-            item_descs = [it.get('description', '') for it in items
-                          if it.get('commodity_code') == code]
-            if not item_descs:
-                continue
-            all_matched = True
-            matches = []
-            for idesc in item_descs:
-                scores = [(_desc_match_score_xl(idesc, c['description']), c) for c in candidates]
-                scores.sort(key=lambda x: x[0], reverse=True)
-                best_score, best_cand = scores[0]
-                if best_score >= 0.25:
-                    new_code = best_cand['code'][:8] if is_export_xl else best_cand['code']
-                    matches.append((idesc, new_code, best_cand['description'], best_score))
-                else:
-                    other_cands = [c for c in candidates
-                                   if c['description'].strip().lower() == 'other']
-                    if other_cands:
-                        oc = other_cands[-1]
-                        new_code = oc['code'][:8] if is_export_xl else oc['code']
-                        matches.append((idesc, new_code, 'Other (fallback)', 0.0))
-                    else:
-                        all_matched = False
-                        matches.append((idesc, None, None, 0.0))
-            if all_matched and matches:
-                desc_resolved_info[code] = matches
-                del still_invalid[code]
-
-        if desc_resolved_info:
-            for code, match_list in desc_resolved_info.items():
-                idx = 0
-                for item in items:
-                    if item.get('commodity_code') != code:
-                        continue
-                    if idx < len(match_list):
-                        _, new_code, tdesc, score = match_list[idx]
-                        idx += 1
-                        if new_code:
-                            old = item['commodity_code']
-                            item['commodity_code'] = new_code
-                            note = f"HS auto-classified: {old} → {new_code} ({tdesc[:50]}, score={score:.2f})"
-                            existing = item.get('review_notes', '')
-                            if note not in (existing or ''):
-                                item['review_notes'] = f"{existing}; {note}" if existing else note
-                            auto_fixed[old] = new_code
-                            auto_fixed_desc[old] = tdesc or ''
+        auto_fixed, auto_fixed_desc, still_invalid = _safe_hs_autocorrections(
+            items, hs_validation, direction
+        )
 
         if auto_fixed:
-            for item in items:
-                cc = item.get('commodity_code', '')
-                if cc in auto_fixed:
-                    old = cc
-                    item['commodity_code'] = auto_fixed[cc]
-                    note = f"HS code auto-corrected: {old} → {auto_fixed[cc]}"
-                    existing = item.get('review_notes', '')
-                    if note not in (existing or ''):
-                        item['review_notes'] = f"{existing}; {note}" if existing else note
-            st.warning(f"🔄 **{len(auto_fixed)} HS code(s) auto-corrected:**")
+            st.warning(f"🔄 **{len(auto_fixed)} HS code(s) auto-corrected** (same CN8 only):")
             with st.expander("Auto-correction Details", expanded=True):
                 for old_c, new_c in sorted(auto_fixed.items()):
                     desc = auto_fixed_desc.get(old_c, '')
@@ -760,23 +724,22 @@ if st.session_state.get('non_pdf_processed', False):
                     st.markdown(f"- `{old_c}` → `{new_c}`{desc_short}")
 
         if still_invalid:
-            for item in items:
-                cc = item.get('commodity_code', '')
-                if cc in still_invalid:
-                    item['needs_review'] = True
-                    existing = item.get('review_notes', '')
-                    msg = still_invalid[cc].get('error', 'Invalid HS code')
-                    if msg not in (existing or ''):
-                        item['review_notes'] = f"{existing}; {msg}" if existing else msg
             st.error(
-                f"❌ **{len(still_invalid)} HS code(s) could not be resolved — manual review needed:** "
+                f"❌ **{len(still_invalid)} HS code(s) need manual review** "
+                "(invoice codes kept — not auto-rewritten): "
                 + ", ".join(f"`{c}`" for c in sorted(still_invalid))
             )
             with st.expander("Unresolved HS Code Details"):
                 for c, v in sorted(still_invalid.items()):
                     st.markdown(f"- **{c}**: {v.get('error', 'Invalid')}")
+                    cands = v.get('candidates') or []
+                    if cands:
+                        st.caption(
+                            "Suggestions: "
+                            + ", ".join(f"{x['code'][:8]} ({x['description'][:40]})" for x in cands[:6])
+                        )
 
-        if not invalid_codes and hs_validation:
+        if not still_invalid and not auto_fixed and hs_validation:
             st.success(f"✅ All {len(hs_validation)} HS codes validated against HMRC tariff")
 
         needs_review = [item for item in items if item.get('needs_review')]
@@ -1300,140 +1263,13 @@ elif st.session_state.processing_started and st.session_state.current_job_id:
 
                 hs_validation = st.session_state.get('hs_validation_results', {})
 
-                # ---------------------------------------------------------
-                # Helper: score how well an item description matches a
-                # tariff candidate description.  Returns 0.0 – 1.0.
-                # ---------------------------------------------------------
-                def _desc_match_score(item_desc: str, tariff_desc: str) -> float:
-                    """Word-overlap score between an invoice description and a tariff candidate."""
-                    import re as _re
-                    stop = {'for', 'of', 'or', 'and', 'the', 'a', 'an', 'in',
-                            'to', 'with', 'not', 'more', 'than', 'other', 'use',
-                            'but', 'on', 'by', 'at', 'from', 'no', 'its', 'is'}
-                    def _tokens(s):
-                        # Strip HTML tags then tokenise
-                        s = _re.sub(r'<[^>]+>', ' ', s)
-                        return {w for w in _re.findall(r'[a-z]{2,}', s.lower()) if w not in stop}
-                    a = _tokens(item_desc)
-                    b = _tokens(tariff_desc)
-                    if not a or not b:
-                        return 0.0
-                    overlap = a & b
-                    # Jaccard-like but weighted toward the smaller set
-                    return len(overlap) / min(len(a), len(b)) if min(len(a), len(b)) > 0 else 0.0
+                auto_fixed, auto_fixed_desc, still_invalid = _safe_hs_autocorrections(
+                    items, hs_validation, direction
+                )
 
-                # ---------------------------------------------------------
-                # Split invalid codes into auto-fixable vs manual-review
-                # ---------------------------------------------------------
-                invalid_codes = {c: v for c, v in hs_validation.items()
-                                 if not v.get('valid', True)}
-                auto_fixed: dict[str, str] = {}   # old_code -> new_code
-                auto_fixed_desc: dict[str, str] = {}  # old_code -> tariff desc
-                still_invalid: dict[str, dict] = {}
-
-                is_export = direction.lower() == "export"
-
-                for code, result in invalid_codes.items():
-                    resolved = result.get('resolved_code')
-                    if resolved:
-                        new_code = resolved[:8] if is_export else resolved
-                        auto_fixed[code] = new_code
-                        auto_fixed_desc[code] = result.get('description', '')
-                    else:
-                        still_invalid[code] = result
-
-                # ---------------------------------------------------------
-                # Description-based matching for multi-candidate codes
-                # ---------------------------------------------------------
-                desc_resolved: dict[str, str] = {}   # old_code -> new_code (per-item)
-                desc_resolved_info: dict[str, list] = {}  # old_code -> [(item_desc, new_code, tariff_desc, score)]
-
-                for code, result in list(still_invalid.items()):
-                    candidates = result.get('candidates', [])
-                    if not candidates:
-                        continue
-
-                    # Gather all item descriptions using this code
-                    item_descs = [
-                        it.get('description', '')
-                        for it in items if it.get('commodity_code') == code
-                    ]
-                    if not item_descs:
-                        continue
-
-                    # For each item, score all candidates
-                    all_matched = True
-                    matches = []
-                    for idesc in item_descs:
-                        scores = [
-                            (_desc_match_score(idesc, c['description']), c)
-                            for c in candidates
-                        ]
-                        scores.sort(key=lambda x: x[0], reverse=True)
-                        best_score, best_cand = scores[0]
-
-                        if best_score >= 0.25:
-                            new_code = best_cand['code'][:8] if is_export else best_cand['code']
-                            matches.append((idesc, new_code, best_cand['description'], best_score))
-                        else:
-                            # No good match — try to pick the "Other" catch-all
-                            other_cands = [
-                                c for c in candidates
-                                if c['description'].strip().lower() == 'other'
-                            ]
-                            if other_cands:
-                                oc = other_cands[-1]  # last "Other" is typically broadest
-                                new_code = oc['code'][:8] if is_export else oc['code']
-                                matches.append((idesc, new_code, 'Other (fallback)', 0.0))
-                            else:
-                                all_matched = False
-                                matches.append((idesc, None, None, 0.0))
-
-                    if all_matched and matches:
-                        # All items with this code were matched
-                        desc_resolved_info[code] = matches
-                        # Use the first match's code as the resolved code
-                        # (items may get different codes if descriptions differ)
-                        del still_invalid[code]
-
-                # Apply description-based corrections to items
-                if desc_resolved_info:
-                    for code, match_list in desc_resolved_info.items():
-                        # Build a map of item_desc -> new_code for per-item assignment
-                        idx = 0
-                        for item in items:
-                            if item.get('commodity_code') != code:
-                                continue
-                            if idx < len(match_list):
-                                _, new_code, tdesc, score = match_list[idx]
-                                idx += 1
-                                if new_code:
-                                    old = item['commodity_code']
-                                    item['commodity_code'] = new_code
-                                    existing = item.get('review_notes', '')
-                                    note = f"HS auto-classified: {old} → {new_code} ({tdesc[:50]}, score={score:.2f})"
-                                    if note not in (existing or ''):
-                                        item['review_notes'] = (
-                                            f"{existing}; {note}" if existing else note
-                                        )
-                                    auto_fixed[old] = new_code
-                                    auto_fixed_desc[old] = tdesc or ''
-
-                # Apply auto-corrections to items (single-resolved codes)
                 if auto_fixed:
-                    for item in items:
-                        cc = item.get('commodity_code', '')
-                        if cc in auto_fixed:
-                            old = cc
-                            item['commodity_code'] = auto_fixed[cc]
-                            existing = item.get('review_notes', '')
-                            note = f"HS code auto-corrected: {old} → {auto_fixed[cc]}"
-                            if note not in (existing or ''):
-                                item['review_notes'] = (
-                                    f"{existing}; {note}" if existing else note
-                                )
                     st.warning(
-                        f"🔄 **{len(auto_fixed)} HS code(s) auto-corrected:**"
+                        f"🔄 **{len(auto_fixed)} HS code(s) auto-corrected** (same CN8 only):"
                     )
                     with st.expander("Auto-correction Details", expanded=True):
                         for old_c, new_c in sorted(auto_fixed.items()):
@@ -1441,27 +1277,26 @@ elif st.session_state.processing_started and st.session_state.current_job_id:
                             desc_short = f" — {desc[:60]}" if desc else ""
                             st.markdown(f"- `{old_c}` → `{new_c}`{desc_short}")
 
-                # Flag remaining unfixable codes for manual review
                 if still_invalid:
-                    for item in items:
-                        cc = item.get('commodity_code', '')
-                        if cc in still_invalid:
-                            item['needs_review'] = True
-                            existing = item.get('review_notes', '')
-                            msg = still_invalid[cc].get('error', 'Invalid HS code')
-                            if msg not in (existing or ''):
-                                item['review_notes'] = (
-                                    f"{existing}; {msg}" if existing else msg
-                                )
                     st.error(
-                        f"❌ **{len(still_invalid)} HS code(s) could not be resolved — manual review needed:** "
+                        f"❌ **{len(still_invalid)} HS code(s) need manual review** "
+                        "(invoice codes kept — not auto-rewritten): "
                         + ", ".join(f"`{c}`" for c in sorted(still_invalid))
                     )
                     with st.expander("Unresolved HS Code Details"):
                         for c, v in sorted(still_invalid.items()):
                             st.markdown(f"- **{c}**: {v.get('error', 'Invalid')}")
+                            cands = v.get('candidates') or []
+                            if cands:
+                                st.caption(
+                                    "Suggestions: "
+                                    + ", ".join(
+                                        f"{x['code'][:8]} ({x['description'][:40]})"
+                                        for x in cands[:6]
+                                    )
+                                )
 
-                if not invalid_codes and hs_validation:
+                if not still_invalid and not auto_fixed and hs_validation:
                     st.success(f"✅ All {len(hs_validation)} HS codes validated against HMRC tariff")
 
                 

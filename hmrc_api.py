@@ -139,15 +139,17 @@ class HMRCTariffAPI:
         # Pad to 10 digits
         padded = clean.ljust(10, '0')
 
-        # 1) Try exact padded code
+        # 1) Try exact padded code — honour declarable (leaf is often null)
         result = self._try_commodity(padded)
-        if result and result.get('leaf', True):
+        if self._commodity_usable(result):
             out = {"valid": True, "code": clean, "resolved_code": padded,
                    "description": result.get('description', '')}
             self._validation_cache[cache_key] = out
             return out
 
-        # 2) For ≤8-digit codes, try common TARIC suffixes (digits 9-10)
+        # 2) For ≤8-digit codes, try TARIC suffixes under the SAME CN8.
+        #    Finding any usable leaf proves the invoice CN8 is valid for export —
+        #    do NOT rewrite digits 1-8.
         if len(clean) <= 8:
             base8 = clean[:8].ljust(8, '0')
             for suffix in ['00', '10', '20', '30', '40', '50',
@@ -156,15 +158,12 @@ class HMRCTariffAPI:
                 if variant == padded:
                     continue
                 res = self._try_commodity(variant)
-                if res and res.get('leaf', True):
+                if self._commodity_usable(res):
                     if is_export:
-                        # Export only needs valid 8-digit CN code.
-                        # A TARIC variant existing proves the CN8 is real.
                         out = {"valid": True, "code": clean,
                                "resolved_code": variant,
                                "description": res.get('description', '')}
                     else:
-                        # Import needs exact 10-digit leaf
                         out = {"valid": False, "code": clean,
                                "resolved_code": variant,
                                "description": res.get('description', ''),
@@ -182,7 +181,7 @@ class HMRCTariffAPI:
                            '60', '70', '80', '90', '91', '99']:
                 variant = base8 + suffix
                 res = self._try_commodity(variant)
-                if res and res.get('leaf', True):
+                if self._commodity_usable(res):
                     out = {"valid": False, "code": clean,
                            "resolved_code": variant,
                            "description": res.get('description', ''),
@@ -192,12 +191,10 @@ class HMRCTariffAPI:
                     self._validation_cache[cache_key] = out
                     return out
 
-        # 4) Code doesn't resolve via TARIC suffixes — explore the heading
-        #    to find valid leaf codes that share the longest prefix with the
-        #    input code.  This catches cases like "82075000" (CN6 820750
-        #    zero-padded to 8 digits) where the real CN8 codes are
-        #    82075010, 82075060, etc.
-        #    For obsolete codes, also search the entire heading for replacements.
+        # 4) Code doesn't resolve under its own CN8 — explore the heading for
+        #    suggestions. IMPORTANT: do not auto-rewrite to a different CN8
+        #    (that was inventing "corrections" like 84212900→84212980 and
+        #    wiping lines when remaps failed). Return candidates for review only.
         heading = clean[:4]
         heading_desc = ''
         candidates: List[Dict] = []
@@ -209,35 +206,40 @@ class HMRCTariffAPI:
                 hd = hdata.get('data', {}).get('attributes', {})
                 heading_desc = hd.get('description_plain',
                                       hd.get('description', ''))
-                # Gather all leaf commodities under this heading
-                # First try to match by 6-digit prefix (for similar codes)
                 prefix6 = clean[:6]
                 prefix4 = clean[:4]
-                
+                base8 = clean[:8].ljust(8, '0') if len(clean) >= 6 else clean
+
                 for inc in hdata.get('included', []):
                     if inc.get('type') != 'commodity':
                         continue
                     attrs = inc.get('attributes', {})
-                    if not attrs.get('leaf', False):
+                    # Accept leaf OR declarable nomenclature nodes
+                    if not (attrs.get('leaf') is True or attrs.get('declarable') is True):
                         continue
                     ccode = attrs.get('goods_nomenclature_item_id', '')
-                    # Try exact prefix6 match first (e.g., 82075010 for 82075000)
                     if ccode.startswith(prefix6):
                         cdesc = (attrs.get('description_plain') or
                                  attrs.get('formatted_description', '')).strip()
                         candidates.append({'code': ccode, 'description': cdesc})
-                
-                # If no exact prefix6 match found (likely obsolete), search entire heading
-                # This catches cases like 8517700 → 8517710 or 8517790
+
+                # Same CN8 found under heading (e.g. only 10-digit leaves listed)
+                same_cn8 = [c for c in candidates if c['code'][:8] == base8[:8]]
+                if is_export and same_cn8:
+                    out = {"valid": True, "code": clean,
+                           "resolved_code": same_cn8[0]['code'],
+                           "description": same_cn8[0]['description']}
+                    self._validation_cache[cache_key] = out
+                    return out
+
                 if not candidates:
                     for inc in hdata.get('included', []):
                         if inc.get('type') != 'commodity':
                             continue
                         attrs = inc.get('attributes', {})
-                        if not attrs.get('leaf', False):
+                        if not (attrs.get('leaf') is True or attrs.get('declarable') is True):
                             continue
                         ccode = attrs.get('goods_nomenclature_item_id', '')
-                        # Only include codes in same heading (first 4 digits match)
                         if ccode.startswith(prefix4) and not ccode.startswith(prefix6):
                             cdesc = (attrs.get('description_plain') or
                                      attrs.get('formatted_description', '')).strip()
@@ -246,7 +248,6 @@ class HMRCTariffAPI:
             pass
 
         if candidates:
-            # Deduplicate by code
             seen = set()
             unique = []
             for c in candidates:
@@ -255,26 +256,18 @@ class HMRCTariffAPI:
                     unique.append(c)
             candidates = unique
 
-            if len(candidates) == 1:
-                # Single leaf under this subheading → auto-correct
-                rc = candidates[0]['code']
-                out = {"valid": False, "code": clean,
-                       "resolved_code": rc,
-                       "description": candidates[0]['description'],
-                       "error": (f"{code} is not a declarable code.  "
-                                 f"Auto-resolved to {rc} "
-                                 f"({candidates[0]['description'][:60]})")}
-            else:
-                # Multiple leaves — list up to 5 as suggestions
-                suggestions = "; ".join(
-                    f"{c['code'][:8]} ({c['description'][:40]})"
-                    for c in candidates[:5]
-                )
-                extra = f" +{len(candidates)-5} more" if len(candidates) > 5 else ""
-                out = {"valid": False, "code": clean,
-                       "candidates": candidates,
-                       "error": (f"{code} is not a declarable code. "
-                                 f"Possible codes: {suggestions}{extra}")}
+            suggestions = "; ".join(
+                f"{c['code'][:8]} ({c['description'][:40]})"
+                for c in candidates[:5]
+            )
+            extra = f" +{len(candidates)-5} more" if len(candidates) > 5 else ""
+            # Never set resolved_code to a different CN8 — that triggered silent
+            # rewrites and broken HMRC doc-code lookups keyed to the old code.
+            out = {"valid": False, "code": clean,
+                   "candidates": candidates,
+                   "error": (f"{code} is not in the current UK tariff as CN "
+                             f"{clean[:8]}. Possible replacements: "
+                             f"{suggestions}{extra}. Invoice code kept — review manually.")}
         else:
             ctx = f" (heading {heading}: {heading_desc})" if heading_desc else ""
             out = {"valid": False, "code": clean,
@@ -330,12 +323,26 @@ class HMRCTariffAPI:
                 return {
                     'description': (attrs.get('description_plain') or
                                     attrs.get('formatted_description', '')).strip(),
-                    'leaf': attrs.get('leaf', False),
+                    # HMRC often returns leaf=null for CN8-padded xx00 codes that
+                    # are still declarable for CDS. Prefer declarable.
+                    'leaf': attrs.get('leaf'),
+                    'declarable': attrs.get('declarable'),
                     'code': attrs.get('goods_nomenclature_item_id', ten_digit_code),
                 }
         except requests.RequestException:
             pass
         return None
+
+    @staticmethod
+    def _commodity_usable(result: Optional[Dict]) -> bool:
+        """True when a commodity API hit can be used for validation/doc lookup."""
+        if not result:
+            return False
+        if result.get('declarable') is True:
+            return True
+        if result.get('leaf') is True:
+            return True
+        return False
     
     def get_commodity_details(self, commodity_code: str, country: str = "GB", direction: str = "import", destination_country: str = None, export_only: bool = False) -> Optional[Dict]:
         """
