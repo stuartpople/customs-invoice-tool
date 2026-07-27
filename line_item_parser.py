@@ -213,6 +213,21 @@ class LineItemParser:
                 "format_type": "xosil",
             }
 
+        # ── Sugatsune Kogyo (UK) hardware invoices ────────────────────────────
+        # Layout: STOCK CODE / PRODUCT / DESCRIPTION / QTY / PRICE / UNIT / VALUE
+        # with Country + 8–10 digit HS under each item (PyMuPDF vertical or OCR).
+        if self._is_sugatsune_invoice(all_text):
+            print("[Parser] Sugatsune invoice detected — using dedicated parser")
+            items = self._parse_sugatsune_format(all_text.split("\n"), direction, page_map)
+            items = self._finalize_parsed_items(items, all_text)
+            return {
+                "total_items": len(items),
+                "items": items,
+                "pages_analyzed": len(pages_data.get("pages", [])),
+                "direction": direction,
+                "format_type": "sugatsune",
+            }
+
         # ── BAS (British Antarctic Survey) / BoL-grouped vertical commodity table ──
         # Never fall through to Gemini for this layout — AI invents lines (e.g. tampons).
         if self._should_use_bas_parser(all_text):
@@ -699,6 +714,10 @@ class LineItemParser:
         if self._should_use_bas_parser(text):
             items = self._parse_bas_commercial_format(lines, direction, page_map)
             return items, "bas_commercial"
+
+        if self._is_sugatsune_invoice(text):
+            items = self._parse_sugatsune_format(lines, direction, page_map)
+            return items, "sugatsune"
         
         # First, try to detect if this is a tabular invoice format
         # Look for "HS Codes" column header (might be on its own line in vertical format)
@@ -3182,6 +3201,335 @@ class LineItemParser:
                 return hs_code[:8]
 
         return hs_code
+
+    @staticmethod
+    def _is_sugatsune_invoice(text: str) -> bool:
+        """Sugatsune Kogyo (UK) commercial invoices (drawer runners / hinges etc.)."""
+        lower = (text or "").lower()
+        if "sugatsune" in lower:
+            return True
+        return (
+            "stock code" in lower
+            and "product" in lower
+            and "description" in lower
+            and bool(re.search(r"\b(china|japan)\b", lower))
+            and bool(re.search(r"\b8302\d{4,6}\b", text or ""))
+        )
+
+    def _parse_sugatsune_format(self, lines: List[str], direction: str, page_map: Dict) -> List[Dict]:
+        """
+        Parse Sugatsune invoices.
+
+        Clean PyMuPDF text is vertical per item::
+            stock / product / description lines / Country / HScode / qty / £price / Unit / £value
+
+        OCR of scanned pages often puts qty/price/unit/value on the product line,
+        with Country + HS still on following lines.
+        """
+        from countries import normalize_item_country_fields
+
+        pad_to_10 = direction.lower() == "import"
+        stripped = [re.sub(r"[\xa0\u200b]", " ", (ln or "")).strip() for ln in lines]
+        country_names = {
+            "china", "japan", "germany", "taiwan", "italy", "france", "usa",
+            "united states", "united kingdom", "uk", "vietnam", "korea",
+            "south korea", "india", "thailand", "malaysia", "indonesia",
+        }
+        uoms = {"pair", "each", "pcs", "pc", "set", "box", "kit"}
+        money_re = re.compile(r"£?\s*([\d]+[.,]\d{2})")
+        hs_re = re.compile(r"^(\d{8}|\d{10})$")
+        # OCR inline: ... 21 £35.93 Pair £754.53
+        inline_re = re.compile(
+            r"^(?P<desc>.+?)\s+(?P<qty>\d+)\s+£?\s*(?P<price>[\d]+[.,]\d{2})\s+"
+            r"(?P<uom>Pair|Each|Pcs?|Set|Box)\s+£?\s*(?P<value>[\d]+[.,]\d{2})\s*$",
+            re.IGNORECASE,
+        )
+        header_tokens = {
+            "stock code", "stockcode", "product", "description", "qty", "price",
+            "unit", "value", "invoice", "account", "invoice to", "deliver to",
+        }
+
+        def _money(s: str) -> str:
+            s = (s or "").replace(",", ".")
+            # if both . and , handled above; restore thousands if OCR used comma as decimal
+            if s.count(".") > 1:
+                parts = s.split(".")
+                s = "".join(parts[:-1]) + "." + parts[-1]
+            return s
+
+        def _valid_hs(code: str) -> bool:
+            if not hs_re.match(code):
+                return False
+            try:
+                ch = int(code[:2])
+            except ValueError:
+                return False
+            return 1 <= ch <= 97
+
+        def _looks_country(line: str) -> Optional[str]:
+            low = line.lower().strip(" :")
+            if low in country_names:
+                return normalize_country_iso(line) or line[:2].upper()
+            # OCR sometimes glues punctuation: "China." / "Japan*"
+            for name in country_names:
+                if low.startswith(name):
+                    return normalize_country_iso(name) or name[:2].upper()
+            return None
+
+        def _desc_before(idx: int) -> str:
+            parts: List[str] = []
+            k = idx - 1
+            while k >= 0 and len(parts) < 8:
+                prev = stripped[k]
+                pl = prev.lower()
+                if not prev or pl in header_tokens or prev.startswith("--- PAGE"):
+                    break
+                if _looks_country(prev) or hs_re.match(prev):
+                    break
+                if re.fullmatch(r"\d{5,6}", prev):
+                    # bare stock code — keep as prefix then stop
+                    parts.insert(0, prev)
+                    break
+                if re.fullmatch(r"[\d.,]+", prev.replace("£", "")):
+                    break
+                parts.insert(0, prev)
+                k -= 1
+            # Deduplicate repeated product codes in description
+            out: List[str] = []
+            seen = set()
+            for p in parts:
+                key = p.lower()
+                if key in seen and len(p) < 40:
+                    continue
+                seen.add(key)
+                out.append(p)
+            desc = " ".join(out)
+            desc = re.sub(r"\s+", " ", desc).strip()
+            # Prefer human description over stock-only
+            return desc[:160]
+
+        def _is_junk_desc(desc: str) -> bool:
+            d = (desc or "").lower()
+            if len(d) < 4:
+                return True
+            junk_markers = (
+                "invoice no", "account your order", "eori:", "eort:",
+                "winnersh", "wharfedale", "deliver to", "invoice to",
+                "sugatsune", "stock code product", "phone:", "vat no",
+                "registration no", "incoterm", "bank details",
+            )
+            return any(m in d for m in junk_markers)
+
+        def _extract_stock(desc: str) -> str:
+            m = re.match(r"^(\d{5,6})\b", (desc or "").strip())
+            return m.group(1) if m else ""
+
+        def _coo_hs_after(start: int) -> Tuple[str, str, int]:
+            """Return (coo, hs, index_of_hs) looking ahead from start."""
+            coo = ""
+            for j in range(start, min(start + 12, len(stripped))):
+                c = _looks_country(stripped[j])
+                if c:
+                    coo = c
+                    if j + 1 < len(stripped) and _valid_hs(stripped[j + 1]):
+                        return coo, stripped[j + 1], j + 1
+                if _valid_hs(stripped[j]) and coo:
+                    return coo, stripped[j], j
+                # OCR HS with leading junk: §202420090 / 8302420090 mid-line
+                m = re.search(r"(?<!\d)(8302\d{6}|83\d{8}|\d{10}|\d{8})(?!\d)", stripped[j])
+                if m and coo:
+                    cand = m.group(1)
+                    if _valid_hs(cand):
+                        return coo, cand, j
+            return coo, "", start
+
+        items: List[Dict] = []
+        seen_keys = set()
+        item_counter = 0
+        i = 0
+        while i < len(stripped):
+            line = stripped[i]
+            if not line or line.lower() in header_tokens or line.startswith("--- PAGE"):
+                i += 1
+                continue
+            if "client own" in line.lower() or "nominated transport" in line.lower():
+                i += 1
+                continue
+            if line.lower().startswith("goods total") or line.lower() in ("vat total (%)", "total"):
+                i += 1
+                continue
+
+            # --- Path A: Country then HS (clean vertical + most OCR) ---
+            coo = _looks_country(line)
+            if coo and i + 1 < len(stripped):
+                hs_line = stripped[i + 1]
+                hs = hs_line if _valid_hs(hs_line) else ""
+                if not hs:
+                    m = re.search(r"(?<!\d)(\d{8}|\d{10})(?!\d)", hs_line)
+                    if m and _valid_hs(m.group(1)):
+                        hs = m.group(1)
+                if hs:
+                    qty = price = unit = value = None
+
+                    # Prefer qty/price already on the product line (OCR layout)
+                    for back in range(1, 8):
+                        if i - back < 0:
+                            break
+                        im = inline_re.match(stripped[i - back])
+                        if im:
+                            qty = im.group("qty")
+                            price = _money(im.group("price"))
+                            unit = im.group("uom")
+                            value = _money(im.group("value"))
+                            break
+
+                    # Clean vertical layout: qty / £price / Unit / £value after HS
+                    if value is None:
+                        for b in stripped[i + 2 : i + 8]:
+                            bl = b.lower().replace("£", "").strip()
+                            if "stock" in bl or "lead" in bl or "week" in bl:
+                                continue
+                            # Qty is small; avoid 5–6 digit stock codes
+                            if qty is None and re.fullmatch(r"\d{1,4}", bl):
+                                qty = bl
+                                continue
+                            mm = money_re.search(b)
+                            if mm and price is None and unit is None:
+                                price = _money(mm.group(1))
+                                continue
+                            if unit is None and bl in uoms:
+                                unit = b if b[:1].isupper() else b.title()
+                                continue
+                            mm2 = money_re.search(b)
+                            if unit is not None and mm2 and value is None:
+                                value = _money(mm2.group(1))
+                                break
+
+                    try:
+                        qty_f = float(qty) if qty is not None else 0.0
+                        val_f = float(value) if value is not None else 0.0
+                    except ValueError:
+                        qty_f, val_f = 0.0, 0.0
+
+                    # Skip zero lines (out-of-stock rows printed at £0.00)
+                    if val_f <= 0 or qty_f <= 0:
+                        i += 2
+                        continue
+
+                    desc = _desc_before(i)
+                    # If description is weak, pull product code from nearby
+                    if len(desc) < 8:
+                        for back in range(1, 5):
+                            if i - back >= 0 and len(stripped[i - back]) > 5:
+                                desc = stripped[i - back]
+                                break
+                    if _is_junk_desc(desc):
+                        i += 2
+                        continue
+
+                    hs_code = self._pad_hs_code(hs, pad_to_10)
+                    stock = _extract_stock(desc)
+                    key = (stock or desc[:40].lower(), hs_code, str(int(qty_f)), f"{val_f:.2f}")
+                    if key in seen_keys:
+                        i += 2
+                        continue
+                    seen_keys.add(key)
+
+                    item_counter += 1
+                    unit_value = ""
+                    try:
+                        unit_value = f"{val_f / qty_f:.4f}".rstrip("0").rstrip(".")
+                    except Exception:
+                        pass
+                    line_pos = sum(len(raw) + 1 for raw in lines[:i])
+                    item = {
+                        "item_number": str(item_counter),
+                        "stock_number": stock,
+                        "description": desc or f"Item {hs_code}",
+                        "quantity": str(int(qty_f)) if qty_f == int(qty_f) else str(qty_f),
+                        "uom": unit or "PCS",
+                        "unit_value": unit_value or (price or ""),
+                        "total_value": f"{val_f:.2f}",
+                        "currency": "GBP",
+                        "commodity_code": hs_code,
+                        "country_of_origin": coo,
+                        "net_weight": "",
+                        "pages": [self._page_at(page_map, line_pos, 1)],
+                        "confidence": 0.9,
+                        "needs_review": False,
+                    }
+                    normalize_item_country_fields(item)
+                    items.append(item)
+                    i += 2
+                    continue
+
+            # --- Path B: OCR inline qty/price/value on product line ---
+            im = inline_re.match(line)
+            if im:
+                qty = im.group("qty")
+                price = _money(im.group("price"))
+                unit = im.group("uom")
+                value = _money(im.group("value"))
+                try:
+                    qty_f = float(qty)
+                    val_f = float(value)
+                except ValueError:
+                    i += 1
+                    continue
+                if val_f <= 0 or qty_f <= 0:
+                    i += 1
+                    continue
+                coo, hs, hs_idx = _coo_hs_after(i + 1)
+                if not hs:
+                    i += 1
+                    continue
+                # Description: inline desc + following text until country
+                desc_bits = [im.group("desc")]
+                for j in range(i + 1, hs_idx):
+                    if _looks_country(stripped[j]) or _valid_hs(stripped[j]):
+                        break
+                    if stripped[j] and stripped[j].lower() not in header_tokens:
+                        # Skip stock/lead-time notes in description body
+                        if "lead time" in stripped[j].lower() or "*in stock" in stripped[j].lower():
+                            continue
+                        if re.search(r"\bin uk stock\b", stripped[j].lower()):
+                            continue
+                        desc_bits.append(stripped[j])
+                desc = re.sub(r"\s+", " ", " ".join(desc_bits)).strip()[:160]
+                # Reject header bleed (OCR reading invoice header as a line)
+                if _is_junk_desc(desc):
+                    i += 1
+                    continue
+                hs_code = self._pad_hs_code(hs, pad_to_10)
+                stock = _extract_stock(desc)
+                key = (stock or desc[:40].lower(), hs_code, str(int(qty_f)), f"{val_f:.2f}")
+                if key in seen_keys:
+                    i += 1
+                    continue
+                seen_keys.add(key)
+                item_counter += 1
+                line_pos = sum(len(raw) + 1 for raw in lines[:i])
+                item = {
+                    "item_number": str(item_counter),
+                    "stock_number": stock,
+                    "description": desc or f"Item {hs_code}",
+                    "quantity": str(int(qty_f)) if qty_f == int(qty_f) else str(qty_f),
+                    "uom": unit or "PCS",
+                    "unit_value": price,
+                    "total_value": f"{val_f:.2f}",
+                    "currency": "GBP",
+                    "commodity_code": hs_code,
+                    "country_of_origin": coo or "",
+                    "net_weight": "",
+                    "pages": [self._page_at(page_map, line_pos, 1)],
+                    "confidence": 0.85,
+                    "needs_review": False,
+                }
+                normalize_item_country_fields(item)
+                items.append(item)
+            i += 1
+
+        return items
 
     def _parse_bas_commercial_format(self, lines: List[str], direction: str, page_map: Dict) -> List[Dict]:
         """
