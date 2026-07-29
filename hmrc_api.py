@@ -416,6 +416,23 @@ class HMRCTariffAPI:
                 
                 if response.status_code == 200:
                     data = response.json()
+                    attrs = data.get('data', {}).get('attributes', {})
+                    # An 8-digit CN lookup tries xx00 first, but xx00 is often a
+                    # non-declarable parent (e.g. 7014000000). Parent nodes have
+                    # no measures/doc codes, while the declarable xx10/xx90
+                    # children carry 9Y10 etc. Continue until a declarable leaf
+                    # is found instead of returning the first HTTP 200 response.
+                    if (
+                        attrs.get('declarable') is False
+                        and (len(clean_code) < 10 or is_padded_8_digit)
+                    ):
+                        last_error = {
+                            "error": (
+                                f"Code {commodity_code} resolved to non-declarable "
+                                f"parent {variant_code}; trying a declarable child"
+                            )
+                        }
+                        continue
                     result = self._parse_commodity_response(data, direction, destination_country, export_only)
                     self._commodity_cache[cache_key] = result
                     return result
