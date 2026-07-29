@@ -591,6 +591,125 @@ def _find_columns(columns, col_lower_map, priority_groups):
     return []
 
 
+def _word_document_to_text(doc) -> str:
+    """Flatten Word paragraphs and table cells for metadata/debugging."""
+    parts = [para.text for para in doc.paragraphs if para.text.strip()]
+    for table in doc.tables:
+        for row in table.rows:
+            parts.append(' | '.join(cell.text.replace('\n', ' / ') for cell in row.cells))
+    return '\n'.join(parts)
+
+
+def _word_decimal(raw) -> Optional[float]:
+    """Parse GBP values using either decimal point or decimal comma."""
+    match = re.search(r'-?\d[\d\s,.]*', str(raw or '').replace('\xa0', ' '))
+    if not match:
+        return None
+    value = re.sub(r'\s+', '', match.group(0))
+    if ',' in value and '.' not in value:
+        value = value.replace(',', '.')
+    elif ',' in value and '.' in value:
+        # Last separator is decimal; the other is thousands.
+        if value.rfind(',') > value.rfind('.'):
+            value = value.replace('.', '').replace(',', '.')
+        else:
+            value = value.replace(',', '')
+    try:
+        return float(value)
+    except ValueError:
+        return None
+
+
+def _parse_word_commercial_tables(doc, trade_direction: str) -> List[Dict]:
+    """Extract standard commercial-invoice rows directly from Word tables."""
+    items: List[Dict] = []
+    suspicious_decimal_comma: List[Dict] = []
+
+    for table in doc.tables:
+        if not table.rows:
+            continue
+        headers = [
+            re.sub(r'\s+', ' ', cell.text).strip().lower()
+            for cell in table.rows[0].cells
+        ]
+
+        def column(*names):
+            for idx, header in enumerate(headers):
+                if any(name in header for name in names):
+                    return idx
+            return None
+
+        qty_col = column('quantity', 'qty')
+        desc_col = column('description', 'goods')
+        country_col = column('country of origin', 'origin')
+        hs_col = column('hs code', 'commodity code', 'tariff')
+        value_col = column('value', 'amount', 'line total')
+        if None in (qty_col, desc_col, hs_col, value_col):
+            continue
+
+        for row in table.rows[1:]:
+            cells = [re.sub(r'\s+', ' ', cell.text).strip() for cell in row.cells]
+            if max(qty_col, desc_col, hs_col, value_col) >= len(cells):
+                continue
+
+            description = cells[desc_col]
+            code = _normalize_hs_code(cells[hs_col], trade_direction)
+            qty = _word_decimal(cells[qty_col])
+            value = _word_decimal(cells[value_col])
+            if not description or not code or qty is None or value is None:
+                # Repeated headers and package separator rows land here.
+                continue
+            if qty <= 0 or value <= 0:
+                continue
+
+            country = ''
+            if country_col is not None and country_col < len(cells):
+                country = normalize_country_iso(cells[country_col])
+            item = {
+                'commodity_code': code,
+                'description': description,
+                'quantity': qty,
+                'uom': 'PCS',
+                'total_value': value,
+                'country_of_origin': country,
+                'net_weight': None,
+                'currency': 'GBP',
+                'needs_review': False,
+            }
+            normalize_item_country_fields(item)
+            items.append(item)
+            raw_value = cells[value_col]
+            if ',' in raw_value and '.' not in raw_value:
+                suspicious_decimal_comma.append(item)
+
+    # Surface a real inconsistency instead of silently treating comma as thousands.
+    paragraph_text = '\n'.join(para.text for para in doc.paragraphs)
+    printed_match = re.search(
+        r'\bTotal\s+value\s*:\s*[£$€]?\s*([\d,.]+)',
+        paragraph_text,
+        re.IGNORECASE,
+    )
+    printed_total = _word_decimal(printed_match.group(1)) if printed_match else None
+    row_total = round(sum(float(item['total_value']) for item in items), 2)
+    if printed_total is not None and abs(row_total - printed_total) >= 0.01:
+        difference = round(row_total - printed_total, 2)
+        candidates = [
+            item for item in suspicious_decimal_comma
+            if abs(float(item['total_value']) - abs(difference)) < 0.01
+        ]
+        review_items = candidates or suspicious_decimal_comma
+        note = (
+            f"Invoice rows total GBP {row_total:.2f}, but the printed total is "
+            f"GBP {printed_total:.2f} (difference GBP {difference:.2f}). "
+            "Check the comma-decimal value on this row."
+        )
+        for item in review_items:
+            item['needs_review'] = True
+            item['review_notes'] = note
+
+    return items
+
+
 def extract_from_word(file_obj, trade_direction: str = "export") -> List[Dict]:
     """
     Extract invoice data from Word document.
@@ -612,19 +731,12 @@ def extract_from_word(file_obj, trade_direction: str = "export") -> List[Dict]:
         # Read Word document
         doc = Document(file_obj)
         
-        # Extract all text
-        full_text = []
-        for para in doc.paragraphs:
-            full_text.append(para.text)
-        
-        # Also extract from tables
-        for table in doc.tables:
-            for row in table.rows:
-                row_text = ' | '.join(cell.text for cell in row.cells)
-                full_text.append(row_text)
-        
-        # Join all text and use the existing parser
-        text = '\n'.join(full_text)
+        # Word tables preserve columns, so use them before flattening text.
+        items = _parse_word_commercial_tables(doc, trade_direction)
+        if items:
+            return items
+
+        text = _word_document_to_text(doc)
         
         # Use the PDF parser logic (it works on text)
         from pdf_extractor import parse_line_items
@@ -697,7 +809,46 @@ def extract_from_file(file_obj, filename: str, trade_direction: str = "export") 
         
         elif file_ext in ['docx', 'doc']:
             items = extract_from_word(file_obj, trade_direction)
-            text = "Word document processed - see extracted items below"
+            file_obj.seek(0)
+            doc = Document(file_obj)
+            text = _word_document_to_text(doc)
+            metadata.update(extract_invoice_metadata(text))
+
+            invoice_ref = re.search(r'\bINV\s*:\s*([A-Z0-9/-]+)', text, re.IGNORECASE)
+            invoice_date = re.search(
+                r'\b(\d{1,2}/\d{1,2}/\d{4})\b', text, re.IGNORECASE
+            )
+            incoterm = re.search(r'\bINCO\s*Terms?\s+([A-Z]{3})\b', text, re.IGNORECASE)
+            printed_total = re.search(
+                r'\bTotal\s+value\s*:\s*[£$€]?\s*([\d,.]+)', text, re.IGNORECASE
+            )
+            gross_total = re.search(
+                r'\bTotal\s+Weight\s*:\s*([\d,.]+)\s*kg', text, re.IGNORECASE
+            )
+            package_numbers = [
+                int(n) for n in re.findall(r'\bPackage\s+(\d+)\s*:', text, re.IGNORECASE)
+            ]
+            net_weights = [
+                _word_decimal(n) for n in re.findall(
+                    r'\bNett\s+Weight\s*:\s*([\d,.]+)\s*kg', text, re.IGNORECASE
+                )
+            ]
+            if invoice_ref:
+                metadata['invoice_number'] = invoice_ref.group(1)
+            if invoice_date:
+                metadata['invoice_date'] = invoice_date.group(1)
+            if incoterm:
+                metadata['incoterm'] = incoterm.group(1).upper()
+            if printed_total:
+                metadata['total_invoice_value'] = _word_decimal(printed_total.group(1))
+            if gross_total:
+                metadata['total_gross_weight'] = _word_decimal(gross_total.group(1))
+            if package_numbers:
+                metadata['number_of_packages'] = max(package_numbers)
+                metadata['package_type'] = 'PK'
+            valid_net_weights = [n for n in net_weights if n is not None]
+            if valid_net_weights:
+                metadata['total_net_weight'] = round(sum(valid_net_weights), 3)
             return text, items, metadata
         
         else:
