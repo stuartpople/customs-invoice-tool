@@ -21,7 +21,7 @@ import shutil
 
 
 # Version tracking for cache busting
-APP_VERSION = "v3.23"
+APP_VERSION = "v3.24"
 
 
 def _coerce_dataframe_for_editor(df: pd.DataFrame) -> pd.DataFrame:
@@ -582,6 +582,8 @@ if uploaded_files and username:
                             if not st.session_state.invoice_metadata:
                                 st.session_state.invoice_metadata = metadata
                             st.success(f"✅ Extracted {len(actual_items)} items from {uploaded_file.name}")
+                            for warning in metadata.get('review_warnings', []):
+                                st.warning(f"⚠️ {warning}")
                         else:
                             st.warning(
                                 f"⚠️ No data rows extracted from {uploaded_file.name}. "
