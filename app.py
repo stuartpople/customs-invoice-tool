@@ -21,7 +21,7 @@ import shutil
 
 
 # Version tracking for cache busting
-APP_VERSION = "v3.22"
+APP_VERSION = "v3.23"
 
 
 def _coerce_dataframe_for_editor(df: pd.DataFrame) -> pd.DataFrame:
@@ -283,7 +283,8 @@ st.markdown("""
 
 # Version check and cache clear
 if 'app_version' not in st.session_state or st.session_state.app_version != APP_VERSION:
-    # Clear HMRC cache on version change
+    # Clear both session and process-wide HMRC caches on version change.
+    HMRCTariffAPI.clear_caches()
     keys_to_clear = ['hmrc_results', 'hmrc_consolidate_state', 'hmrc_dest_country', 'parsed_items', 'parsed_job_ids', 'hs_validation_results']
     for key in keys_to_clear:
         if key in st.session_state:
@@ -851,6 +852,7 @@ if st.session_state.get('non_pdf_processed', False):
                 if st.button("🔄 Clear & Re-lookup", use_container_width=True,
                              key="excel_hmrc_clear",
                              help="Clear cached results and lookup again"):
+                    HMRCTariffAPI.clear_caches()
                     del st.session_state.hmrc_results
                     st.rerun()
             
@@ -1533,6 +1535,7 @@ elif st.session_state.processing_started and st.session_state.current_job_id:
                     with col2:
                         if 'hmrc_results' in st.session_state and st.session_state.hmrc_results:
                             if st.button("🔄 Clear & Re-lookup", use_container_width=True, help="Clear cached results and lookup again"):
+                                HMRCTariffAPI.clear_caches()
                                 del st.session_state.hmrc_results
                                 if 'hmrc_consolidate_state' in st.session_state:
                                     del st.session_state.hmrc_consolidate_state

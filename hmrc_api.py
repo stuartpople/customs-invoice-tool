@@ -86,6 +86,16 @@ class HMRCTariffAPI:
     _commodity_cache: Dict[str, Optional[Dict]] = {}
     _heading_cache: Dict[str, Optional[Dict]] = {}
     _validation_cache: Dict[str, Dict] = {}
+    # Bump when lookup semantics change so hot-reloaded Streamlit workers cannot
+    # reuse results produced by older code.
+    CACHE_SCHEMA_VERSION = "declarable-leaf-v2"
+
+    @classmethod
+    def clear_caches(cls) -> None:
+        """Clear all process-wide HMRC lookup and validation caches."""
+        cls._commodity_cache.clear()
+        cls._heading_cache.clear()
+        cls._validation_cache.clear()
     
     def __init__(self, base_url: str = "https://www.trade-tariff.service.gov.uk"):
         self.base_url = base_url
@@ -132,7 +142,7 @@ class HMRCTariffAPI:
         if is_export and len(clean) > 8:
             clean = clean[:8]
 
-        cache_key = f"{clean}_{direction.lower()}"
+        cache_key = f"{self.CACHE_SCHEMA_VERSION}_{clean}_{direction.lower()}"
         if cache_key in self._validation_cache:
             return self._validation_cache[cache_key]
 
@@ -362,7 +372,10 @@ class HMRCTariffAPI:
         clean_code = commodity_code.replace(' ', '').replace('-', '')
         
         # Check cache first
-        cache_key = f"{clean_code}_{direction}_{destination_country}_{export_only}"
+        cache_key = (
+            f"{self.CACHE_SCHEMA_VERSION}_{clean_code}_{direction}_"
+            f"{destination_country}_{export_only}"
+        )
         if cache_key in self._commodity_cache:
             return self._commodity_cache[cache_key]
         
