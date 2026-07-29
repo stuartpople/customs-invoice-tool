@@ -820,26 +820,6 @@ def extract_from_file(file_obj, filename: str, trade_direction: str = "export") 
             valid_net_weights = [n for n in net_weights if n is not None]
             if valid_net_weights:
                 metadata['total_net_weight'] = round(sum(valid_net_weights), 3)
-
-            # This is an invoice-level arithmetic inconsistency, not a bad line
-            # extraction. Keep every valid item and surface one clear warning.
-            printed_value = metadata.get('total_invoice_value')
-            row_total = round(sum(float(item.get('total_value') or 0) for item in items), 2)
-            if printed_value is not None and abs(row_total - printed_value) >= 0.01:
-                difference = round(row_total - float(printed_value), 2)
-                matching = [
-                    item.get('description', '')
-                    for item in items
-                    if abs(float(item.get('total_value') or 0) - abs(difference)) < 0.01
-                ]
-                likely_row = f" The difference matches “{matching[0]}”." if matching else ""
-                metadata['review_warnings'] = [
-                    (
-                        f"Invoice rows total GBP {row_total:.2f}, but the printed "
-                        f"invoice total is GBP {float(printed_value):.2f} "
-                        f"(difference GBP {difference:.2f}).{likely_row}"
-                    )
-                ]
             return text, items, metadata
         
         else:
