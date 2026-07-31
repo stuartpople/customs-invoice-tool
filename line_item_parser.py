@@ -787,42 +787,45 @@ class LineItemParser:
                 data_start = i
                 break
         
-        # Detect the stride by finding distance between item numbers
-        # Look for pattern: "1" ... "2" to determine stride
+        # Detect the stride by finding distance between item numbers.
+        # Require the candidate "2" to be followed by a stock number — otherwise a
+        # quantity of 2 on item 1 (common on short IKF packing lists) is mistaken
+        # for item #2 and stride collapses to ~4, which skips the IKF/CofO path.
         stride = 10  # Default
-        for i in range(data_start + 1, min(data_start + 20, len(lines))):
-            if lines[i].strip() == '2':
+        for i in range(data_start + 1, min(data_start + 30, len(lines))):
+            if lines[i].strip() != '2':
+                continue
+            if i + 1 < len(lines) and self._is_ikf_stock_number(lines[i + 1]):
                 stride = i - data_start
                 break
-        # debug removed
-        
-        # Detect sub-format: IKF-style (stride 12, has description+UOM+CofO inline)
-        # vs ATI-style (stride 10, country ISO code at position 2, descriptions in separate section)
-        # vs RS-style (stride 11, has inline description after stock, country after description)
+
+        # Detect sub-format: IKF-style (description+UOM+CofO inline; variable stride)
+        # vs ATI-style (stride 10, country ISO at position 2, descriptions elsewhere)
+        # vs RS-style (stride 11, inline description, country after description)
         is_ikf_format = False
         is_rs_format = False
-        
-        if stride >= 11:
-            # Check if there's a "CofO" line within the first item
-            for j in range(data_start + 1, min(data_start + stride + 2, len(lines))):
-                if lines[j].strip() == 'CofO':
-                    is_ikf_format = True
-                    break
-            
-            # If not IKF, check for RS format: item, stock, DESCRIPTION (not country), country, hs-code
-            if not is_ikf_format and stride == 11:
-                # In RS format: i+2 should be a description (not a 2-letter country code)
-                # Check the third line after item number (i+2)
-                if data_start + 2 < len(lines):
-                    field_i2 = lines[data_start + 2].strip()
-                    # If it's not a 2-letter country code, it's probably a description
-                    if not re.match(r'^[A-Z]{2}$', field_i2) and len(field_i2) > 3:
-                        is_rs_format = True
-        
+
+        # IKF: "HS Codes" header + 8-digit code immediately before "CofO" in first item.
+        # Do not gate on stride — short invoices with qty=2 previously failed that gate.
+        scan_end = min(data_start + max(stride, 14) + 4, len(lines))
+        for j in range(data_start + 1, scan_end):
+            if lines[j].strip() != 'CofO' or j == 0:
+                continue
+            if re.match(r'^\d{8}$', lines[j - 1].strip()):
+                is_ikf_format = True
+                break
+
+        if not is_ikf_format and stride == 11:
+            # RS format: i+2 should be a description (not a 2-letter country code)
+            if data_start + 2 < len(lines):
+                field_i2 = lines[data_start + 2].strip()
+                if not re.match(r'^[A-Z]{2}$', field_i2) and len(field_i2) > 3:
+                    is_rs_format = True
+
         if is_ikf_format:
             self._last_table_format = "vertical_table_ikf"
             return self._parse_vertical_table_ikf(lines, data_start, stride, direction, page_map, pad_to_10)
-        
+
         if is_rs_format:
             self._last_table_format = "vertical_table_rs"
             return self._parse_vertical_table_rs(lines, data_start, stride, direction, page_map, pad_to_10)

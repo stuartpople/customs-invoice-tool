@@ -21,7 +21,7 @@ import shutil
 
 
 # Version tracking for cache busting
-APP_VERSION = "v3.25"
+APP_VERSION = "v3.26"
 
 
 def _coerce_dataframe_for_editor(df: pd.DataFrame) -> pd.DataFrame:
