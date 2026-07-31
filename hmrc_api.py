@@ -89,7 +89,7 @@ class HMRCTariffAPI:
     # Bump when lookup semantics change so hot-reloaded Streamlit workers cannot
     # reuse results produced by older code.
     # Bump when lookup / validation semantics change so process-wide caches refresh.
-    CACHE_SCHEMA_VERSION = "cn8-residual-leaf-v3"
+    CACHE_SCHEMA_VERSION = "cn8-pad-other-only-v4"
 
     @classmethod
     def clear_caches(cls) -> None:
@@ -390,21 +390,18 @@ class HMRCTariffAPI:
         
         if len(clean_code) < 10:
             if len(clean_code) == 8:
-                # Resolve CN8 → TARIC leaf. Prefer xx00, then residual "Other"
-                # leaves (90/99/80…) before specialised subdivisions (10/20…).
-                # Trying 10 first wrongly applied NAR supplementary units from
-                # 8544429010 (specialist data cable) to generic power cords
-                # declared as 85444290.
+                # Export: invoice codes are CN8. Only pad with 00, then residual
+                # "Other" TARIC endings (90/99) for doc codes / supp-unit checks.
+                # Do NOT walk specialised subdivisions (10/20/…) — those belong to
+                # specific products and wrongly inherit measures like NAR.
                 if direction.lower() == 'export':
-                    for suffix in ['00', '90', '99', '80', '91', '70', '60',
-                                   '50', '40', '30', '20', '10']:
+                    for suffix in ['00', '90', '99']:
                         code_variants.append(clean_code + suffix)
                 else:
                     for suffix in ['99', '91', '90', '80', '10', '00']:
                         code_variants.append(clean_code + suffix)
-                # Then try broader levels (heading, chapter)
-                code_variants.append(clean_code[:6] + '0000')  # 6-digit heading
-                code_variants.append(clean_code[:4] + '000000')  # 4-digit chapter
+                    code_variants.append(clean_code[:6] + '0000')
+                    code_variants.append(clean_code[:4] + '000000')
             else:
                 # For other lengths, just pad with zeros
                 code_variants.append(clean_code.ljust(10, '0'))
