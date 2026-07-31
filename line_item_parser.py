@@ -165,15 +165,53 @@ class LineItemParser:
             and re.search(r'\bUnit\s+Price\b', all_text, re.IGNORECASE) is not None
         )
         if _is_ikf_vertical:
-            print("[Parser] IKF/RS vertical table detected — using regex parser (skip AI)")
-            items, format_type = self._parse_line_items_proven(all_text, direction, page_map)
+            print("[Parser] IKF/RS vertical table detected — using dedicated IKF parser (skip AI)")
+            lines = all_text.split("\n")
+            pad_to_10 = direction.lower() == "import"
+            # Prefer the variable-stride IKF parser directly. Going via
+            # _parse_line_items_proven used to mis-detect stride when item 1
+            # qty was 2 and then fall into the ATI fixed-stride path (0 items).
+            data_start = 0
+            for i, line in enumerate(lines):
+                if "HS Codes" in line or "HS Code" in line:
+                    for j in range(i + 1, min(i + 8, len(lines))):
+                        tok = lines[j].strip()
+                        if (
+                            tok.isdigit()
+                            and int(tok) == 1
+                            and j + 1 < len(lines)
+                            and self._is_ikf_stock_number(lines[j + 1])
+                        ):
+                            data_start = j
+                            break
+                    if data_start:
+                        break
+            if not data_start:
+                for i, line in enumerate(lines):
+                    tok = line.strip()
+                    if (
+                        tok.isdigit()
+                        and int(tok) == 1
+                        and i + 1 < len(lines)
+                        and self._is_ikf_stock_number(lines[i + 1])
+                    ):
+                        data_start = i
+                        break
+            items = (
+                self._parse_vertical_table_ikf(lines, data_start, 12, direction, page_map, pad_to_10)
+                if data_start
+                else []
+            )
+            if not items:
+                # Fallback: previous tabular detector (still includes stride fix)
+                items, _fmt = self._parse_line_items_proven(all_text, direction, page_map)
             items = self._postprocess_items(items)
             return {
                 "total_items": len(items),
                 "items": items,
                 "pages_analyzed": len(pages_data.get("pages", [])),
                 "direction": direction,
-                "format_type": format_type or "vertical_table_ikf",
+                "format_type": "vertical_table_ikf",
             }
 
         # ── Arrow Export / (cc:XXXXXXXXXX) bracket HS code format ─────────────
@@ -500,7 +538,8 @@ class LineItemParser:
         footer_tokens = [
             'total product', 'shipping cost', 'in total', 'terms & conditions',
             'signed by', 'date:', 'currency:', 'method of payment', 'payment term',
-            'total invoice', 'invoice total', 'grand total', 'shipping', 'total'
+            'total invoice', 'invoice total', 'grand total', 'shipping cost',
+            'freight charge', 'goods value',
         ]
 
         kept: List[Dict] = []

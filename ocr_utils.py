@@ -2,20 +2,16 @@ import re
 
 def clean_ocr_text(text):
     """
-    Cleans OCR text for better AI extraction:
-    - Removes excessive whitespace
-    - Fixes common OCR errors (e.g., misread characters)
-    - Attempts to align columns by normalizing spaces
-    - Removes non-printable/control characters
+    Light cleanup for OCR / extracted text before AI fallback.
+
+    Must preserve newlines — vertical invoice layouts (IKF/ATI/etc.) put one
+    field per line. Never apply destructive OCR letter substitutions globally
+    (O→0 / l→1) — that corrupts tokens like CofO and Seller.
     """
-    # Remove non-printable characters
-    text = re.sub(r'[\x00-\x1F\x7F]', '', text)
-    # Replace multiple spaces/tabs with a single space
+    if not text:
+        return text
+    # Strip control chars except tab/newline/carriage-return
+    text = re.sub(r'[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]', '', text)
     text = re.sub(r'[ \t]+', ' ', text)
-    # Replace multiple newlines with a single newline
-    text = re.sub(r'\n+', '\n', text)
-    # Fix common OCR errors (add more as needed)
-    text = text.replace('O', '0').replace('l', '1')  # Example: O→0, l→1
-    # Remove leading/trailing whitespace
-    text = text.strip()
-    return text
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    return text.strip()
