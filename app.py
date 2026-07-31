@@ -21,7 +21,7 @@ import shutil
 
 
 # Version tracking for cache busting
-APP_VERSION = "v3.27"
+APP_VERSION = "v3.28"
 
 
 def _coerce_dataframe_for_editor(df: pd.DataFrame) -> pd.DataFrame:
@@ -979,8 +979,14 @@ if st.session_state.get('non_pdf_processed', False):
 
 # Step 3: Monitor Progress (for PDF files)
 elif st.session_state.processing_started and st.session_state.current_job_id:
-    # Check if we have multiple PDF jobs
-    pdf_job_ids = st.session_state.get('pdf_job_ids', [st.session_state.current_job_id])
+    # Check if we have multiple PDF jobs.
+    # IMPORTANT: an empty list is truthy for .get()'s default-skip — "Start New Job"
+    # sets pdf_job_ids=[] then Load from history only set current_job_id, so Parse
+    # would run over zero PDFs and report "no items".
+    pdf_job_ids = st.session_state.get('pdf_job_ids') or []
+    if not pdf_job_ids and st.session_state.current_job_id:
+        pdf_job_ids = [st.session_state.current_job_id]
+        st.session_state.pdf_job_ids = pdf_job_ids
     
     st.header("📊 Processing Progress")
     
@@ -1966,7 +1972,10 @@ with st.sidebar:
                 with col_load:
                     if st.button(f"Load", key=f"load_{job_id}"):
                         st.session_state.current_job_id = job_id
+                        st.session_state.pdf_job_ids = [job_id]
                         st.session_state.processing_started = True
+                        st.session_state.parsed_items = None
+                        st.session_state.parsed_job_ids = None
                         st.rerun()
                 with col_reprocess:
                     if status == 'completed' and st.button("🔄 Re-OCR", key=f"reocr_{job_id}", help="Re-run OCR with deskewing on all pages"):
