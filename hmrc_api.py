@@ -88,7 +88,8 @@ class HMRCTariffAPI:
     _validation_cache: Dict[str, Dict] = {}
     # Bump when lookup semantics change so hot-reloaded Streamlit workers cannot
     # reuse results produced by older code.
-    CACHE_SCHEMA_VERSION = "declarable-leaf-v2"
+    # Bump when lookup / validation semantics change so process-wide caches refresh.
+    CACHE_SCHEMA_VERSION = "cn8-residual-leaf-v3"
 
     @classmethod
     def clear_caches(cls) -> None:
@@ -389,14 +390,14 @@ class HMRCTariffAPI:
         
         if len(clean_code) < 10:
             if len(clean_code) == 8:
-                # For export doc-code lookups the standard TARIC leaf for a CN8
-                # code is almost always the xx00 variant, so try that first to
-                # avoid unnecessary API calls and accidentally landing on a
-                # different TARIC variant (e.g. xx99) whose doc codes may differ.
-                # For imports we try specific leaves first (99/91/90…) then 00.
+                # Resolve CN8 → TARIC leaf. Prefer xx00, then residual "Other"
+                # leaves (90/99/80…) before specialised subdivisions (10/20…).
+                # Trying 10 first wrongly applied NAR supplementary units from
+                # 8544429010 (specialist data cable) to generic power cords
+                # declared as 85444290.
                 if direction.lower() == 'export':
-                    for suffix in ['00', '10', '20', '30', '40', '50',
-                                   '60', '70', '80', '90', '91', '99']:
+                    for suffix in ['00', '90', '99', '80', '91', '70', '60',
+                                   '50', '40', '30', '20', '10']:
                         code_variants.append(clean_code + suffix)
                 else:
                     for suffix in ['99', '91', '90', '80', '10', '00']:
