@@ -13,7 +13,50 @@ from job_processor import JobProcessor
 from line_item_parser import LineItemParser
 from consolidation import group_by_commodity_code, create_consolidated_dataframe, export_to_excel
 from excel_export import create_comprehensive_export
-from cds_csv_export import create_cds_excel, create_cds_excel_parts, cds_export_download_meta
+from cds_csv_export import create_cds_excel
+
+# Split helpers (v3.32+) — import defensively so a mid-deploy mismatch
+# between app.py and cds_csv_export.py cannot brick the whole app.
+try:
+    from cds_csv_export import create_cds_excel_parts, cds_export_download_meta
+except ImportError:  # pragma: no cover - only during partial Streamlit deploys
+    def create_cds_excel_parts(
+        items,
+        direction='export',
+        hmrc_data=None,
+        metadata=None,
+        consolidate=True,
+        max_items_per_file=99,
+    ):
+        buf = create_cds_excel(
+            items=items,
+            direction=direction,
+            hmrc_data=hmrc_data,
+            metadata=metadata,
+            consolidate=consolidate,
+        )
+        # Approximate count for UI only; single-file fallback
+        n = len(items) if items else 0
+        return [{
+            'part': 1,
+            'parts': 1,
+            'item_count': n,
+            'start_item': 1 if n else 0,
+            'end_item': n,
+            'buffer': buf,
+        }]
+
+    def cds_export_download_meta(parts, base_name):
+        data = parts[0]['buffer'].getvalue() if parts else b''
+        return {
+            'base_name': base_name,
+            'file_name': f"{base_name}.xlsx",
+            'mime': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+            'label': '📋 Download FCL Excel Sheet',
+            'caption': None,
+            'data': data,
+            'parts': parts,
+        }
 from hmrc_api import HMRCTariffAPI
 from countries import COUNTRIES, COMMON_COUNTRIES, COUNTRY_TO_ISO, normalize_items_country_fields
 from file_extractor import extract_from_file
@@ -21,7 +64,7 @@ import shutil
 
 
 # Version tracking for cache busting
-APP_VERSION = "v3.32"
+APP_VERSION = "v3.33"
 
 
 def _coerce_dataframe_for_editor(df: pd.DataFrame) -> pd.DataFrame:

@@ -14,6 +14,14 @@ from openpyxl import Workbook, load_workbook
 from consolidation import group_by_commodity_code, consolidate_items
 from countries import normalize_country_iso
 
+__all__ = [
+    "CDS_MAX_ITEMS_PER_ENTRY",
+    "create_cds_excel",
+    "create_cds_excel_parts",
+    "cds_export_download_meta",
+    "chunk_cds_rows",
+]
+
 # Path to the original CDS template bundled with this tool.
 # Using the template preserves all merged cells, column widths, and borders
 # required by the CDS upload system.
@@ -365,7 +373,7 @@ def create_cds_excel(
                    assumed to already be consolidated (or no consolidation needed).
         direction: 'export' or 'import'.
         hmrc_data: HMRC tariff lookup results keyed by commodity code.
-        metadata:  Invoice metadata (number_of_packages, package_type, cpc_code …).
+        metadata:  Invoice metadata (number_of_packages, package_type, cpc_code...).
         consolidate: If True, consolidate raw items by commodity code.
                      If False, items are already consolidated/finalized.
         max_items_per_file: CDS max declaration lines per worksheet (default 99).
