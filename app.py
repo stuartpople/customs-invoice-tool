@@ -21,7 +21,7 @@ import shutil
 
 
 # Version tracking for cache busting
-APP_VERSION = "v3.30"
+APP_VERSION = "v3.31"
 
 
 def _coerce_dataframe_for_editor(df: pd.DataFrame) -> pd.DataFrame:
@@ -82,12 +82,12 @@ def _run_hs_validation(items: list, direction: str) -> dict:
 
 
 def _safe_hs_autocorrections(items: list, hs_validation: dict, direction: str) -> tuple:
-    """Apply only same-CN8 expansions. Never rewrite to a different CN8.
+    """Apply safe HS corrections.
 
-    Description/"Other" catch-all remaps were rewriting invoice codes
-    (e.g. 84212900→84212980, 85044090→85044095) and then HMRC doc-code
-    lookups keyed to the old codes came back empty. Obsolete codes are
-    flagged for review instead.
+    1) Same-CN8 expansions (padding / TARIC leaf under the invoice CN8).
+    2) Obsolete CN8 reclassification when HMRC validation provides a suggested
+       replacement (prefer residual "Other" under the same HS6). Marked for
+       review so the declarant can confirm.
     """
     is_export = direction.lower() == 'export'
     invalid_codes = {c: v for c, v in (hs_validation or {}).items()
@@ -98,25 +98,41 @@ def _safe_hs_autocorrections(items: list, hs_validation: dict, direction: str) -
 
     for code, result in invalid_codes.items():
         resolved = (result.get('resolved_code') or '').replace(' ', '')
+        suggested = (result.get('suggested_code') or '').replace(' ', '')
         clean = (code or '').replace(' ', '').replace('-', '').replace('.', '')
         if resolved and clean and len(clean) >= 8 and resolved[:8] == clean[:8]:
             new_code = resolved[:8] if is_export else resolved
             if new_code != code:
                 auto_fixed[code] = new_code
                 auto_fixed_desc[code] = result.get('description', '')
-        else:
-            still_invalid[code] = result
+            continue
+        if suggested and clean and suggested != clean[:len(suggested)]:
+            # Obsolete CN — reclassify to suggested replacement
+            new_code = suggested[:8] if is_export else suggested[:10].ljust(10, '0')
+            auto_fixed[code] = new_code
+            auto_fixed_desc[code] = result.get('suggested_description') or result.get('description', '')
+            continue
+        still_invalid[code] = result
 
     if auto_fixed:
         for item in items:
             cc = item.get('commodity_code', '')
-            if cc in auto_fixed:
-                old = cc
-                item['commodity_code'] = auto_fixed[cc]
+            if cc not in auto_fixed:
+                continue
+            old = cc
+            item['commodity_code'] = auto_fixed[cc]
+            # Obsolete remaps always need human confirmation
+            if old[:8] != auto_fixed[cc][:8]:
+                item['needs_review'] = True
+                note = (
+                    f"Obsolete HS {old} reclassified to {auto_fixed[cc]} "
+                    f"({auto_fixed_desc.get(old, 'tariff replacement')}) — confirm"
+                )
+            else:
                 note = f"HS code auto-corrected: {old} → {auto_fixed[cc]}"
-                existing = item.get('review_notes', '')
-                if note not in (existing or ''):
-                    item['review_notes'] = f"{existing}; {note}" if existing else note
+            existing = item.get('review_notes', '')
+            if note not in (existing or ''):
+                item['review_notes'] = f"{existing}; {note}" if existing else note
 
     for code, result in still_invalid.items():
         for item in items:
@@ -727,7 +743,7 @@ if st.session_state.get('non_pdf_processed', False):
         if still_invalid:
             st.error(
                 f"❌ **{len(still_invalid)} HS code(s) need manual review** "
-                "(invoice codes kept — not auto-rewritten): "
+                "(no safe automatic replacement): "
                 + ", ".join(f"`{c}`" for c in sorted(still_invalid))
             )
             with st.expander("Unresolved HS Code Details"):
@@ -1289,7 +1305,7 @@ elif st.session_state.processing_started and st.session_state.current_job_id:
                 if still_invalid:
                     st.error(
                         f"❌ **{len(still_invalid)} HS code(s) need manual review** "
-                        "(invoice codes kept — not auto-rewritten): "
+                        "(no safe automatic replacement): "
                         + ", ".join(f"`{c}`" for c in sorted(still_invalid))
                     )
                     with st.expander("Unresolved HS Code Details"):

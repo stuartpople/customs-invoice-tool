@@ -89,7 +89,7 @@ class HMRCTariffAPI:
     # Bump when lookup semantics change so hot-reloaded Streamlit workers cannot
     # reuse results produced by older code.
     # Bump when lookup / validation semantics change so process-wide caches refresh.
-    CACHE_SCHEMA_VERSION = "cn8-pad-other-only-v4"
+    CACHE_SCHEMA_VERSION = "obsolete-cn8-reclass-v5"
 
     @classmethod
     def clear_caches(cls) -> None:
@@ -109,6 +109,77 @@ class HMRCTariffAPI:
     # ------------------------------------------------------------------
     # Commodity code validation
     # ------------------------------------------------------------------
+    @staticmethod
+    def pick_obsolete_replacement(invoice_code: str, candidates: List[Dict],
+                                  export: bool = True) -> Optional[Dict]:
+        """Choose a replacement when an invoice CN8 no longer exists in the tariff.
+
+        Prefers residual "Other" leaves that share the longest HS prefix with the
+        invoice code (e.g. 90251980 → 9025190090 Other). Returns dict with
+        code/description, or None if nothing usable.
+        """
+        if not candidates:
+            return None
+        inv = (invoice_code or '').replace(' ', '').replace('-', '').replace('.', '')
+        if not inv:
+            return None
+
+        scored = []
+        for c in candidates:
+            raw = (c.get('code') or '').replace(' ', '')
+            if not raw.isdigit() or len(raw) < 8:
+                continue
+            desc = (c.get('description') or '').strip()
+            desc_l = desc.lower()
+            # Common residual wording in UK tariff
+            is_other = desc_l == 'other' or desc_l.startswith('other ') or desc_l.startswith('other<')
+            # Longest shared prefix with invoice CN8
+            prefix = 0
+            for a, b in zip(inv[:8], raw[:8]):
+                if a != b:
+                    break
+                prefix += 1
+            # Prefer residual TARIC …90 / …00 over specialised …10 aircraft etc.
+            taric = raw[8:10] if len(raw) >= 10 else '00'
+            taric_score = 2 if taric == '90' else (1 if taric == '00' else 0)
+            # Prefer not "for use in civil aircraft" when an Other exists
+            aircraft_penalty = 1 if 'civil aircraft' in desc_l else 0
+            scored.append({
+                'code': raw,
+                'description': desc,
+                'prefix': prefix,
+                'is_other': is_other,
+                'taric_score': taric_score,
+                'aircraft_penalty': aircraft_penalty,
+            })
+
+        if not scored:
+            return None
+
+        # Require at least HS6 match so we don't jump to a random heading sibling
+        scored = [s for s in scored if s['prefix'] >= 6] or scored
+
+        scored.sort(
+            key=lambda s: (
+                s['is_other'],
+                s['prefix'],
+                s['taric_score'],
+                -s['aircraft_penalty'],
+                # Closer CN8 to the invoice code wins ties (85044082→85044083 not …87)
+                -abs(int(s['code'][:8]) - int(inv[:8])),
+                s['code'],
+            ),
+            reverse=True,
+        )
+        best = scored[0]
+        out_code = best['code'][:8] if export else best['code'][:10].ljust(10, '0')
+        return {
+            'code': out_code,
+            'resolved_code': best['code'][:10].ljust(10, '0'),
+            'description': best['description'],
+            'invoice_code': inv[:8] if export else inv,
+        }
+
     def validate_commodity_code(self, code: str, direction: str = "export") -> Dict:
         """
         Validate that a commodity code exists in the UK Trade Tariff.
@@ -272,13 +343,29 @@ class HMRCTariffAPI:
                 for c in candidates[:5]
             )
             extra = f" +{len(candidates)-5} more" if len(candidates) > 5 else ""
-            # Never set resolved_code to a different CN8 — that triggered silent
-            # rewrites and broken HMRC doc-code lookups keyed to the old code.
-            out = {"valid": False, "code": clean,
-                   "candidates": candidates,
-                   "error": (f"{code} is not in the current UK tariff as CN "
-                             f"{clean[:8]}. Possible replacements: "
-                             f"{suggestions}{extra}. Invoice code kept — review manually.")}
+            suggested = self.pick_obsolete_replacement(
+                clean, candidates, export=is_export
+            )
+            out = {
+                "valid": False,
+                "code": clean,
+                "candidates": candidates,
+                "error": (
+                    f"{code} is not in the current UK tariff as CN "
+                    f"{clean[:8]}. Possible replacements: "
+                    f"{suggestions}{extra}."
+                ),
+            }
+            if suggested:
+                out["suggested_code"] = suggested["code"]
+                out["suggested_resolved_code"] = suggested["resolved_code"]
+                out["suggested_description"] = suggested["description"]
+                out["error"] += (
+                    f" Suggested reclassify to {suggested['code']} "
+                    f"({suggested['description'][:40]})."
+                )
+            else:
+                out["error"] += " Invoice code kept — review manually."
         else:
             ctx = f" (heading {heading}: {heading_desc})" if heading_desc else ""
             out = {"valid": False, "code": clean,
@@ -457,7 +544,52 @@ class HMRCTariffAPI:
                 last_error = {"error": f"Network error: {str(e)}"}
                 continue
         
-        # If we get here, none of the variants worked
+        # If we get here, none of the variants worked under this CN8.
+        # Obsolete invoice codes (restructured CN) 404 on 00/90/99 — fall back
+        # to the suggested replacement so doc codes still resolve.
+        if len(clean_code) == 8 or is_padded_8_digit:
+            base8 = clean_code[:8]
+            validation = self.validate_commodity_code(
+                base8, direction=direction
+            )
+            suggested = (validation.get('suggested_resolved_code')
+                         or validation.get('suggested_code')
+                         or '')
+            suggested = suggested.replace(' ', '')
+            if suggested and suggested[:8] != base8:
+                lookup = suggested if len(suggested) >= 10 else suggested.ljust(10, '0')
+                # Prefer residual Other pad for the suggested CN8
+                retry_codes = []
+                if len(suggested) >= 10:
+                    retry_codes.append(lookup)
+                cn8 = suggested[:8]
+                for suffix in ['00', '90', '99']:
+                    v = cn8 + suffix
+                    if v not in retry_codes:
+                        retry_codes.append(v)
+                for variant_code in retry_codes:
+                    try:
+                        url = f"{self.base_url}/uk/api/commodities/{variant_code}"
+                        response = self.session.get(url, timeout=10)
+                        if response.status_code != 200:
+                            continue
+                        data = response.json()
+                        attrs = data.get('data', {}).get('attributes', {})
+                        if attrs.get('declarable') is False:
+                            continue
+                        result = self._parse_commodity_response(
+                            data, direction, destination_country, export_only
+                        )
+                        result['obsolete_invoice_code'] = base8
+                        result['reclassified_from'] = base8
+                        result['commodity_code'] = (
+                            cn8 if direction.lower() == 'export' else variant_code
+                        )
+                        self._commodity_cache[cache_key] = result
+                        return result
+                    except requests.RequestException:
+                        continue
+
         result = last_error or {"error": f"Code {commodity_code} not found"}
         self._commodity_cache[cache_key] = result
         return result
