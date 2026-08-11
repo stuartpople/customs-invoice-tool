@@ -93,6 +93,8 @@ HEADER_ROW_4 = [
 
 NUM_COLUMNS = len(HEADER_ROW_4)          # 46
 TOTAL_DATA_ROWS = 200                    # Pad to this many data rows (fallback only)
+# CDS declaration item limit (DE 1/9 etc.) — split worksheets beyond this.
+CDS_MAX_ITEMS_PER_ENTRY = 99
 
 
 def _strip_non_ascii(text: str) -> str:
@@ -143,15 +145,216 @@ def _safe_float(value, default=0.0):
         return default
 
 
+def _build_cds_data_rows(
+    items: List[Dict],
+    direction: str = 'export',
+    hmrc_data: Optional[Dict[str, Dict]] = None,
+    metadata: Optional[Dict] = None,
+    consolidate: bool = True,
+) -> List[List]:
+    """Build CDS worksheet data rows (one list per declaration line)."""
+    hmrc_data = hmrc_data or {}
+    metadata = metadata or {}
+    is_export = direction.lower() == 'export'
+
+    package_type = metadata.get('package_type', 'PK')
+    package_count = metadata.get('number_of_packages', '')
+    invoice_ref = (
+        metadata.get('invoice_number')
+        or metadata.get('document_ref')
+        or metadata.get('reference', '')
+    )
+
+    if consolidate:
+        grouped = group_by_commodity_code(items)
+    else:
+        grouped = {f'item_{idx}': [item] for idx, item in enumerate(items)}
+
+    data_rows: List[List] = []
+    for code_key, group_items in grouped.items():
+        consolidated = consolidate_items(group_items)
+
+        if consolidate:
+            commodity_code = code_key
+            if commodity_code.startswith('__BLANK_'):
+                commodity_code = ''
+        else:
+            commodity_code = group_items[0].get('commodity_code', '')
+
+        descriptions: List[str] = []
+        seen_descs: set = set()
+        for it in group_items:
+            d = it.get('description', '').strip()
+            if d and d not in seen_descs:
+                descriptions.append(d)
+                seen_descs.add(d)
+        description = _strip_non_ascii('; '.join(descriptions))
+
+        total_value = (
+            round(consolidated['total_value'], 2) if consolidated['total_value'] else ''
+        )
+        net_weight = (
+            round(consolidated['total_net_weight'], 3)
+            if consolidated['total_net_weight'] is not None
+            and consolidated['total_net_weight'] != 0
+            else ''
+        )
+        gross_weight = (
+            round(consolidated['total_net_weight'] * 1.10, 3)
+            if consolidated['total_net_weight'] is not None
+            and consolidated['total_net_weight'] != 0
+            else ''
+        )
+
+        countries = consolidated.get('countries_of_origin', [])
+        country_orig = normalize_country_iso(countries[0] if countries else '')
+
+        supp_units = ''
+        hmrc_info = hmrc_data.get(commodity_code, {})
+        supp_raw = hmrc_info.get('supplementary_units', '')
+        if supp_raw and supp_raw != 'Not required':
+            supp_units = (
+                int(consolidated['total_quantity']) if consolidated['total_quantity'] else ''
+            )
+
+        doc_codes_dict = (
+            hmrc_info.get('selected_document_codes') or hmrc_info.get('document_codes', {})
+        )
+        doc_list = list(doc_codes_dict.keys())[:3]
+
+        row = [''] * NUM_COLUMNS
+        row[0] = commodity_code
+        row[1] = supp_units
+        if is_export:
+            row[2] = total_value
+        else:
+            row[3] = total_value
+        row[4] = description
+        row[5] = net_weight
+        row[7] = gross_weight
+        row[9] = package_type if package_type else 'PK'
+        row[10] = package_count
+        row[11] = country_orig
+        row[14] = 'Z'
+        row[15] = '380'
+        if invoice_ref:
+            row[16] = invoice_ref
+        if len(doc_list) >= 1:
+            row[23] = doc_list[0]
+        if len(doc_list) >= 2:
+            row[26] = doc_list[1]
+        if len(doc_list) >= 3:
+            row[29] = doc_list[2]
+        data_rows.append(row)
+
+    return data_rows
+
+
+def _write_cds_workbook(data_rows: List[List], is_export: bool) -> io.BytesIO:
+    """Write one CDS template workbook for the given data rows."""
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore')
+            wb = load_workbook(TEMPLATE_PATH)
+        ws = wb.active
+
+        ws['B2'] = 'B1' if is_export else 'H1'
+        ws['C2'] = 2
+        ws['I2'] = 'E' if is_export else 'I'
+        ws['J2'] = 'CDE08' if is_export else 'CDI10'
+
+        max_row = max(ws.max_row, FIRST_DATA_ROW + len(data_rows))
+        for r in range(FIRST_DATA_ROW, max_row + 1):
+            for c in range(1, ws.max_column + 1):
+                try:
+                    ws.cell(row=r, column=c).value = None
+                except AttributeError:
+                    pass
+
+    except Exception:
+        wb = Workbook()
+        ws = wb.active
+        ws.title = 'Sheet1'
+        for header_row in [HEADER_ROW_1, _make_header_row_2(is_export), HEADER_ROW_3, HEADER_ROW_4]:
+            ws.append(header_row)
+
+    for row_idx, row_data in enumerate(data_rows, start=FIRST_DATA_ROW):
+        for col_idx, val in enumerate(row_data, start=1):
+            if val not in ('', None):
+                try:
+                    ws.cell(row=row_idx, column=col_idx).value = val
+                except AttributeError:
+                    pass
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return buf
+
+
+def chunk_cds_rows(
+    data_rows: List[List],
+    max_items: int = CDS_MAX_ITEMS_PER_ENTRY,
+) -> List[List[List]]:
+    """Split declaration lines into CDS-sized chunks (default 99)."""
+    if max_items <= 0:
+        return [data_rows]
+    if not data_rows:
+        return [[]]
+    return [
+        data_rows[i:i + max_items]
+        for i in range(0, len(data_rows), max_items)
+    ]
+
+
+def create_cds_excel_parts(
+    items: List[Dict],
+    direction: str = 'export',
+    hmrc_data: Optional[Dict[str, Dict]] = None,
+    metadata: Optional[Dict] = None,
+    consolidate: bool = True,
+    max_items_per_file: int = CDS_MAX_ITEMS_PER_ENTRY,
+) -> List[Dict]:
+    """
+    Create one or more CDS worksheets, splitting at the CDS item limit.
+
+    Returns a list of dicts:
+      {part, parts, item_count, start_item, end_item, buffer}
+    """
+    is_export = direction.lower() == 'export'
+    data_rows = _build_cds_data_rows(
+        items, direction=direction, hmrc_data=hmrc_data,
+        metadata=metadata, consolidate=consolidate,
+    )
+    chunks = chunk_cds_rows(data_rows, max_items=max_items_per_file)
+    parts: List[Dict] = []
+    offset = 0
+    for idx, chunk in enumerate(chunks, start=1):
+        parts.append({
+            'part': idx,
+            'parts': len(chunks),
+            'item_count': len(chunk),
+            'start_item': offset + 1 if chunk else 0,
+            'end_item': offset + len(chunk),
+            'buffer': _write_cds_workbook(chunk, is_export),
+        })
+        offset += len(chunk)
+    return parts
+
+
 def create_cds_excel(
     items: List[Dict],
     direction: str = 'export',
     hmrc_data: Optional[Dict[str, Dict]] = None,
     metadata: Optional[Dict] = None,
     consolidate: bool = True,
+    max_items_per_file: int = CDS_MAX_ITEMS_PER_ENTRY,
 ) -> io.BytesIO:
     """
     Create a CDS Customs Entry Worksheet as an Excel (.xlsx) file.
+
+    If consolidated declaration lines exceed ``max_items_per_file`` (CDS limit
+    99), returns a ZIP containing part files instead of a single workbook.
 
     Loads the original CDS template (preserving merged cells, column widths and
     borders) then writes direction-specific header values and item data rows.
@@ -165,144 +368,69 @@ def create_cds_excel(
         metadata:  Invoice metadata (number_of_packages, package_type, cpc_code …).
         consolidate: If True, consolidate raw items by commodity code.
                      If False, items are already consolidated/finalized.
+        max_items_per_file: CDS max declaration lines per worksheet (default 99).
 
     Returns:
-        BytesIO object containing the .xlsx file ready for download.
+        BytesIO containing .xlsx (one part) or .zip (multiple parts).
     """
-    hmrc_data = hmrc_data or {}
-    metadata = metadata or {}
-    is_export = direction.lower() == 'export'
+    parts = create_cds_excel_parts(
+        items=items,
+        direction=direction,
+        hmrc_data=hmrc_data,
+        metadata=metadata,
+        consolidate=consolidate,
+        max_items_per_file=max_items_per_file,
+    )
+    if len(parts) == 1:
+        return parts[0]['buffer']
 
-    # --- Derive header-level defaults from metadata ---
-    package_type = metadata.get('package_type', 'PK')
-    package_count = metadata.get('number_of_packages', '')
-    cpc_code = metadata.get('cpc_code', '')
-    invoice_ref = metadata.get('invoice_number') or metadata.get('document_ref') or metadata.get('reference', '')
+    import zipfile
+    zip_buf = io.BytesIO()
+    with zipfile.ZipFile(zip_buf, 'w', zipfile.ZIP_DEFLATED) as zf:
+        for p in parts:
+            name = (
+                f"CDS-Customs-Entry-Worksheet-FCL-"
+                f"part{p['part']}of{p['parts']}-"
+                f"items{p['start_item']}-{p['end_item']}.xlsx"
+            )
+            zf.writestr(name, p['buffer'].getvalue())
+    zip_buf.seek(0)
+    return zip_buf
 
-    # --- Consolidate items by commodity code (if needed) ---
-    if consolidate:
-        grouped = group_by_commodity_code(items)
-    else:
-        # Items are already consolidated/finalized — treat each as a single group
-        grouped = {f'item_{idx}': [item] for idx, item in enumerate(items)}
-    data_rows: List[List] = []
 
-    for code_key, group_items in grouped.items():
-        consolidated = consolidate_items(group_items)
-
-        # Extract commodity code correctly based on whether we're consolidating
-        if consolidate:
-            commodity_code = code_key
-            if commodity_code.startswith('__BLANK_'):
-                commodity_code = ''
-        else:
-            # Items already consolidated — get code from the item itself
-            commodity_code = group_items[0].get('commodity_code', '')
-
-        # Joined description (semicolon-separated, deduplicated); strip non-ASCII
-        descriptions: List[str] = []
-        seen_descs: set = set()
-        for it in group_items:
-            d = it.get('description', '').strip()
-            if d and d not in seen_descs:
-                descriptions.append(d)
-                seen_descs.add(d)
-        description = _strip_non_ascii('; '.join(descriptions))
-
-        total_value = round(consolidated['total_value'], 2) if consolidated['total_value'] else ''
-        net_weight = round(consolidated['total_net_weight'], 3) if consolidated['total_net_weight'] is not None and consolidated['total_net_weight'] != 0 else ''
-        gross_weight = round(consolidated['total_net_weight'] * 1.10, 3) if consolidated['total_net_weight'] is not None and consolidated['total_net_weight'] != 0 else ''
-
-        # Country of origin — pick the first (CDS only allows one per line)
-        countries = consolidated.get('countries_of_origin', [])
-        country_orig = normalize_country_iso(countries[0] if countries else '')
-
-        # Supplementary units from HMRC data
-        supp_units = ''
-        hmrc_info = hmrc_data.get(commodity_code, {})
-        supp_raw = hmrc_info.get('supplementary_units', '')
-        if supp_raw and supp_raw != 'Not required':
-            supp_units = int(consolidated['total_quantity']) if consolidated['total_quantity'] else ''
-
-        # Document codes — use the auto-selected (non-restrictive) codes,
-        # falling back to the full set if selected_document_codes isn't available
-        doc_codes_dict = hmrc_info.get('selected_document_codes') or hmrc_info.get('document_codes', {})
-        doc_list = list(doc_codes_dict.keys())[:3]
-
-        # Build data row — only the fields we actually complete
-        row = [''] * NUM_COLUMNS
-        row[0] = commodity_code                                       # Commodity
-        row[1] = supp_units                                           # Supp.Units
-        if is_export:
-            row[2] = total_value                                      # Stats Value (Exports)
-        else:
-            row[3] = total_value                                      # Item Value (Imports)
-        row[4] = description                                          # Goods Description
-        row[5] = net_weight                                           # Nett Weight
-        row[7] = gross_weight                                         # Gross Weight
-        row[9] = package_type if package_type else 'PK'               # Package
-        row[10] = package_count                                       # Package Count (total packages)
-        row[11] = country_orig                                        # Country Orig
-        row[14] = 'Z'                                                 # Prv Doc Class
-        row[15] = '380'                                               # Prv Doc Type (commercial invoice)
-        if invoice_ref:
-            row[16] = invoice_ref                                     # Prv Doc Reference
-
-        # Document Code 1 (col 24, index 23)
-        if len(doc_list) >= 1:
-            row[23] = doc_list[0]
-        # Document Code 2 (col 27, index 26)
-        if len(doc_list) >= 2:
-            row[26] = doc_list[1]
-        # Document Code 3 (col 30, index 29)
-        if len(doc_list) >= 3:
-            row[29] = doc_list[2]
-
-        data_rows.append(row)
-
-    # --- Load template workbook (preserves merged cells, borders, column widths) ---
-    try:
-        with warnings.catch_warnings():
-            warnings.simplefilter('ignore')
-            wb = load_workbook(TEMPLATE_PATH)
-        ws = wb.active
-
-        # Set direction-specific values in row 2
-        ws['B2'] = 'B1' if is_export else 'H1'   # Entry Type
-        ws['C2'] = 2                               # Tmode (always 2 = air)
-        ws['I2'] = 'E' if is_export else 'I'       # Type
-        ws['J2'] = 'CDE08' if is_export else 'CDI10'  # Commodity prefix
-
-        # Clear all existing data rows (row 5 onwards)
-        max_row = max(ws.max_row, FIRST_DATA_ROW + len(data_rows))
-        for r in range(FIRST_DATA_ROW, max_row + 1):
-            for c in range(1, ws.max_column + 1):
-                try:
-                    ws.cell(row=r, column=c).value = None
-                except AttributeError:
-                    pass  # read-only merged cell — leave alone
-
-    except Exception:
-        # Fallback: build a blank workbook if template is unavailable
-        wb = Workbook()
-        ws = wb.active
-        ws.title = 'Sheet1'
-        for header_row in [HEADER_ROW_1, _make_header_row_2(is_export), HEADER_ROW_3, HEADER_ROW_4]:
-            ws.append(header_row)
-        # Pad so data starts at row 5 (blank workbook already has 4 header rows)
-
-    # --- Write data rows ---
-    for row_idx, row_data in enumerate(data_rows, start=FIRST_DATA_ROW):
-        for col_idx, val in enumerate(row_data, start=1):
-            if val not in ('', None):
-                try:
-                    ws.cell(row=row_idx, column=col_idx).value = val
-                except AttributeError:
-                    pass  # merged cell
-
-    # --- Save to BytesIO ---
-    buf = io.BytesIO()
-    wb.save(buf)
-    buf.seek(0)
-    return buf
-
+def cds_export_download_meta(parts: List[Dict], base_name: str) -> Dict:
+    """Filename / mime / caption for a create_cds_excel_parts result."""
+    if len(parts) <= 1:
+        return {
+            'base_name': base_name,
+            'file_name': f"{base_name}.xlsx",
+            'mime': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+            'label': '📋 Download FCL Excel Sheet',
+            'caption': None,
+            'data': parts[0]['buffer'].getvalue() if parts else b'',
+            'parts': parts,
+        }
+    import zipfile
+    zip_buf = io.BytesIO()
+    with zipfile.ZipFile(zip_buf, 'w', zipfile.ZIP_DEFLATED) as zf:
+        for p in parts:
+            name = (
+                f"{base_name}-part{p['part']}of{p['parts']}-"
+                f"items{p['start_item']}-{p['end_item']}.xlsx"
+            )
+            zf.writestr(name, p['buffer'].getvalue())
+    zip_buf.seek(0)
+    total = sum(p['item_count'] for p in parts)
+    return {
+        'base_name': base_name,
+        'file_name': f"{base_name}-split-{len(parts)}parts.zip",
+        'mime': 'application/zip',
+        'label': f'📋 Download FCL Excel ZIP ({len(parts)} files)',
+        'caption': (
+            f"CDS allows max {CDS_MAX_ITEMS_PER_ENTRY} items per entry — "
+            f"split {total} lines into {len(parts)} worksheets of up to "
+            f"{CDS_MAX_ITEMS_PER_ENTRY}."
+        ),
+        'data': zip_buf.getvalue(),
+        'parts': parts,
+    }

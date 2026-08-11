@@ -13,7 +13,7 @@ from job_processor import JobProcessor
 from line_item_parser import LineItemParser
 from consolidation import group_by_commodity_code, create_consolidated_dataframe, export_to_excel
 from excel_export import create_comprehensive_export
-from cds_csv_export import create_cds_excel
+from cds_csv_export import create_cds_excel, create_cds_excel_parts, cds_export_download_meta
 from hmrc_api import HMRCTariffAPI
 from countries import COUNTRIES, COMMON_COUNTRIES, COUNTRY_TO_ISO, normalize_items_country_fields
 from file_extractor import extract_from_file
@@ -21,7 +21,7 @@ import shutil
 
 
 # Version tracking for cache busting
-APP_VERSION = "v3.31"
+APP_VERSION = "v3.32"
 
 
 def _coerce_dataframe_for_editor(df: pd.DataFrame) -> pd.DataFrame:
@@ -898,11 +898,11 @@ if st.session_state.get('non_pdf_processed', False):
 
             if st.button("📋 FCL Excel Sheet", use_container_width=True,
                          key="excel_cds_btn",
-                         help="Export in CDS Customs Entry Worksheet format using the same consolidation as above."):
+                         help="Export in CDS Customs Entry Worksheet format (auto-splits over 99 lines)."):
                 # FCL export uses the same consolidation as standard Excel
                 _inv_meta = st.session_state.get('invoice_metadata', {})
                 _inv_meta = {**_inv_meta, 'cpc_code': '1040' if current_direction == 'export' else '4000'}
-                cds_bytes = create_cds_excel(
+                _parts = create_cds_excel_parts(
                     items=display_items,
                     direction=current_direction,
                     hmrc_data=_apply_selected_doc_codes(hmrc_results),
@@ -910,15 +910,41 @@ if st.session_state.get('non_pdf_processed', False):
                     metadata=_inv_meta
                 )
                 _inv_ref = _inv_meta.get('invoice_number') or ''
-                _fcl_fname = f"CDS-Customs-Entry-Worksheet-FCL-{_inv_ref}.xlsx" if _inv_ref else "CDS-Customs-Entry-Worksheet-FCL.xlsx"
+                _base = f"CDS-Customs-Entry-Worksheet-FCL-{_inv_ref}" if _inv_ref else "CDS-Customs-Entry-Worksheet-FCL"
+                _dl = cds_export_download_meta(_parts, _base)
+                st.session_state['fcl_excel_download'] = _dl
+                if _dl.get('caption'):
+                    st.warning(_dl['caption'])
+                st.rerun()
+
+            _fcl_dl = st.session_state.get('fcl_excel_download')
+            if _fcl_dl:
+                if _fcl_dl.get('caption'):
+                    st.info(_fcl_dl['caption'])
                 st.download_button(
-                    "📋 Download FCL Excel Sheet",
-                    data=cds_bytes.getvalue(),
-                    file_name=_fcl_fname,
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    _fcl_dl['label'],
+                    data=_fcl_dl['data'],
+                    file_name=_fcl_dl['file_name'],
+                    mime=_fcl_dl['mime'],
                     use_container_width=True,
                     key="excel_cds_download_btn"
                 )
+                # Offer individual part downloads when split
+                _parts_list = _fcl_dl.get('parts') or []
+                if len(_parts_list) > 1:
+                    _bn = _fcl_dl.get('base_name') or 'CDS-Customs-Entry-Worksheet-FCL'
+                    for _p in _parts_list:
+                        st.download_button(
+                            f"Part {_p['part']}/{_p['parts']} (items {_p['start_item']}–{_p['end_item']})",
+                            data=_p['buffer'].getvalue(),
+                            file_name=(
+                                f"{_bn}-part{_p['part']}of{_p['parts']}-"
+                                f"items{_p['start_item']}-{_p['end_item']}.xlsx"
+                            ),
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            use_container_width=True,
+                            key=f"excel_cds_part_{_p['part']}"
+                        )
         
         # Show HMRC results if available
         if hmrc_results:
@@ -1594,7 +1620,7 @@ elif st.session_state.processing_started and st.session_state.current_job_id:
                             )
 
                         if st.button("📋 FCL Excel Sheet", use_container_width=True,
-                                     help="Export in CDS Customs Entry Worksheet format using the same consolidation as above."):
+                                     help="Export in CDS Customs Entry Worksheet format (auto-splits over 99 lines)."):
                             metadata = processor.get_job_metadata(job_id)
                             hmrc_results = st.session_state.get('hmrc_results', None)
                             invoice_metadata = st.session_state.get('invoice_metadata', {})
@@ -1603,28 +1629,51 @@ elif st.session_state.processing_started and st.session_state.current_job_id:
                             # - If consolidated: pass consolidated df with consolidate=False
                             # - If not consolidated: pass raw items with consolidate=True (so FCL consolidates by HS code)
                             if consolidate:
-                                # Consolidated display → pass df rows with consolidate=False
                                 export_items = df_items.to_dict('records')
                                 should_consolidate = False
                             else:
-                                # Individual items display → pass raw items with consolidate=True
                                 export_items = items
                                 should_consolidate = True
                             
-                            cds_bytes = create_cds_excel(
+                            _parts = create_cds_excel_parts(
                                 items=export_items,
                                 direction=metadata.get('direction', 'export'),
                                 hmrc_data=_apply_selected_doc_codes(hmrc_results),
                                 consolidate=should_consolidate,
                                 metadata=invoice_metadata
                             )
+                            _base = f"CDS-Customs-Entry-Worksheet-FCL-{job_id}"
+                            _dl = cds_export_download_meta(_parts, _base)
+                            st.session_state['fcl_excel_download_pdf'] = _dl
+                            st.rerun()
+
+                        _fcl_dl_pdf = st.session_state.get('fcl_excel_download_pdf')
+                        if _fcl_dl_pdf:
+                            if _fcl_dl_pdf.get('caption'):
+                                st.info(_fcl_dl_pdf['caption'])
                             st.download_button(
-                                "📋 Download FCL Excel Sheet",
-                                data=cds_bytes.getvalue(),
-                                file_name=f"CDS-Customs-Entry-Worksheet-FCL-{job_id}.xlsx",
-                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                                use_container_width=True
+                                _fcl_dl_pdf['label'],
+                                data=_fcl_dl_pdf['data'],
+                                file_name=_fcl_dl_pdf['file_name'],
+                                mime=_fcl_dl_pdf['mime'],
+                                use_container_width=True,
+                                key="pdf_fcl_download_btn"
                             )
+                            _plist = _fcl_dl_pdf.get('parts') or []
+                            if len(_plist) > 1:
+                                _bn = _fcl_dl_pdf.get('base_name') or 'CDS-FCL'
+                                for _p in _plist:
+                                    st.download_button(
+                                        f"Part {_p['part']}/{_p['parts']} (items {_p['start_item']}–{_p['end_item']})",
+                                        data=_p['buffer'].getvalue(),
+                                        file_name=(
+                                            f"{_bn}-part{_p['part']}of{_p['parts']}-"
+                                            f"items{_p['start_item']}-{_p['end_item']}.xlsx"
+                                        ),
+                                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                        use_container_width=True,
+                                        key=f"pdf_fcl_part_{_p['part']}"
+                                    )
                     
                     # JSON export in separate row
                     st.markdown("")
