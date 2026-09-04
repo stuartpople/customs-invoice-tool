@@ -11,7 +11,10 @@ from pathlib import Path
 from typing import Dict, List, Optional
 import io
 from countries import normalize_country_iso
-from hmrc_api import format_hs_for_sheet, resolve_hmrc_data
+try:
+    from hs_format import format_hs_for_sheet, resolve_hmrc_data
+except ImportError:  # pragma: no cover
+    from hmrc_api import format_hs_for_sheet, resolve_hmrc_data
 
 
 def _safe_float(value, default=0.0):

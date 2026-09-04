@@ -13,7 +13,10 @@ from typing import Dict, List, Optional
 from openpyxl import Workbook, load_workbook
 from consolidation import group_by_commodity_code, consolidate_items
 from countries import normalize_country_iso
-from hmrc_api import format_hs_for_sheet, resolve_hmrc_data
+try:
+    from hs_format import format_hs_for_sheet, resolve_hmrc_data
+except ImportError:  # pragma: no cover
+    from hmrc_api import format_hs_for_sheet, resolve_hmrc_data
 
 __all__ = [
     "CDS_MAX_ITEMS_PER_ENTRY",

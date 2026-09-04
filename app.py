@@ -35,7 +35,6 @@ except ImportError:  # pragma: no cover - only during partial Streamlit deploys
             metadata=metadata,
             consolidate=consolidate,
         )
-        # Approximate count for UI only; single-file fallback
         n = len(items) if items else 0
         return [{
             'part': 1,
@@ -57,14 +56,27 @@ except ImportError:  # pragma: no cover - only during partial Streamlit deploys
             'data': data,
             'parts': parts,
         }
-from hmrc_api import HMRCTariffAPI, format_hs_for_sheet
+
+from hmrc_api import HMRCTariffAPI
+try:
+    from hs_format import format_hs_for_sheet
+except ImportError:  # pragma: no cover
+    try:
+        from hmrc_api import format_hs_for_sheet
+    except ImportError:
+        def format_hs_for_sheet(code, direction='export'):
+            digits = ''.join(ch for ch in str(code or '') if ch.isdigit())
+            if not digits:
+                return ''
+            return digits[:8] if (direction or 'export').lower() == 'export' else digits[:10].ljust(10, '0')
+
 from countries import COUNTRIES, COMMON_COUNTRIES, COUNTRY_TO_ISO, normalize_items_country_fields
 from file_extractor import extract_from_file
 import shutil
 
 
 # Version tracking for cache busting
-APP_VERSION = "v3.34"
+APP_VERSION = "v3.35"
 
 
 def _normalize_items_hs_for_direction(items: list, direction: str) -> list:

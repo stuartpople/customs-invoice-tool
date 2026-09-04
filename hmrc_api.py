@@ -7,60 +7,10 @@ import requests
 from typing import Dict, Optional, List
 import time
 
+from hs_format import hs_digits, format_hs_for_sheet, resolve_hmrc_data
 
-def hs_digits(code) -> str:
-    """Strip a commodity code down to digits only."""
-    return _re.sub(r'\D', '', str(code or ''))
-
-
-def format_hs_for_sheet(code, direction: str = 'export') -> str:
-    """HS code as written on the CDS worksheet.
-
-    Export = CN8 only. Import = TARIC 10 (pad with zeros if shorter).
-    """
-    digits = hs_digits(code)
-    if not digits:
-        return ''
-    if (direction or 'export').lower() == 'export':
-        return digits[:8]
-    if len(digits) >= 10:
-        return digits[:10]
-    return digits.ljust(10, '0')
-
-
-def resolve_hmrc_data(hmrc_data: Optional[Dict], code) -> Dict:
-    """Find an HMRC cache entry for a code, ignoring 8-vs-10 key mismatches.
-
-    Doc-code lookup pads CN8 with 00/90/99 silently; the sheet always shows
-    CN8 for export, so cache keys and item codes often differ by two digits.
-    """
-    if not hmrc_data:
-        return {}
-    digits = hs_digits(code)
-    if not digits:
-        return {}
-    cn8 = digits[:8]
-    candidates = [
-        digits,
-        cn8,
-        cn8 + '00',
-        cn8 + '90',
-        cn8 + '99',
-        digits.ljust(10, '0')[:10],
-    ]
-    # Prefer a successful (non-error) hit
-    for key in candidates:
-        hit = hmrc_data.get(key)
-        if hit and not hit.get('error'):
-            return hit
-    for key in candidates:
-        if key in hmrc_data:
-            return hmrc_data[key] or {}
-    for key, hit in hmrc_data.items():
-        kd = hs_digits(key)
-        if kd.startswith(cn8) and hit and not hit.get('error'):
-            return hit
-    return {}
+# Re-export so existing `from hmrc_api import format_hs_for_sheet` keeps working.
+__all_hs__ = ('hs_digits', 'format_hs_for_sheet', 'resolve_hmrc_data')
 
 
 # Phrases in requirement text that indicate a non-restrictive / exemption code
