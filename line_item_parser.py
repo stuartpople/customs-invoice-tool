@@ -4167,7 +4167,7 @@ class LineItemParser:
             # ── Phase 3: zip price groups with description items ──────────────
             for pg, di in zip(price_groups, desc_items):
                 item_counter += 1
-                hs_code = self._pad_hs_code(di['hs'], True)
+                hs_code = self._pad_hs_code(di['hs'], direction.lower() == 'import')
                 # Clean asterisk footnote references from description
                 description = re.sub(r'\s*\*#\d+', '', di['description']).strip()
                 # Use price group qty (more reliable for bundles like "2 x")
@@ -4416,7 +4416,7 @@ class LineItemParser:
                     unit_wt    = nums[3] if len(nums) > 3 else ''
 
                     country = self._ATI_ORIGIN_MAP.get(coc, coc)
-                    hs10 = self._pad_hs_code(hs_code, True)
+                    hs10 = self._pad_hs_code(hs_code, direction.lower() == 'import')
 
                     page_items.append({
                         'item_num':    item_num,

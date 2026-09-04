@@ -8,6 +8,61 @@ from typing import Dict, Optional, List
 import time
 
 
+def hs_digits(code) -> str:
+    """Strip a commodity code down to digits only."""
+    return _re.sub(r'\D', '', str(code or ''))
+
+
+def format_hs_for_sheet(code, direction: str = 'export') -> str:
+    """HS code as written on the CDS worksheet.
+
+    Export = CN8 only. Import = TARIC 10 (pad with zeros if shorter).
+    """
+    digits = hs_digits(code)
+    if not digits:
+        return ''
+    if (direction or 'export').lower() == 'export':
+        return digits[:8]
+    if len(digits) >= 10:
+        return digits[:10]
+    return digits.ljust(10, '0')
+
+
+def resolve_hmrc_data(hmrc_data: Optional[Dict], code) -> Dict:
+    """Find an HMRC cache entry for a code, ignoring 8-vs-10 key mismatches.
+
+    Doc-code lookup pads CN8 with 00/90/99 silently; the sheet always shows
+    CN8 for export, so cache keys and item codes often differ by two digits.
+    """
+    if not hmrc_data:
+        return {}
+    digits = hs_digits(code)
+    if not digits:
+        return {}
+    cn8 = digits[:8]
+    candidates = [
+        digits,
+        cn8,
+        cn8 + '00',
+        cn8 + '90',
+        cn8 + '99',
+        digits.ljust(10, '0')[:10],
+    ]
+    # Prefer a successful (non-error) hit
+    for key in candidates:
+        hit = hmrc_data.get(key)
+        if hit and not hit.get('error'):
+            return hit
+    for key in candidates:
+        if key in hmrc_data:
+            return hmrc_data[key] or {}
+    for key, hit in hmrc_data.items():
+        kd = hs_digits(key)
+        if kd.startswith(cn8) and hit and not hit.get('error'):
+            return hit
+    return {}
+
+
 # Phrases in requirement text that indicate a non-restrictive / exemption code
 _EXEMPTION_PHRASES = [
     'not required',
@@ -89,7 +144,7 @@ class HMRCTariffAPI:
     # Bump when lookup semantics change so hot-reloaded Streamlit workers cannot
     # reuse results produced by older code.
     # Bump when lookup / validation semantics change so process-wide caches refresh.
-    CACHE_SCHEMA_VERSION = "obsolete-cn8-reclass-v5"
+    CACHE_SCHEMA_VERSION = "export-cn8-sheet-v6"
 
     @classmethod
     def clear_caches(cls) -> None:
@@ -458,6 +513,13 @@ class HMRCTariffAPI:
         """
         # Clean commodity code (remove spaces, dashes)
         clean_code = commodity_code.replace(' ', '').replace('-', '')
+        clean_code = hs_digits(clean_code)
+
+        # Export worksheets are CN8 — silently expand to TARIC pads for the API only.
+        if direction.lower() == 'export' and len(clean_code) > 8:
+            clean_code = clean_code[:8]
+        elif direction.lower() == 'export' and 0 < len(clean_code) < 8:
+            clean_code = clean_code.ljust(8, '0')
         
         # Check cache first
         cache_key = (
@@ -678,6 +740,13 @@ class HMRCTariffAPI:
             "_debug_direction_checks": [],
             "_debug_country_checks": []
         }
+
+        # Export declarations use CN8 on the sheet; keep TARIC only for lookup.
+        taric = hs_digits(result.get('commodity_code'))
+        if taric:
+            result['resolved_taric_code'] = taric[:10].ljust(10, '0') if len(taric) >= 8 else taric
+            if (direction or '').lower() == 'export':
+                result['commodity_code'] = taric[:8]
         
         # Extract measures and build lookups for related data
         measures = data.get('included', [])

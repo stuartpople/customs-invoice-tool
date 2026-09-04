@@ -57,14 +57,28 @@ except ImportError:  # pragma: no cover - only during partial Streamlit deploys
             'data': data,
             'parts': parts,
         }
-from hmrc_api import HMRCTariffAPI
+from hmrc_api import HMRCTariffAPI, format_hs_for_sheet
 from countries import COUNTRIES, COMMON_COUNTRIES, COUNTRY_TO_ISO, normalize_items_country_fields
 from file_extractor import extract_from_file
 import shutil
 
 
 # Version tracking for cache busting
-APP_VERSION = "v3.33"
+APP_VERSION = "v3.34"
+
+
+def _normalize_items_hs_for_direction(items: list, direction: str) -> list:
+    """Force CN8 on export items (TARIC last-2 is HMRC-only, never on the sheet)."""
+    for it in items or []:
+        raw = it.get('commodity_code') or it.get('hs_code') or ''
+        if not raw:
+            continue
+        normalized = format_hs_for_sheet(raw, direction)
+        if normalized:
+            it['commodity_code'] = normalized
+            if it.get('hs_code'):
+                it['hs_code'] = normalized
+    return items
 
 
 def _coerce_dataframe_for_editor(df: pd.DataFrame) -> pd.DataFrame:
@@ -699,7 +713,9 @@ if uploaded_files and username:
         
         # Store non-PDF items if any
         if all_items:
-            st.session_state.line_items = normalize_items_country_fields(all_items)
+            st.session_state.line_items = normalize_items_country_fields(
+                _normalize_items_hs_for_direction(all_items, direction)
+            )
             st.session_state.non_pdf_processed = True
             st.session_state.process_message = f"✅ Extracted {len(all_items)} items"
         elif non_pdf_files:
@@ -1192,6 +1208,7 @@ elif st.session_state.processing_started and st.session_state.current_job_id:
                                 errors.append(f"PDF {idx} ({filename}): {result['error']}")
                             else:
                                 items = result.get('items', [])
+                                _normalize_items_hs_for_direction(items, direction)
                                 fmt = result.get('format_type', 'unknown')
                                 all_items.extend(items)
                                 if items:
@@ -1283,6 +1300,14 @@ elif st.session_state.processing_started and st.session_state.current_job_id:
                 st.error(f"❌ {result['error']}")
             else:
                 items = result.get('items', [])
+                _pdf_ids = st.session_state.get('pdf_job_ids') or (
+                    [st.session_state.current_job_id] if st.session_state.get('current_job_id') else []
+                )
+                _meta_dir = (
+                    processor.get_job_metadata(_pdf_ids[0]).get('direction', 'export')
+                    if _pdf_ids else 'export'
+                )
+                _normalize_items_hs_for_direction(items, _meta_dir)
                 
                 # Combine with any non-PDF items if they exist
                 non_pdf_items = st.session_state.get('line_items', [])

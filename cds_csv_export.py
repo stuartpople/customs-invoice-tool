@@ -13,6 +13,7 @@ from typing import Dict, List, Optional
 from openpyxl import Workbook, load_workbook
 from consolidation import group_by_commodity_code, consolidate_items
 from countries import normalize_country_iso
+from hmrc_api import format_hs_for_sheet, resolve_hmrc_data
 
 __all__ = [
     "CDS_MAX_ITEMS_PER_ENTRY",
@@ -217,8 +218,11 @@ def _build_cds_data_rows(
         countries = consolidated.get('countries_of_origin', [])
         country_orig = normalize_country_iso(countries[0] if countries else '')
 
+        # Sheet shows CN8 for export; HMRC cache may be keyed by 8 or 10 digits.
+        hmrc_info = resolve_hmrc_data(hmrc_data, commodity_code)
+        sheet_code = format_hs_for_sheet(commodity_code, direction)
+
         supp_units = ''
-        hmrc_info = hmrc_data.get(commodity_code, {})
         supp_raw = hmrc_info.get('supplementary_units', '')
         if supp_raw and supp_raw != 'Not required':
             supp_units = (
@@ -231,7 +235,7 @@ def _build_cds_data_rows(
         doc_list = list(doc_codes_dict.keys())[:3]
 
         row = [''] * NUM_COLUMNS
-        row[0] = commodity_code
+        row[0] = sheet_code
         row[1] = supp_units
         if is_export:
             row[2] = total_value

@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Dict, List, Optional
 import io
 from countries import normalize_country_iso
+from hmrc_api import format_hs_for_sheet, resolve_hmrc_data
 
 
 def _safe_float(value, default=0.0):
@@ -298,7 +299,7 @@ def create_comprehensive_export(
 
             row_data = {
                 'Description': description,
-                'Commodity Code': commodity_code,
+                'Commodity Code': format_hs_for_sheet(commodity_code, direction),
                 'Quantity': total_qty,
                 'UOM': first_item.get('uom', 'ea'),
                 'Value': total_value,
@@ -309,7 +310,7 @@ def create_comprehensive_export(
                 '_review_notes': '; '.join(review_notes) if review_notes else ''
             }
             
-            _write_row(ws, row_num, row_data, hmrc_data.get(commodity_code) if hmrc_data else None, 
+            _write_row(ws, row_num, row_data, resolve_hmrc_data(hmrc_data, commodity_code),
                       direction, thin_border, metadata)
             row_num += 1
     else:
@@ -327,7 +328,7 @@ def create_comprehensive_export(
             
             row_data = {
                 'Description': item.get('description', ''),
-                'Commodity Code': commodity_code,
+                'Commodity Code': format_hs_for_sheet(commodity_code, direction),
                 'Quantity': item.get('quantity', ''),
                 'UOM': item.get('uom', 'ea'),
                 'Value': item.get('total_value') or item.get('value', ''),
@@ -338,7 +339,7 @@ def create_comprehensive_export(
                 '_review_notes': item.get('review_notes', '')
             }
             
-            _write_row(ws, row_num, row_data, hmrc_data.get(commodity_code) if hmrc_data else None,
+            _write_row(ws, row_num, row_data, resolve_hmrc_data(hmrc_data, commodity_code),
                       direction, thin_border, metadata)
             row_num += 1
     
