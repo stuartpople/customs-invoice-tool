@@ -87,6 +87,31 @@ def test_invoice_number_ocr_ne_and_title():
     assert extract_invoice_number('Invoice number\n2221875953') == '2221875953'
 
 
+def test_invoice_number_skips_consignee_invoice_to():
+    from parse_coverage import extract_invoice_number
+    blob = """
+    Commercial Invoice
+    Consignee / Invoice To:
+    ACME IMPORTS LTD
+    22 Bolt Avenue
+    Invoice No: AE88421
+    Invoice Date: 07 September 2026
+    """
+    assert extract_invoice_number(blob) == 'AE88421'
+    assert extract_invoice_number('Consignee / Invoice To:\nACME LTD') != 'CONSIGNEE'
+    assert extract_invoice_number('Consignee / Invoice To:\nACME LTD') is None
+
+
+def test_export_cpc_defaults_to_1040():
+    from parse_coverage import extract_cpc_code, default_cpc
+    assert default_cpc('export') == '1040'
+    assert default_cpc('import') == '4000'
+    assert extract_cpc_code('', 'export') == '1040'
+    assert extract_cpc_code('CPC: 1000001 Perm Export / LIC99', 'export') == '1040'
+    assert extract_cpc_code('CPC: 1040', 'export') == '1040'
+    assert extract_cpc_code('Something CPC: 4000', 'export') == '1040'
+
+
 def test_wrap_row_without_hs_merges():
     from parse_coverage import is_table_overflow_line, merge_overflow_items
     assert is_table_overflow_line('LENGTH: 200mm BREAKLOAD: 1850kg', previous_has_hs=True)
@@ -121,5 +146,7 @@ if __name__ == '__main__':
     test_invoice_total_and_gap_warning()
     test_not_commodity()
     test_invoice_number_ocr_ne_and_title()
+    test_invoice_number_skips_consignee_invoice_to()
+    test_export_cpc_defaults_to_1040()
     test_wrap_row_without_hs_merges()
     print('ok')

@@ -246,6 +246,15 @@ def _build_cds_data_rows(
             row[3] = total_value
         row[4] = description
         row[5] = net_weight
+        cpc = (
+            metadata.get('cpc_code')
+            or ('1040' if is_export else '4000')
+        )
+        if is_export and str(cpc) in ('4000', '1000', ''):
+            cpc = '1040'
+        if (not is_export) and str(cpc) in ('1040', '1000', ''):
+            cpc = '4000'
+        row[6] = cpc
         row[7] = gross_weight
         row[9] = package_type if package_type else 'PK'
         row[10] = package_count

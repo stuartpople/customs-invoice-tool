@@ -199,7 +199,7 @@ def extract_from_file_with_progress(file_obj, filename: str, trade_direction: st
             metadata['cpc_code'] = '4000'  # Free circulation (default for imports)
             metadata['valuation_method'] = '1'  # Transaction value (Method 1)
         else:  # export
-            metadata['cpc_code'] = '1000'  # Permanent export (default for exports)
+            metadata['cpc_code'] = '1040'  # Permanent export
         
         return text, items, metadata
     else:
@@ -754,7 +754,7 @@ def extract_from_file(file_obj, filename: str, trade_direction: str = "export") 
             }
         else:  # export
             metadata = {
-                'cpc_code': '1000',  # Permanent export
+                'cpc_code': '1040',  # Permanent export
                 'incoterm': None,
                 'currency': 'GBP',
                 'total_invoice_value': None,

@@ -486,7 +486,9 @@ def _write_row(ws, row_num: int, row_data: Dict, hmrc_info: Optional[Dict],
             
         else:  # import
             # CPC Code (Customs Procedure Code)
-            cpc_code = metadata.get('cpc_code', '4000')
+            cpc_code = metadata.get('cpc_code') or '4000'
+            if (direction or '').lower() == 'export' and str(cpc_code) in ('4000', '1000', ''):
+                cpc_code = '1040'
             ws.cell(row=row_num, column=col_num).value = cpc_code
             col_num += 1
             

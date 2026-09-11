@@ -76,7 +76,7 @@ import shutil
 
 
 # Version tracking for cache busting
-APP_VERSION = "v3.38"
+APP_VERSION = "v3.39"
 
 
 def _normalize_items_hs_for_direction(items: list, direction: str) -> list:
@@ -93,7 +93,7 @@ def _normalize_items_hs_for_direction(items: list, direction: str) -> list:
     return items
 
 
-def _export_invoice_metadata() -> dict:
+def _export_invoice_metadata(direction: str | None = None) -> dict:
     """Invoice header for FCL/Excel, including the edited Prv Doc Reference."""
     meta = dict(st.session_state.get('invoice_metadata') or {})
     typed = (
@@ -105,6 +105,16 @@ def _export_invoice_metadata() -> dict:
     typed = str(typed).strip()
     if typed:
         meta['invoice_number'] = typed
+    direction = (direction or meta.get('direction') or '').lower()
+    cpc = str(meta.get('cpc_code') or '')
+    if direction == 'export':
+        if cpc in ('', '4000', '1000'):
+            meta['cpc_code'] = '1040'
+    elif direction == 'import':
+        if cpc in ('', '1040', '1000'):
+            meta['cpc_code'] = '4000'
+    elif not cpc:
+        meta['cpc_code'] = '1040'
     return meta
 
 
@@ -961,8 +971,7 @@ if st.session_state.get('non_pdf_processed', False):
             if st.button("📥 Export to Excel", use_container_width=True,
                          key="excel_export_btn"):
                 # Create comprehensive Excel export with HMRC data
-                _inv_meta = _export_invoice_metadata()
-                _inv_meta = {**_inv_meta, 'cpc_code': '1040' if current_direction == 'export' else '4000'}
+                _inv_meta = _export_invoice_metadata(current_direction)
                 excel_bytes = create_comprehensive_export(
                     items=display_items,
                     hmrc_data=_apply_selected_doc_codes(hmrc_results),
@@ -986,8 +995,7 @@ if st.session_state.get('non_pdf_processed', False):
                          key="excel_cds_btn",
                          help="Export in CDS Customs Entry Worksheet format (auto-splits over 99 lines)."):
                 # FCL export uses the same consolidation as standard Excel
-                _inv_meta = _export_invoice_metadata()
-                _inv_meta = {**_inv_meta, 'cpc_code': '1040' if current_direction == 'export' else '4000'}
+                _inv_meta = _export_invoice_metadata(current_direction)
                 _parts = create_cds_excel_parts(
                     items=display_items,
                     direction=current_direction,
@@ -1641,8 +1649,14 @@ elif st.session_state.processing_started and st.session_state.current_job_id:
                             st.session_state.invoice_metadata['invoice_number'] = _typed
                             st.session_state.invoice_number_input = _typed
                         with col2:
-                            cpc = invoice_meta.get('cpc_code', '4000')
-                            st.metric("CPC Code", cpc, help="Customs Procedure Code")
+                            cpc = (
+                                invoice_meta.get('cpc_code')
+                                or ('1040' if _meta_dir == 'export' else '4000')
+                            )
+                            if _meta_dir == 'export' and str(cpc) in ('4000', '1000'):
+                                cpc = '1040'
+                                st.session_state.invoice_metadata['cpc_code'] = '1040'
+                            st.metric("CPC Code", cpc, help="Customs Procedure Code — 1040 permanent export, 4000 import free circulation")
                         with col3:
                             val_method = invoice_meta.get('valuation_method', '1')
                             st.metric("Valuation Method", f"Method{val_method}", help="1 = Transaction Value")
@@ -1738,7 +1752,7 @@ elif st.session_state.processing_started and st.session_state.current_job_id:
                             hmrc_results = st.session_state.get('hmrc_results', None)
                             
                             # Get invoice metadata if available
-                            invoice_metadata = _export_invoice_metadata()
+                            invoice_metadata = _export_invoice_metadata(metadata.get('direction', 'export'))
                             
                             # Create comprehensive Excel export
                             excel_bytes = create_comprehensive_export(
@@ -1762,7 +1776,7 @@ elif st.session_state.processing_started and st.session_state.current_job_id:
                                      help="Export in CDS Customs Entry Worksheet format (auto-splits over 99 lines)."):
                             metadata = processor.get_job_metadata(job_id)
                             hmrc_results = st.session_state.get('hmrc_results', None)
-                            invoice_metadata = _export_invoice_metadata()
+                            invoice_metadata = _export_invoice_metadata(metadata.get('direction', 'export'))
                             
                             # Export respects the consolidation choice:
                             # - If consolidated: pass consolidated df with consolidate=False

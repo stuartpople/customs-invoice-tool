@@ -624,14 +624,19 @@ def extract_invoice_metadata(text: str) -> Dict:
     except Exception:
         inv_number = None
     if not inv_number:
-        # Legacy fallbacks — 10-digit near label, then alphanumeric
-        _inv_stop_words = {'RECHNUNG', 'FACTURE', 'FACTURA', 'NUMBER', 'DATE', 'REF', 'PAGE'}
+        # Legacy fallbacks — 10-digit near label, then alphanumeric IDs that
+        # contain digits (never 'CONSIGNEE' from 'Consignee / Invoice To').
+        try:
+            from parse_coverage import looks_like_invoice_id as _ok_inv
+        except Exception:
+            def _ok_inv(c):
+                return bool(c) and any(ch.isdigit() for ch in c)
         m = re.search(r'(?:invoice\s*(?:no|number|#)).{0,120}?(\b\d{10}\b)', text, re.IGNORECASE | re.DOTALL)
-        if m and m.group(1).upper() not in _inv_stop_words:
+        if m and _ok_inv(m.group(1)):
             inv_number = m.group(1)
         if not inv_number:
             m = re.search(r'(?:invoice\s*(?:no|number|#))[\s:]*([A-Z0-9-]{3,})', text, re.IGNORECASE)
-            if m and m.group(1).upper() not in _inv_stop_words:
+            if m and _ok_inv(m.group(1)):
                 inv_number = m.group(1)
     metadata['invoice_number'] = inv_number
 

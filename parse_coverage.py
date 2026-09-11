@@ -246,16 +246,30 @@ _INV_STOP = frozenset({
     'N0', 'PAGE', 'ADDRESS', 'TOTAL', 'COMMERCIAL', 'TERMS', 'DUE', 'VAT',
     'FROM', 'THE', 'AND', 'FOR', 'SHIPMENT', 'EXPORT', 'IMPORT', 'VALUE',
     'AMOUNT', 'INVOICE', 'INV', 'SIN', 'GB', 'UK', 'OF', 'TO',
+    'CONSIGNEE', 'EXPORTER', 'IMPORTER', 'SHIPPER', 'BUYER', 'SELLER',
+    'CUSTOMER', 'SUPPLIER', 'COMPANY', 'ACCOUNT',
 })
 
-# Invoice No / Nr / Ne (OCR of No) / Number / #  then SIN134283 or 10-digit
+# Party-role lines that contain the word Invoice but are not the invoice number
+_PARTY_INVOICE_LINE_RE = re.compile(
+    r'consignee\s*/\s*invoice|'
+    r'invoice\s+to\b|'
+    r'invoice\s+address|'
+    r'invoice\s+for\b|'
+    r'bill\s+to\b|'
+    r'sold\s+to\b|'
+    r'ship(?:ped)?\s+to\b',
+    re.IGNORECASE,
+)
+
+# Invoice No / Nr / Ne (OCR of No) / Number / Ref / #  then SIN134283 or 6+ digits
 _INV_LABEL_ID_RE = re.compile(
-    r'(?:invoice|inv)\s*(?:no\.?|nr\.?|ne|n0|num(?:ber)?|#)\s*[:.\-]?\s*'
+    r'(?:invoice|inv)\s*(?:no\.?|nr\.?|ne|n0|num(?:ber)?|ref(?:erence)?|#)\s*[:.\-]?\s*'
     r'([A-Z]{2,8}[-/]?\d{2,}[A-Z0-9\-/]*|\d{6,12})',
     re.IGNORECASE,
 )
 _INV_LABEL_RE = re.compile(
-    r'(?:invoice|inv)\s*(?:no\.?|nr\.?|ne|n0|num(?:ber)?|#)\b',
+    r'(?:invoice|inv)\s*(?:no\.?|nr\.?|ne|n0|num(?:ber)?|ref(?:erence)?|#)\b',
     re.IGNORECASE,
 )
 _INV_ID_RE = re.compile(
@@ -273,6 +287,8 @@ def looks_like_invoice_id(candidate: str) -> bool:
     cand = (candidate or '').strip().strip('.:#')
     if not cand or cand.upper() in _INV_STOP:
         return False
+    if not re.search(r'\d', cand):
+        return False
     if re.fullmatch(r'[A-Z]{2,8}[-/]?\d{2,}[A-Z0-9\-/]*', cand, re.I):
         return True
     if re.fullmatch(r'\d{6,12}', cand):
@@ -287,20 +303,29 @@ def extract_invoice_number(text: str) -> Optional[str]:
     """Find the commercial invoice number for CDS previous-document (Z/380).
 
     Handles two-column headers and OCR (`Invoice Ne: SIN134283`). Ignores the
-    'Commercial Invoice' title and Invoice Date / Due Date labels.
+    'Commercial Invoice' title, Invoice Date / Due Date, and party labels
+    like 'Consignee / Invoice To:'.
     """
     if not text:
         return None
-    # Same-line labelled IDs anywhere (repeats on each Marlow page)
-    for m in _INV_LABEL_ID_RE.finditer(text):
-        cand = m.group(1)
-        if looks_like_invoice_id(cand):
-            return cand.upper() if re.search(r'[A-Za-z]', cand) else cand
+
+    def _norm(cand: str) -> str:
+        return cand.upper() if re.search(r'[A-Za-z]', cand) else cand
+
     lines = text.splitlines()
-    for i, line in enumerate(lines):
-        if re.search(r'commercial\s+invoice\s*$', line.strip(), re.I):
+    for line in lines:
+        if _PARTY_INVOICE_LINE_RE.search(line):
             continue
-        if re.search(r'invoice\s+date|invoice\s+due', line, re.I) and not _INV_LABEL_RE.search(line):
+        m = _INV_LABEL_ID_RE.search(line)
+        if m and looks_like_invoice_id(m.group(1)):
+            return _norm(m.group(1))
+
+    for i, line in enumerate(lines):
+        if _PARTY_INVOICE_LINE_RE.search(line):
+            continue
+        if re.search(r'commercial\s+invoice', line, re.I):
+            continue
+        if re.search(r'invoice\s+date|invoice\s+due', line, re.I):
             continue
         if not _INV_LABEL_RE.search(line):
             continue
@@ -308,8 +333,47 @@ def extract_invoice_number(text: str) -> Optional[str]:
         for m in _INV_ID_RE.finditer(window):
             cand = m.group(1)
             if looks_like_invoice_id(cand):
-                return cand.upper() if re.search(r'[A-Za-z]', cand) else cand
+                return _norm(cand)
     return None
+
+
+_KNOWN_FOUR_DIGIT_CPC = frozenset({
+    '1040', '1000', '2100', '2200', '2300', '3151',
+    '4000', '4071', '4200', '4400', '5100', '5171',
+    '5300', '6110', '7100',
+})
+
+
+def default_cpc(direction: str) -> str:
+    """CDS requested procedure: 1040 permanent export, 4000 free-circulation import."""
+    return '1040' if (direction or '').lower() == 'export' else '4000'
+
+
+def extract_cpc_code(text: str, direction: str = 'export') -> str:
+    """CPC from the invoice when stated; otherwise 1040 export / 4000 import.
+
+    Ignores 7-digit strings like Marlow 'CPC: 1000001' (procedure+additional)
+    so they are not truncated to 1000.
+    """
+    blob = text or ''
+    labelled = re.search(r'\bCPC\s*:?\s*(\d{4})(?!\d)', blob, re.IGNORECASE)
+    if labelled and labelled.group(1) in _KNOWN_FOUR_DIGIT_CPC:
+        code = labelled.group(1)
+        if (direction or '').lower() == 'export' and code == '4000':
+            return '1040'
+        if (direction or '').lower() == 'import' and code == '1040':
+            return '4000'
+        return code
+    seven = re.search(r'\bCPC\s*:?\s*(\d{7})\b', blob, re.IGNORECASE)
+    if seven:
+        raw = seven.group(1)
+        if raw.startswith('10'):
+            return '1040'
+        if raw.startswith('40'):
+            return '4000'
+    if re.search(r'perm(?:anent)?\s+export|direct\s+export', blob, re.I):
+        return '1040'
+    return default_cpc(direction)
 
 
 def line_has_commodity_hs(line: str) -> bool:

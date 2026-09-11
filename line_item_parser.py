@@ -485,6 +485,7 @@ class LineItemParser:
             from parse_coverage import (
                 cn8 as _cn8,
                 coverage_warnings,
+                extract_cpc_code,
                 extract_invoice_number,
                 harvest_hs_rows,
                 invoice_total_hint,
@@ -564,6 +565,7 @@ class LineItemParser:
             meta = {}
         if inv_no:
             meta['invoice_number'] = inv_no
+        meta['cpc_code'] = extract_cpc_code(all_text, direction)
         if inv_total and not meta.get('total_invoice_value'):
             meta['total_invoice_value'] = inv_total
 
