@@ -73,9 +73,53 @@ def test_not_commodity():
     assert is_commodity_hs('56074911')
 
 
+def test_invoice_number_ocr_ne_and_title():
+    from parse_coverage import extract_invoice_number
+    blob = """
+    Commercial Invoice
+    Page 1 of 4
+    Phone: +44 (0) 1323 444444 Fax: +44 (0) 1323 444455 Invoice Ne: SIN134283
+    Invoice Date: 07 September 2026
+    VAT No: GB 377109145
+    """
+    assert extract_invoice_number(blob) == 'SIN134283'
+    assert extract_invoice_number('Invoice No: INV-2026-001\nDate: 2026-04-20') == 'INV-2026-001'
+    assert extract_invoice_number('Invoice number\n2221875953') == '2221875953'
+
+
+def test_wrap_row_without_hs_merges():
+    from parse_coverage import is_table_overflow_line, merge_overflow_items
+    assert is_table_overflow_line('LENGTH: 200mm BREAKLOAD: 1850kg', previous_has_hs=True)
+    assert not is_table_overflow_line(
+        'WSS210 SOFT SHACKLE 4mm 2 EA 5607491100 GB 14.53',
+        previous_has_hs=True,
+    )
+    items = [
+        {
+            'stock_number': 'WSS210',
+            'description': 'SOFT SHACKLE 4mm D12 BLK - PK OF 2',
+            'quantity': '2',
+            'total_value': '14.53',
+            'commodity_code': '56074911',
+        },
+        {
+            'stock_number': '',
+            'description': 'LENGTH: 200mm BREAKLOAD: 1850kg',
+            'quantity': '',
+            'total_value': '',
+            'commodity_code': '',
+        },
+    ]
+    merged = merge_overflow_items(items)
+    assert len(merged) == 1
+    assert 'LENGTH: 200mm' in merged[0]['description']
+
+
 if __name__ == '__main__':
     test_ignores_bank_account_as_hs()
     test_harvest_recovers_missed_hs()
     test_invoice_total_and_gap_warning()
     test_not_commodity()
+    test_invoice_number_ocr_ne_and_title()
+    test_wrap_row_without_hs_merges()
     print('ok')

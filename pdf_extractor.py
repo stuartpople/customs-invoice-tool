@@ -617,26 +617,22 @@ def extract_invoice_metadata(text: str) -> Dict:
         elif re.search(r'\bpallet(?:s)?\b', text, re.IGNORECASE):
             metadata['package_type'] = 'Pallet'
     
-    # Extract invoice number
-    # RS Components: "Invoice number" label appears as a column header; the actual
-    # number (10 digits) appears on the next line. Use re.DOTALL so \D spans newlines.
-    _inv_stop_words = {'RECHNUNG', 'FACTURE', 'FACTURA', 'NUMBER', 'DATE', 'REF'}
-    inv_number = None
-    # Pattern 1: 10-digit invoice number within 120 chars of the label (spans newlines via re.DOTALL)
-    # Uses non-greedy .{0,120}? to find the first 10-digit number after the label
-    # RS Components format: label is on line 1, actual number appears after VAT reg on line 2
-    m = re.search(r'(?:invoice\s*(?:no|number|#)).{0,120}?(\b\d{10}\b)', text, re.IGNORECASE | re.DOTALL)
-    if m and m.group(1).upper() not in _inv_stop_words:
-        inv_number = m.group(1)
+    # Extract invoice number (SIN134283, 10-digit RS, OCR "Invoice Ne")
+    try:
+        from parse_coverage import extract_invoice_number as _extract_inv
+        inv_number = _extract_inv(text)
+    except Exception:
+        inv_number = None
     if not inv_number:
-        # Pattern 2: alphanumeric ID immediately after the label
-        m = re.search(r'(?:invoice\s*(?:no|number|#))[\s:]*([A-Z0-9-]{3,})', text, re.IGNORECASE)
+        # Legacy fallbacks — 10-digit near label, then alphanumeric
+        _inv_stop_words = {'RECHNUNG', 'FACTURE', 'FACTURA', 'NUMBER', 'DATE', 'REF', 'PAGE'}
+        m = re.search(r'(?:invoice\s*(?:no|number|#)).{0,120}?(\b\d{10}\b)', text, re.IGNORECASE | re.DOTALL)
         if m and m.group(1).upper() not in _inv_stop_words:
             inv_number = m.group(1)
-    if not inv_number:
-        m = re.search(r'invoice[\s:]*([A-Z0-9-]{3,})', text, re.IGNORECASE)
-        if m and m.group(1).upper() not in _inv_stop_words:
-            inv_number = m.group(1)
+        if not inv_number:
+            m = re.search(r'(?:invoice\s*(?:no|number|#))[\s:]*([A-Z0-9-]{3,})', text, re.IGNORECASE)
+            if m and m.group(1).upper() not in _inv_stop_words:
+                inv_number = m.group(1)
     metadata['invoice_number'] = inv_number
 
     # Extract invoice date

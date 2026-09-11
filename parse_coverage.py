@@ -239,3 +239,123 @@ def coverage_warnings(
                 f'({gap:.0%} off) — rows are probably missing.'
             )
     return doc_hs, parsed_hs, warnings
+
+
+_INV_STOP = frozenset({
+    'RECHNUNG', 'FACTURE', 'FACTURA', 'NUMBER', 'DATE', 'REF', 'NO', 'NR', 'NE',
+    'N0', 'PAGE', 'ADDRESS', 'TOTAL', 'COMMERCIAL', 'TERMS', 'DUE', 'VAT',
+    'FROM', 'THE', 'AND', 'FOR', 'SHIPMENT', 'EXPORT', 'IMPORT', 'VALUE',
+    'AMOUNT', 'INVOICE', 'INV', 'SIN', 'GB', 'UK', 'OF', 'TO',
+})
+
+# Invoice No / Nr / Ne (OCR of No) / Number / #  then SIN134283 or 10-digit
+_INV_LABEL_ID_RE = re.compile(
+    r'(?:invoice|inv)\s*(?:no\.?|nr\.?|ne|n0|num(?:ber)?|#)\s*[:.\-]?\s*'
+    r'([A-Z]{2,8}[-/]?\d{2,}[A-Z0-9\-/]*|\d{6,12})',
+    re.IGNORECASE,
+)
+_INV_LABEL_RE = re.compile(
+    r'(?:invoice|inv)\s*(?:no\.?|nr\.?|ne|n0|num(?:ber)?|#)\b',
+    re.IGNORECASE,
+)
+_INV_ID_RE = re.compile(
+    r'\b([A-Z]{2,8}[-/]?\d{2,}[A-Z0-9\-/]*|\d{6,12})\b',
+    re.IGNORECASE,
+)
+_OVERFLOW_PREFIX_RE = re.compile(
+    r'^(LENGTH|WIDTH|HEIGHT|DEPTH|BREAKLOAD|COLOUR|COLOR|SIZE|DIMS?|'
+    r'WEIGHT|NETT?|GROSS|NOTE[S]?|BATCH|LOT|SERIAL|DESC(?:RIPTION)?)\b',
+    re.IGNORECASE,
+)
+
+
+def looks_like_invoice_id(candidate: str) -> bool:
+    cand = (candidate or '').strip().strip('.:#')
+    if not cand or cand.upper() in _INV_STOP:
+        return False
+    if re.fullmatch(r'[A-Z]{2,8}[-/]?\d{2,}[A-Z0-9\-/]*', cand, re.I):
+        return True
+    if re.fullmatch(r'\d{6,12}', cand):
+        # Phone / VAT / sort-code fragments
+        if cand.startswith(('1323', '377109', '4470', '44')):
+            return False
+        return 6 <= len(cand) <= 12
+    return False
+
+
+def extract_invoice_number(text: str) -> Optional[str]:
+    """Find the commercial invoice number for CDS previous-document (Z/380).
+
+    Handles two-column headers and OCR (`Invoice Ne: SIN134283`). Ignores the
+    'Commercial Invoice' title and Invoice Date / Due Date labels.
+    """
+    if not text:
+        return None
+    # Same-line labelled IDs anywhere (repeats on each Marlow page)
+    for m in _INV_LABEL_ID_RE.finditer(text):
+        cand = m.group(1)
+        if looks_like_invoice_id(cand):
+            return cand.upper() if re.search(r'[A-Za-z]', cand) else cand
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        if re.search(r'commercial\s+invoice\s*$', line.strip(), re.I):
+            continue
+        if re.search(r'invoice\s+date|invoice\s+due', line, re.I) and not _INV_LABEL_RE.search(line):
+            continue
+        if not _INV_LABEL_RE.search(line):
+            continue
+        window = ' '.join(lines[i:i + 3])
+        for m in _INV_ID_RE.finditer(window):
+            cand = m.group(1)
+            if looks_like_invoice_id(cand):
+                return cand.upper() if re.search(r'[A-Za-z]', cand) else cand
+    return None
+
+
+def line_has_commodity_hs(line: str) -> bool:
+    for m in _HS_RE.finditer(line or ''):
+        if is_commodity_hs(m.group(1)):
+            return True
+    return False
+
+
+def is_table_overflow_line(line: str, previous_has_hs: bool = True) -> bool:
+    """True when a table row is wrapped description, not a new item.
+
+    A new item has its own HS code (or qty+UoM+money). Overflow is LENGTH:/
+    BREAKLOAD, a continuation sentence, or any SKU-like start with no HS
+    once the previous item already captured its code.
+    """
+    s = (line or '').strip().lstrip('~-_|• ')
+    if not s:
+        return True
+    if line_has_commodity_hs(s):
+        return False
+    if _QTY_UOM_RE.search(s) and _MONEY_RE.search(s):
+        return False
+    if _OVERFLOW_PREFIX_RE.match(s) or re.match(r'^[a-z(]', s):
+        return True
+    # No HS on this row and the line above already had one → wrapped cell
+    return bool(previous_has_hs)
+
+
+def merge_overflow_items(items: List[Dict]) -> List[Dict]:
+    """Fold HS-less wrap rows into the previous goods line."""
+    if not items:
+        return items
+    out: List[Dict] = []
+    for it in items:
+        code = cn8(it.get('commodity_code') or it.get('hs_code') or '')
+        desc = (it.get('description') or '').strip()
+        tot = parse_money(str(it.get('total_value') or ''))
+        if len(code) == 8 and is_commodity_hs(code):
+            out.append(it)
+            continue
+        if out and (not tot or is_table_overflow_line(desc, previous_has_hs=True)):
+            prev = out[-1]
+            extra = desc or (it.get('stock_number') or '')
+            if extra and extra.lower() not in (prev.get('description') or '').lower():
+                prev['description'] = ((prev.get('description') or '') + ' ' + extra).strip()
+            continue
+        out.append(it)
+    return out

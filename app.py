@@ -76,7 +76,7 @@ import shutil
 
 
 # Version tracking for cache busting
-APP_VERSION = "v3.37"
+APP_VERSION = "v3.38"
 
 
 def _normalize_items_hs_for_direction(items: list, direction: str) -> list:
@@ -91,6 +91,21 @@ def _normalize_items_hs_for_direction(items: list, direction: str) -> list:
             if it.get('hs_code'):
                 it['hs_code'] = normalized
     return items
+
+
+def _export_invoice_metadata() -> dict:
+    """Invoice header for FCL/Excel, including the edited Prv Doc Reference."""
+    meta = dict(st.session_state.get('invoice_metadata') or {})
+    typed = (
+        st.session_state.get('invoice_number_field')
+        or st.session_state.get('invoice_number_input')
+        or meta.get('invoice_number')
+        or ''
+    )
+    typed = str(typed).strip()
+    if typed:
+        meta['invoice_number'] = typed
+    return meta
 
 
 def _coerce_dataframe_for_editor(df: pd.DataFrame) -> pd.DataFrame:
@@ -946,7 +961,7 @@ if st.session_state.get('non_pdf_processed', False):
             if st.button("📥 Export to Excel", use_container_width=True,
                          key="excel_export_btn"):
                 # Create comprehensive Excel export with HMRC data
-                _inv_meta = st.session_state.get('invoice_metadata', {})
+                _inv_meta = _export_invoice_metadata()
                 _inv_meta = {**_inv_meta, 'cpc_code': '1040' if current_direction == 'export' else '4000'}
                 excel_bytes = create_comprehensive_export(
                     items=display_items,
@@ -971,7 +986,7 @@ if st.session_state.get('non_pdf_processed', False):
                          key="excel_cds_btn",
                          help="Export in CDS Customs Entry Worksheet format (auto-splits over 99 lines)."):
                 # FCL export uses the same consolidation as standard Excel
-                _inv_meta = st.session_state.get('invoice_metadata', {})
+                _inv_meta = _export_invoice_metadata()
                 _inv_meta = {**_inv_meta, 'cpc_code': '1040' if current_direction == 'export' else '4000'}
                 _parts = create_cds_excel_parts(
                     items=display_items,
@@ -1224,6 +1239,18 @@ elif st.session_state.processing_started and st.session_state.current_job_id:
                                 _normalize_items_hs_for_direction(items, direction)
                                 fmt = result.get('format_type', 'unknown')
                                 all_items.extend(items)
+                                _meta = dict(result.get('metadata') or {})
+                                if result.get('invoice_number'):
+                                    _meta['invoice_number'] = result['invoice_number']
+                                if _meta:
+                                    st.session_state.invoice_metadata = {
+                                        **st.session_state.get('invoice_metadata', {}),
+                                        **{k: v for k, v in _meta.items() if v not in (None, '')},
+                                    }
+                                    st.session_state.invoice_number_input = str(
+                                        st.session_state.invoice_metadata.get('invoice_number') or ''
+                                    )
+                                    st.session_state.invoice_number_field = st.session_state.invoice_number_input
                                 if items:
                                     pw = result.get('parse_warning')
                                     hs_doc = result.get('hs_in_document') or []
@@ -1602,6 +1629,17 @@ elif st.session_state.processing_started and st.session_state.current_job_id:
                         with col1:
                             incoterm = invoice_meta.get('incoterm', 'Not found')
                             st.metric("Incoterm", incoterm if incoterm else "Not found")
+                        if 'invoice_number_field' not in st.session_state:
+                            st.session_state.invoice_number_field = str(invoice_meta.get('invoice_number') or '')
+                        st.text_input(
+                            "Invoice number (FCL Prv Doc Reference / Z-380)",
+                            help="Written to Previous Document Reference on the FCL sheet (class Z, type 380).",
+                            key="invoice_number_field",
+                        )
+                        _typed = str(st.session_state.get('invoice_number_field') or '').strip()
+                        if _typed:
+                            st.session_state.invoice_metadata['invoice_number'] = _typed
+                            st.session_state.invoice_number_input = _typed
                         with col2:
                             cpc = invoice_meta.get('cpc_code', '4000')
                             st.metric("CPC Code", cpc, help="Customs Procedure Code")
@@ -1700,7 +1738,7 @@ elif st.session_state.processing_started and st.session_state.current_job_id:
                             hmrc_results = st.session_state.get('hmrc_results', None)
                             
                             # Get invoice metadata if available
-                            invoice_metadata = st.session_state.get('invoice_metadata', {})
+                            invoice_metadata = _export_invoice_metadata()
                             
                             # Create comprehensive Excel export
                             excel_bytes = create_comprehensive_export(
@@ -1724,7 +1762,7 @@ elif st.session_state.processing_started and st.session_state.current_job_id:
                                      help="Export in CDS Customs Entry Worksheet format (auto-splits over 99 lines)."):
                             metadata = processor.get_job_metadata(job_id)
                             hmrc_results = st.session_state.get('hmrc_results', None)
-                            invoice_metadata = st.session_state.get('invoice_metadata', {})
+                            invoice_metadata = _export_invoice_metadata()
                             
                             # Export respects the consolidation choice:
                             # - If consolidated: pass consolidated df with consolidate=False

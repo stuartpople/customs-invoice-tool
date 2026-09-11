@@ -485,9 +485,12 @@ class LineItemParser:
             from parse_coverage import (
                 cn8 as _cn8,
                 coverage_warnings,
+                extract_invoice_number,
                 harvest_hs_rows,
+                invoice_total_hint,
                 item_key,
                 items_total,
+                merge_overflow_items,
             )
         except ImportError:
             items = self._postprocess_items(items or [])
@@ -503,6 +506,7 @@ class LineItemParser:
             return result
 
         items = [self._coerce_parser_item(it) for it in (items or [])]
+        items = merge_overflow_items(items)
         items = self._postprocess_items(items)
         pad_to_10 = (direction or "").lower() == "import"
         currency = "GBP" if re.search(r"\bGBP\b", all_text or "") else "USD"
@@ -548,6 +552,21 @@ class LineItemParser:
         if extra_warning:
             warnings = [extra_warning] + list(warnings)
 
+        inv_no = extract_invoice_number(all_text)
+        inv_total = invoice_total_hint(all_text)
+        meta: Dict = {}
+        try:
+            from pdf_extractor import extract_invoice_metadata
+            meta = {
+                k: v for k, v in (extract_invoice_metadata(all_text) or {}).items() if v
+            }
+        except Exception:
+            meta = {}
+        if inv_no:
+            meta['invoice_number'] = inv_no
+        if inv_total and not meta.get('total_invoice_value'):
+            meta['total_invoice_value'] = inv_total
+
         result = {
             "total_items": len(items),
             "items": items,
@@ -557,6 +576,8 @@ class LineItemParser:
             "hs_in_document": sorted(doc_hs),
             "hs_parsed": sorted(parsed_hs),
             "line_total": items_total(items),
+            "invoice_number": meta.get('invoice_number') or '',
+            "metadata": meta,
         }
         if warnings:
             result["parse_warning"] = " ".join(warnings)
@@ -2929,6 +2950,21 @@ class LineItemParser:
 
             item_m = _item_re.match(line)
             if item_m:
+                pending_has_hs = any(
+                    _is_commodity_hs(m.group(1))
+                    for buf in pending_lines
+                    for m in _hs_re.finditer(buf)
+                )
+                try:
+                    from parse_coverage import is_table_overflow_line as _is_overflow
+                    overflow = _is_overflow(line, previous_has_hs=pending_has_hs)
+                except ImportError:
+                    overflow = pending_has_hs and not any(
+                        _is_commodity_hs(m.group(1)) for m in _hs_re.finditer(line)
+                    )
+                if pending_no and overflow:
+                    pending_lines.append(line)
+                    continue
                 _flush()
                 pending_no = item_m.group(1).upper()
                 pending_lines = [line[item_m.end():].strip()]
