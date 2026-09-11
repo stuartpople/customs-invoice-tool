@@ -287,14 +287,10 @@ _BANK_CONTEXT_RE = re.compile(
     r'account\s+no|barclays|hsbc|natwest|lloyds|bank\s*:)\b',
     re.IGNORECASE,
 )
-_SKIP_ROW_LABELS = frozenset({
+_COL_HEADERS = frozenset({
     'tax', 'point', 'page', 'of', '1', 'number', 'no', 'nr', 'ne', 'n0',
-})
-_STOP_FIELD_LABELS = frozenset({
-    'account', 'acc', 'a/c', 'a/c.', 'sort', 'iban', 'swift', 'bic', 'bank',
-    'your', 'our', 'order', 'po', 'p.o', 'p.o.', 'vat', 'payment', 'barclays',
-    'hsbc', 'natwest', 'lloyds', 'customer', 'delivery', 'terms', 'currency',
-    'code', 'ref', 'reference', 'date', 'due', 'from', 'to',
+    'account', 'acc', 'a/c', 'a/c.', 'date', 'your', 'our', 'ref', 'reference',
+    'order', 'vat', 'code', 'customer', 'delivery', 'terms', 'currency',
 })
 _OVERFLOW_PREFIX_RE = re.compile(
     r'^(LENGTH|WIDTH|HEIGHT|DEPTH|BREAKLOAD|COLOUR|COLOR|SIZE|DIMS?|'
@@ -350,28 +346,51 @@ def _norm_invoice_id(cand: str) -> str:
     return cand.upper() if re.search(r'[A-Za-z]', cand) else cand
 
 
+def _token_key(tok: str) -> str:
+    return tok.strip('.:#|,;').lower().rstrip('.')
+
+
+def _is_letter_invoice_id(cand: str) -> bool:
+    """INV00017249 / SIN134283 / AE88421 — not an 8-digit bank/account number."""
+    cand = (cand or '').strip().strip('.:#')
+    if looks_like_po(cand) or _POSTCODE_OUTWARD_RE.fullmatch(cand):
+        return False
+    return bool(re.fullmatch(r'[A-Z]{1,10}[-/]?\d{2,}[A-Z0-9\-/]*', cand, re.I))
+
+
 def _id_after_invoice_no_label(span: str) -> Optional[str]:
-    """Value sitting next to 'Invoice No' — stop at Account No / bank 'No:'."""
-    window = span[:120]
-    glued = _INV_SPACED_RE.match(window.lstrip(' :.-'))
-    if glued:
-        cand = f"{glued.group(1)}{glued.group(2)}"
-        if looks_like_invoice_id(cand, window):
+    """Value for Invoice No:.
+
+    1. Token immediately after the label (Invoice No: INV000 / 88421).
+    2. After a header row (Date / Account / Your Ref), the first letter+digit
+       ref — never the 8-digit Account No that follows those labels.
+    """
+    tokens = [
+        t.strip('.:#|,;')
+        for t in re.split(r'\s+', span[:180].strip())
+        if t.strip('.:#|,;')
+    ]
+    i = 0
+    saw_account = False
+    while i < len(tokens) and _token_key(tokens[i]) in _COL_HEADERS:
+        if _token_key(tokens[i]) in ('account', 'acc', 'a/c', 'a/c.'):
+            saw_account = True
+        i += 1
+    if i < len(tokens) - 1 and re.fullmatch(r'[A-Za-z]{1,8}', tokens[i]) and tokens[i + 1].isdigit():
+        glued = tokens[i] + tokens[i + 1]
+        if _is_letter_invoice_id(glued) and looks_like_invoice_id(glued, span):
+            return _norm_invoice_id(glued)
+    if i < len(tokens):
+        cand = tokens[i]
+        if looks_like_invoice_id(cand, span) and not (
+            saw_account and re.fullmatch(r'\d{8}', cand)
+        ):
             return _norm_invoice_id(cand)
-    for tok in re.split(r'\s+', window.strip()):
-        clean = tok.strip('.:#|,;')
-        if not clean:
+    for cand in tokens[i:]:
+        if _token_key(cand) in _COL_HEADERS:
             continue
-        key = clean.lower().rstrip('.')
-        if key in _STOP_FIELD_LABELS:
-            break
-        if key in _SKIP_ROW_LABELS:
-            continue
-        if looks_like_invoice_id(clean, window):
-            return _norm_invoice_id(clean)
-        m = _INV_ID_RE.match(clean)
-        if m and looks_like_invoice_id(m.group(1), window):
-            return _norm_invoice_id(m.group(1))
+        if _is_letter_invoice_id(cand) and looks_like_invoice_id(cand, span):
+            return _norm_invoice_id(cand)
     return None
 
 
@@ -408,52 +427,69 @@ def invoice_number_from_pdf_words(words) -> Optional[str]:
         return None
     texts = [(float(w[0]), float(w[1]), float(w[2]), float(w[3]), str(w[4])) for w in words]
     labels = []
-    for i, (_x0, y0, x1, y1, t) in enumerate(texts):
-        if not re.fullmatch(r'invoice', t, re.I):
-            continue
+    for i, (x0, y0, x1, y1, t) in enumerate(texts):
+        combined = re.fullmatch(r'invoice\s*no\.?:?', t, re.I)
         nxt = texts[i + 1] if i + 1 < len(texts) else None
-        if not nxt or not re.fullmatch(r'(?:no\.?|nr\.?|n0|ne|num(?:ber)?|#):?', nxt[4], re.I):
-            continue
-        # 'Invoice' and 'No' must be the same label, not title 'Invoice' + bank 'No:'
-        if abs(nxt[1] - y0) > max(4.0, (y1 - y0) * 0.8):
-            continue
-        if nxt[0] - x1 > 50:
-            continue
-        nxt2 = texts[i + 2] if i + 2 < len(texts) else None
-        if nxt2 and re.fullmatch(r'(?:to|date|due|address)', nxt2[4], re.I):
+        if combined:
+            no_box = (x0, y0, x1, y1, t)
+            no_i = i
+            inv_x0 = x0
+        elif re.fullmatch(r'invoice', t, re.I) and nxt and re.fullmatch(
+            r'(?:no\.?|nr\.?|n0|ne|num(?:ber)?|#):?', nxt[4], re.I
+        ):
+            if abs(nxt[1] - y0) > max(4.0, (y1 - y0) * 0.8):
+                continue
+            if nxt[0] - x1 > 80:
+                continue
+            nxt2 = texts[i + 2] if i + 2 < len(texts) else None
+            if nxt2 and re.fullmatch(r'(?:to|date|due|address)', nxt2[4], re.I):
+                continue
+            no_box = nxt
+            no_i = i + 1
+            inv_x0 = x0
+        else:
             continue
         if _FALSE_LABEL_BEFORE_RE.search(' '.join(w[4] for w in texts[max(0, i - 8): i])):
             continue
-        labels.append((y0, i + 1, nxt))
+        labels.append((y0, no_i, no_box, inv_x0))
     if not labels:
         return None
     labels.sort(key=lambda r: (r[0], r[1]))
-    _ly0, label_i, label = labels[0]
+    _ly0, label_i, label, inv_x0 = labels[0]
     _lx0, ly0, lx1, ly1, _ = label
     line_tol = max(4.0, (ly1 - ly0) * 0.7)
 
-    def _from_tokens(seq):
+    def _from_tokens(seq, saw_account=False):
         pending_prefix = None
         blob = ' '.join(seq)
         for t in seq:
             clean = t.strip('.:#|,;')
             if not clean:
                 continue
-            key = clean.lower().rstrip('.')
-            if key in _STOP_FIELD_LABELS:
-                break
-            if key in _SKIP_ROW_LABELS:
+            key = _token_key(clean)
+            if key in ('account', 'acc', 'a/c', 'a/c.'):
+                saw_account = True
+                pending_prefix = None
+                continue
+            if key in _COL_HEADERS:
                 pending_prefix = None
                 continue
             if pending_prefix:
                 glued = pending_prefix + clean
-                if looks_like_invoice_id(glued, blob):
+                if _is_letter_invoice_id(glued) and looks_like_invoice_id(glued, blob):
                     return _norm_invoice_id(glued)
                 pending_prefix = None
+            if saw_account and re.fullmatch(r'\d{8}', clean):
+                continue
             if looks_like_invoice_id(clean, blob):
-                return _norm_invoice_id(clean)
+                if _is_letter_invoice_id(clean) or not saw_account:
+                    return _norm_invoice_id(clean)
             if re.fullmatch(r'[A-Za-z]{1,8}', clean) and not looks_like_po(clean):
                 pending_prefix = clean
+        for t in seq:
+            clean = t.strip('.:#|,;')
+            if _is_letter_invoice_id(clean) and looks_like_invoice_id(clean, blob):
+                return _norm_invoice_id(clean)
         return None
 
     right = sorted(
@@ -464,11 +500,11 @@ def invoice_number_from_pdf_words(words) -> Optional[str]:
     found = _from_tokens([t for _x, t in right])
     if found:
         return found
-    # Only the Invoice No column — not Account No to the right (bank/header).
-    col_right = lx1 + max(36.0, (lx1 - _lx0) * 2)
+    col_right = lx1 + 110
     below = sorted(
         ((y0, x0, t) for x0, y0, _x1, _y1, t in texts[label_i + 1:]
-         if y0 >= ly1 - 2 and y0 <= ly1 + (ly1 - ly0) * 4 and x0 <= col_right),
+         if y0 >= ly1 - 2 and y0 <= ly1 + (ly1 - ly0) * 5
+         and x0 >= inv_x0 - 15 and x0 <= col_right),
         key=lambda r: (r[0], r[1]),
     )
     return _from_tokens([t for _y, _x, t in below])

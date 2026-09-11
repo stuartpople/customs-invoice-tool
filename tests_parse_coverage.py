@@ -123,8 +123,8 @@ def test_invoice_number_standard_no_on_same_row_as_invoice_to():
 def test_invoice_number_sage_value_after_header_labels():
     from parse_coverage import extract_invoice_number
     sage = """
-    Invoice No. Tax Point Page
-    INV00017249 11/09/2026 1 of 1
+    Invoice No. Date Account Your Ref
+    INV00017249 11/09/2026 81839357 PO-99
     """
     assert extract_invoice_number(sage) == 'INV00017249'
     assert extract_invoice_number('INV00017249\nInvoice No:') == 'INV00017249'
