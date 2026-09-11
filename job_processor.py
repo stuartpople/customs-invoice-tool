@@ -319,6 +319,13 @@ class JobProcessor:
             doc = fitz.open(pdf_path)
             page = doc[page_num - 1]  # 0-indexed
             embedded_text = page.get_text("text").strip()
+            try:
+                from parse_coverage import invoice_number_from_pdf_words
+                layout_no = invoice_number_from_pdf_words(page.get_text("words"))
+            except Exception:
+                layout_no = None
+            if layout_no:
+                embedded_text = f"Invoice No: {layout_no}\n{embedded_text}"
             doc.close()
             
             # Check if we got meaningful text (>50 chars) AND no corrupt chars

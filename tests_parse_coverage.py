@@ -123,52 +123,51 @@ def test_invoice_number_standard_no_on_same_row_as_invoice_to():
 def test_invoice_number_sage_value_after_header_labels():
     from parse_coverage import extract_invoice_number
     sage = """
-    Invoice No.
-    Tax Point
-    Page
-    Account
-    Your Ref
-    Consignee / Invoice To:
-    ARROW CUSTOMER LTD
-    UNIT 3 TEST LANE
-    SOUTHAMPTON
-    SO16 9JW
-    INV00017249
-    11/09/2026
-    1 of 1
+    Invoice No. Tax Point Page
+    INV00017249 11/09/2026 1 of 1
     """
     assert extract_invoice_number(sage) == 'INV00017249'
     assert extract_invoice_number('INV00017249\nInvoice No:') == 'INV00017249'
     assert extract_invoice_number('Invoice No: INV 00017249') == 'INV00017249'
     padded = ('Address line\n' * 80) + 'INVOICE NO. IPGB025993\n'
     assert extract_invoice_number(padded) == 'IPGB025993'
-    assert extract_invoice_number('(cc:85444290)\nINV00017252') == 'INV00017252'
     assert extract_invoice_number('Invoice No: SO16') is None
 
 
-def test_invoice_number_not_account_number():
+def test_invoice_number_not_account_or_po():
     from parse_coverage import extract_invoice_number
-    interleaved = """
-    Invoice No.
-    Account
-    33404927
-    Your Ref
-    PO-99
-    INV00017249
-    11/09/2026
-    """
-    assert extract_invoice_number(interleaved) == 'INV00017249'
     assert extract_invoice_number(
-        'Invoice No. Account Your Ref\n33404927 INV00017249 PO-99'
+        'Invoice No: INV00017249 Your Ref: PO-2026-001 Account No: 33404927'
     ) == 'INV00017249'
     assert extract_invoice_number(
-        'Invoice No: INV00017249\nAccount No: 33404927'
+        'Invoice No: 88421 Your Ref: PO-99'
+    ) == '88421'
+    assert extract_invoice_number(
+        'Invoice No. Account Your Ref\nINV00017249 33404927 PO-99'
     ) == 'INV00017249'
     assert extract_invoice_number(
         'Account No.: 33404927\nInvoice No: SIN134283'
     ) == 'SIN134283'
+    assert extract_invoice_number(
+        'Invoice No: AE88421 Order No: PO12345'
+    ) == 'AE88421'
     assert extract_invoice_number('Invoice No: 88421') == '88421'
     assert extract_invoice_number('Invoice number\n2221875953') == '2221875953'
+    assert extract_invoice_number('Your Ref: PO-2026-001\nInvoice No:') is None
+
+
+def test_invoice_number_from_pdf_words_right_of_label():
+    from parse_coverage import invoice_number_from_pdf_words
+    # Invoice No: INV00017249     Your Ref: PO-2026-001
+    words = [
+        (10, 20, 50, 32, 'Invoice', 0, 0, 0),
+        (52, 20, 70, 32, 'No:', 0, 0, 1),
+        (90, 20, 170, 32, 'INV00017249', 0, 0, 2),
+        (200, 20, 240, 32, 'Your', 0, 0, 3),
+        (242, 20, 270, 32, 'Ref:', 0, 0, 4),
+        (280, 20, 360, 32, 'PO-2026-001', 0, 0, 5),
+    ]
+    assert invoice_number_from_pdf_words(words) == 'INV00017249'
 
 
 
@@ -219,7 +218,8 @@ if __name__ == '__main__':
     test_invoice_number_skips_consignee_invoice_to()
     test_invoice_number_standard_no_on_same_row_as_invoice_to()
     test_invoice_number_sage_value_after_header_labels()
-    test_invoice_number_not_account_number()
+    test_invoice_number_not_account_or_po()
+    test_invoice_number_from_pdf_words_right_of_label()
     test_export_cpc_defaults_to_1040()
     test_wrap_row_without_hs_merges()
     print('ok')

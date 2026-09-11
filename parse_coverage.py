@@ -247,12 +247,9 @@ _INV_STOP = frozenset({
     'FROM', 'THE', 'AND', 'FOR', 'SHIPMENT', 'EXPORT', 'IMPORT', 'VALUE',
     'AMOUNT', 'INVOICE', 'INV', 'SIN', 'GB', 'UK', 'OF', 'TO',
     'CONSIGNEE', 'EXPORTER', 'IMPORTER', 'SHIPPER', 'BUYER', 'SELLER',
-    'CUSTOMER', 'SUPPLIER', 'COMPANY', 'ACCOUNT',
+    'CUSTOMER', 'SUPPLIER', 'COMPANY', 'ACCOUNT', 'ORDER', 'PO',
 })
 
-# Party phrases that contain "invoice" but are not the invoice-number label.
-# Mask these; do not skip the whole line — Arrow/two-column PDFs often extract
-# "Consignee / Invoice To:" and "Invoice No: INV00017249" on the same row.
 _PARTY_PHRASE_RE = re.compile(
     r'consignee\s*/\s*invoice\s*to|'
     r'consignee\s*/\s*invoice|'
@@ -264,14 +261,8 @@ _PARTY_PHRASE_RE = re.compile(
     r'\bship(?:ped)?\s+to\b',
     re.IGNORECASE,
 )
-# Sage/Arrow put Account next to Invoice No; the account value must not win.
-_ACCOUNT_FIELD_RE = re.compile(
-    r'\b(?:account|a/?c)\s*(?:no\.?|nr\.?|number|#|code)?\s*[:.\-]?\s*'
-    r'[A-Z0-9][A-Z0-9\-/]{2,}',
-    re.IGNORECASE,
-)
 
-# Invoice No / Nr / Ne (OCR of No) / Number / # — not Invoice To / Date / Ref.
+# Invoice No / Nr / Ne (OCR of No) / Number / # — not Invoice To / Date.
 _INV_LABEL_RE = re.compile(
     r'(?:invoice|inv)[\s.]*'
     r'(?:no\.?|nr\.?|n0|ne(?![a-z])|num(?:ber)?|#)'
@@ -282,9 +273,15 @@ _INV_ID_RE = re.compile(
     r'\b([A-Za-z]{1,10}[-/]?\d{2,}[A-Za-z0-9\-/]*|\d{4,16})\b',
     re.IGNORECASE,
 )
-_SAGE_INV_RE = re.compile(r'\b(INV\d{5,12})\b', re.IGNORECASE)
 _INV_SPACED_RE = re.compile(r'\b([A-Za-z]{1,8})\s+(\d{4,16})\b')
 _POSTCODE_OUTWARD_RE = re.compile(r'^[A-Z]{1,2}\d{1,2}[A-Z]?$', re.IGNORECASE)
+_PO_ID_RE = re.compile(r'^(?:P\.?O\.?|PO)[-/]?\d', re.IGNORECASE)
+_HEADER_WORDS = frozenset({
+    'tax', 'point', 'page', 'account', 'your', 'our', 'ref', 'reference',
+    'order', 'po', 'p.o', 'p.o.', 'delivery', 'date', 'customer', 'vat',
+    'due', 'total', 'number', 'no', 'nr', 'ne', 'n0', 'of', 'acc', 'a/c',
+    'code', 'from', 'to', 'terms', 'payment', 'currency', 'of', '1',
+})
 _OVERFLOW_PREFIX_RE = re.compile(
     r'^(LENGTH|WIDTH|HEIGHT|DEPTH|BREAKLOAD|COLOUR|COLOR|SIZE|DIMS?|'
     r'WEIGHT|NETT?|GROSS|NOTE[S]?|BATCH|LOT|SERIAL|DESC(?:RIPTION)?)\b',
@@ -292,9 +289,16 @@ _OVERFLOW_PREFIX_RE = re.compile(
 )
 
 
+def looks_like_po(candidate: str) -> bool:
+    cand = (candidate or '').strip().strip('.:#')
+    return bool(_PO_ID_RE.match(cand))
+
+
 def looks_like_invoice_id(candidate: str) -> bool:
     cand = (candidate or '').strip().strip('.:#')
     if not cand or cand.upper() in _INV_STOP:
+        return False
+    if looks_like_po(cand):
         return False
     if not re.search(r'\d', cand):
         return False
@@ -309,7 +313,6 @@ def looks_like_invoice_id(candidate: str) -> bool:
     if re.fullmatch(r'[A-Z]{1,10}[-/]?\d{2,}[A-Z0-9\-/]*', cand, re.I):
         return True
     if re.fullmatch(r'\d{4,16}', cand):
-        # Phone / VAT / sort-code fragments / a lone year
         if cand.startswith(('1323', '377109', '4470')):
             return False
         if re.fullmatch(r'(?:19|20)\d{2}', cand):
@@ -323,62 +326,111 @@ def _norm_invoice_id(cand: str) -> str:
     return cand.upper() if re.search(r'[A-Za-z]', cand) else cand
 
 
-def _invoice_ids_in(span: str, limit: int = 800) -> List[str]:
-    """Invoice-like tokens after a label, nearest first."""
-    chunk = span[:limit]
-    found: List[str] = []
-    immediate = _INV_SPACED_RE.search(chunk[:48])
-    if immediate:
-        glued = f"{immediate.group(1)}{immediate.group(2)}"
-        if looks_like_invoice_id(glued):
-            found.append(_norm_invoice_id(glued))
-    for m in _INV_ID_RE.finditer(chunk):
-        cand = m.group(1)
+def _id_after_invoice_no_label(span: str) -> Optional[str]:
+    """Value sitting next to 'Invoice No' — not a PO/account 800 characters away."""
+    window = span[:120]
+    glued = _INV_SPACED_RE.match(window.lstrip(' :.-'))
+    if glued:
+        cand = f"{glued.group(1)}{glued.group(2)}"
         if looks_like_invoice_id(cand):
-            normed = _norm_invoice_id(cand)
-            if normed not in found:
-                found.append(normed)
-    return found
-
-
-def _pick_invoice_candidate(span: str) -> Optional[str]:
-    """Prefer Sage INV000… / letter+digit refs over a neighbouring account number."""
-    sage = _SAGE_INV_RE.search(span[:800])
-    if sage and looks_like_invoice_id(sage.group(1)):
-        return _norm_invoice_id(sage.group(1))
-    ids = _invoice_ids_in(span, limit=800)
-    alpha = [i for i in ids if re.search(r'[A-Z]', i)]
-    if alpha:
-        return alpha[0]
-    near = _invoice_ids_in(span, limit=64)
-    return near[0] if near else None
+            return _norm_invoice_id(cand)
+    for tok in re.split(r'\s+', window.strip()):
+        clean = tok.strip('.:#|,;')
+        if not clean:
+            continue
+        if clean.lower().rstrip('.') in _HEADER_WORDS:
+            continue
+        if looks_like_invoice_id(clean):
+            return _norm_invoice_id(clean)
+        m = _INV_ID_RE.match(clean)
+        if m and looks_like_invoice_id(m.group(1)):
+            return _norm_invoice_id(m.group(1))
+    return None
 
 
 def extract_invoice_number(text: str) -> Optional[str]:
-    """Find the commercial invoice number for CDS previous-document (Z/380).
+    """The token next to 'Invoice No:' / 'Invoice Ne:' / 'Invoice number'.
 
-    Reads 'Invoice No:' even when PDF reading-order puts the value later.
-    Account numbers sitting next to that field are ignored.
+    Ignores Consignee / Invoice To, Invoice Date, account numbers and POs.
+    Does not wander across the page looking for a 'better' ID.
     """
     if not text:
         return None
 
     masked = _PARTY_PHRASE_RE.sub(' ', text)
-    masked = _ACCOUNT_FIELD_RE.sub(' ', masked)
     flat = re.sub(r'[\s|]+', ' ', masked).strip()
 
     for m in _INV_LABEL_RE.finditer(flat):
-        found = _pick_invoice_candidate(flat[m.end():])
+        found = _id_after_invoice_no_label(flat[m.end():])
         if found:
             return found
-        found = _pick_invoice_candidate(flat[max(0, m.start() - 80): m.start()])
-        if found:
-            return found
-
-    sage = _SAGE_INV_RE.search(flat)
-    if sage and looks_like_invoice_id(sage.group(1)):
-        return _norm_invoice_id(sage.group(1))
+        # Value printed immediately above/left of the label (one token).
+        before = flat[max(0, m.start() - 28): m.start()].strip()
+        if before:
+            last = before.split()[-1].strip('.:#|,;')
+            if looks_like_invoice_id(last):
+                return _norm_invoice_id(last)
     return None
+
+
+def invoice_number_from_pdf_words(words) -> Optional[str]:
+    """Value to the right of, or just under, the 'Invoice No' label on the page."""
+    if not words:
+        return None
+    texts = [(float(w[0]), float(w[1]), float(w[2]), float(w[3]), str(w[4])) for w in words]
+    label = None
+    label_i = None
+    for i, (_x0, y0, x1, y1, t) in enumerate(texts):
+        if not re.fullmatch(r'invoice', t, re.I):
+            continue
+        nxt = texts[i + 1] if i + 1 < len(texts) else None
+        if not nxt or not re.fullmatch(r'(?:no\.?|nr\.?|n0|ne|num(?:ber)?|#):?', nxt[4], re.I):
+            continue
+        nxt2 = texts[i + 2] if i + 2 < len(texts) else None
+        if nxt2 and re.fullmatch(r'(?:to|date|due|address)', nxt2[4], re.I):
+            continue
+        label = nxt
+        label_i = i + 1
+        break
+    if label is None or label_i is None:
+        return None
+    _lx0, ly0, lx1, ly1, _ = label
+    line_tol = max(4.0, (ly1 - ly0) * 0.7)
+
+    def _from_tokens(seq):
+        pending_prefix = None
+        for t in seq:
+            clean = t.strip('.:#|,;')
+            if not clean:
+                continue
+            if clean.lower().rstrip('.') in _HEADER_WORDS:
+                pending_prefix = None
+                continue
+            if pending_prefix:
+                glued = pending_prefix + clean
+                if looks_like_invoice_id(glued):
+                    return _norm_invoice_id(glued)
+                pending_prefix = None
+            if looks_like_invoice_id(clean):
+                return _norm_invoice_id(clean)
+            if re.fullmatch(r'[A-Za-z]{1,8}', clean) and not looks_like_po(clean):
+                pending_prefix = clean
+        return None
+
+    right = sorted(
+        ((x0, t) for x0, y0, _x1, _y1, t in texts[label_i + 1:]
+         if abs(y0 - ly0) <= line_tol and x0 >= lx1 - 2),
+        key=lambda r: r[0],
+    )
+    found = _from_tokens([t for _x, t in right])
+    if found:
+        return found
+    below = sorted(
+        ((y0, x0, t) for x0, y0, _x1, _y1, t in texts[label_i + 1:]
+         if y0 >= ly1 - 2 and y0 <= ly1 + (ly1 - ly0) * 4 and x0 <= lx1 + 180),
+        key=lambda r: (r[0], r[1]),
+    )
+    return _from_tokens([t for _y, _x, t in below])
 
 
 _KNOWN_FOUR_DIGIT_CPC = frozenset({
