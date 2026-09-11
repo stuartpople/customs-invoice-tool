@@ -76,7 +76,7 @@ import shutil
 
 
 # Version tracking for cache busting
-APP_VERSION = "v3.40"
+APP_VERSION = "v3.41"
 
 
 def _normalize_items_hs_for_direction(items: list, direction: str) -> list:
@@ -1642,20 +1642,15 @@ elif st.session_state.processing_started and st.session_state.current_job_id:
                         invoice_meta = st.session_state.invoice_metadata
                         
                         col1, col2, col3, col4 = st.columns(4)
+                        _inv_shown = str(invoice_meta.get('invoice_number') or '').strip()
+                        if _inv_shown and not str(st.session_state.get('invoice_number_field') or '').strip():
+                            st.session_state.invoice_number_field = _inv_shown
                         with col1:
-                            incoterm = invoice_meta.get('incoterm', 'Not found')
-                            st.metric("Incoterm", incoterm if incoterm else "Not found")
-                        if 'invoice_number_field' not in st.session_state:
-                            st.session_state.invoice_number_field = str(invoice_meta.get('invoice_number') or '')
-                        st.text_input(
-                            "Invoice number (FCL Prv Doc Reference / Z-380)",
-                            help="Written to Previous Document Reference on the FCL sheet (class Z, type 380).",
-                            key="invoice_number_field",
-                        )
-                        _typed = str(st.session_state.get('invoice_number_field') or '').strip()
-                        if _typed:
-                            st.session_state.invoice_metadata['invoice_number'] = _typed
-                            st.session_state.invoice_number_input = _typed
+                            st.metric(
+                                "Invoice number",
+                                _inv_shown or "Not found",
+                                help="Previous document Z/380 on the FCL sheet",
+                            )
                         with col2:
                             cpc = (
                                 invoice_meta.get('cpc_code')
@@ -1666,8 +1661,8 @@ elif st.session_state.processing_started and st.session_state.current_job_id:
                                 st.session_state.invoice_metadata['cpc_code'] = '1040'
                             st.metric("CPC Code", cpc, help="Customs Procedure Code — 1040 permanent export, 4000 import free circulation")
                         with col3:
-                            val_method = invoice_meta.get('valuation_method', '1')
-                            st.metric("Valuation Method", f"Method{val_method}", help="1 = Transaction Value")
+                            incoterm = invoice_meta.get('incoterm', 'Not found')
+                            st.metric("Incoterm", incoterm if incoterm else "Not found")
                         with col4:
                             packages = invoice_meta.get('number_of_packages', 'Not found')
                             pkg_type = invoice_meta.get('package_type', '')
@@ -1675,8 +1670,17 @@ elif st.session_state.processing_started and st.session_state.current_job_id:
                                 st.metric("Packages", f"{packages} {pkg_type if pkg_type else ''}")
                             else:
                                 st.metric("Packages", "Not found")
+                        st.text_input(
+                            "Edit invoice number (FCL Prv Doc Reference / Z-380)",
+                            help="Written to Previous Document Reference on the FCL sheet (class Z, type 380).",
+                            key="invoice_number_field",
+                        )
+                        _typed = str(st.session_state.get('invoice_number_field') or '').strip()
+                        if _typed:
+                            st.session_state.invoice_metadata['invoice_number'] = _typed
+                            st.session_state.invoice_number_input = _typed
                         
-                        col5, col6, col7 = st.columns(3)
+                        col5, col6, col7, col8 = st.columns(4)
                         with col5:
                             total_value = invoice_meta.get('total_invoice_value')
                             if total_value:
@@ -1690,6 +1694,9 @@ elif st.session_state.processing_started and st.session_state.current_job_id:
                             gross_wt = invoice_meta.get('total_gross_weight')
                             if gross_wt:
                                 st.metric("Total Gross Weight", f"{gross_wt:.3f} kg")
+                        with col8:
+                            val_method = invoice_meta.get('valuation_method', '1')
+                            st.metric("Valuation Method", f"Method{val_method}", help="1 = Transaction Value")
                     
                     # Step 3: HMRC Enrichment and Export
                     st.divider()

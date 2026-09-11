@@ -265,18 +265,10 @@ _PARTY_PHRASE_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Invoice No / Nr / Ne (OCR of No) / Number / Ref / # then the ID.
-# Allow a single-letter prefix (S81217) and 4+ digit numbers (88421).
-_INV_LABEL_ID_RE = re.compile(
-    r'(?:invoice|inv)[\s.]*'
-    r'(?:no\.?|nr\.?|n0|ne(?![a-z])|num(?:ber)?|ref(?:erence)?|#)'
-    r'(?!\s*(?:to|address|date|due|total|value|from)\b)\s*[:.\-]?\s*'
-    r'([A-Za-z]{1,10}[-/]?\d{2,}[A-Za-z0-9\-/]*|\d{4,16})',
-    re.IGNORECASE,
-)
+# Invoice No / Nr / Ne (OCR of No) / Number / # — not Invoice To / Date / Ref.
 _INV_LABEL_RE = re.compile(
     r'(?:invoice|inv)[\s.]*'
-    r'(?:no\.?|nr\.?|n0|ne(?![a-z])|num(?:ber)?|ref(?:erence)?|#)'
+    r'(?:no\.?|nr\.?|n0|ne(?![a-z])|num(?:ber)?|#)'
     r'(?!\s*(?:to|address|date|due|total|value|from)\b)',
     re.IGNORECASE,
 )
@@ -284,6 +276,9 @@ _INV_ID_RE = re.compile(
     r'\b([A-Za-z]{1,10}[-/]?\d{2,}[A-Za-z0-9\-/]*|\d{4,16})\b',
     re.IGNORECASE,
 )
+_SAGE_INV_RE = re.compile(r'\b(INV\d{5,12})\b', re.IGNORECASE)
+_INV_SPACED_RE = re.compile(r'\b([A-Za-z]{1,8})\s+(\d{4,16})\b')
+_POSTCODE_OUTWARD_RE = re.compile(r'^[A-Z]{1,2}\d{1,2}[A-Z]?$', re.IGNORECASE)
 _OVERFLOW_PREFIX_RE = re.compile(
     r'^(LENGTH|WIDTH|HEIGHT|DEPTH|BREAKLOAD|COLOUR|COLOR|SIZE|DIMS?|'
     r'WEIGHT|NETT?|GROSS|NOTE[S]?|BATCH|LOT|SERIAL|DESC(?:RIPTION)?)\b',
@@ -301,6 +296,10 @@ def looks_like_invoice_id(candidate: str) -> bool:
         return False
     if re.search(r'\d{1,2}[./-]\d{1,2}[./-]\d{2,4}', cand):
         return False
+    if _POSTCODE_OUTWARD_RE.fullmatch(cand):
+        return False
+    if re.fullmatch(r'[A-Z]{2}\d{9,}', cand, re.I):  # VAT / EORI GB377109145
+        return False
     if re.fullmatch(r'[A-Z]{1,10}[-/]?\d{2,}[A-Z0-9\-/]*', cand, re.I):
         return True
     if re.fullmatch(r'\d{4,16}', cand):
@@ -313,36 +312,62 @@ def looks_like_invoice_id(candidate: str) -> bool:
     return False
 
 
+def _norm_invoice_id(cand: str) -> str:
+    cand = (cand or '').strip().strip('.:#')
+    return cand.upper() if re.search(r'[A-Za-z]', cand) else cand
+
+
+def _invoice_ids_in(span: str, limit: int = 600) -> List[str]:
+    """Invoice-like tokens after a label, nearest first.
+
+    Sage/Arrow dumps column headers before the value, so the ID may sit
+    hundreds of characters after 'Invoice No'. Do not scan the whole window
+    for 'GB 377109145' style spaced pairs — only glue the first tokens.
+    """
+    chunk = span[:limit]
+    found: List[str] = []
+    immediate = _INV_SPACED_RE.search(chunk[:48])
+    if immediate:
+        glued = f"{immediate.group(1)}{immediate.group(2)}"
+        if looks_like_invoice_id(glued):
+            found.append(_norm_invoice_id(glued))
+    for m in _INV_ID_RE.finditer(chunk):
+        cand = m.group(1)
+        if looks_like_invoice_id(cand):
+            normed = _norm_invoice_id(cand)
+            if normed not in found:
+                found.append(normed)
+    sage = _SAGE_INV_RE.search(chunk)
+    if sage and looks_like_invoice_id(sage.group(1)):
+        normed = _norm_invoice_id(sage.group(1))
+        if normed not in found:
+            found.append(normed)
+    return found
+
+
 def extract_invoice_number(text: str) -> Optional[str]:
     """Find the commercial invoice number for CDS previous-document (Z/380).
 
-    Reads the standard 'Invoice No:' field even when it shares a PDF row with
-    'Consignee / Invoice To:'. OCR 'Invoice Ne' / wrapped 'Invoice\\nNo:' still
-    count. Party labels never become the number.
+    Reads the standard 'Invoice No:' field even when PDF reading-order puts the
+    value on a later line or before the label. Ignores 'Consignee / Invoice To'.
     """
     if not text:
         return None
 
-    def _norm(cand: str) -> str:
-        return cand.upper() if re.search(r'[A-Za-z]', cand) else cand
-
-    header = '\n'.join(text.splitlines()[:120])
-    masked = _PARTY_PHRASE_RE.sub(' ', header)
+    masked = _PARTY_PHRASE_RE.sub(' ', text)
     flat = re.sub(r'[\s|]+', ' ', masked).strip()
 
-    for m in _INV_LABEL_ID_RE.finditer(flat):
-        cand = m.group(1)
-        if looks_like_invoice_id(cand):
-            return _norm(cand)
+    for m in _INV_LABEL_RE.finditer(flat):
+        after = _invoice_ids_in(flat[m.end():])
+        if after:
+            return after[0]
+        before = _invoice_ids_in(flat[max(0, m.start() - 80): m.start()])
+        if before:
+            return before[-1]
 
-    # Label present but ID on the following tokens (rare leftover spacing)
-    label = _INV_LABEL_RE.search(flat)
-    if label:
-        tail = flat[label.end():label.end() + 80]
-        for m in _INV_ID_RE.finditer(tail):
-            cand = m.group(1)
-            if looks_like_invoice_id(cand):
-                return _norm(cand)
+    sage = _SAGE_INV_RE.search(flat)
+    if sage and looks_like_invoice_id(sage.group(1)):
+        return _norm_invoice_id(sage.group(1))
     return None
 
 

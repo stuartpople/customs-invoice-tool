@@ -120,6 +120,33 @@ def test_invoice_number_standard_no_on_same_row_as_invoice_to():
     assert extract_invoice_number('Invoice No: INV-2026-001') == 'INV-2026-001'
 
 
+def test_invoice_number_sage_value_after_header_labels():
+    from parse_coverage import extract_invoice_number
+    sage = """
+    Invoice No.
+    Tax Point
+    Page
+    Account
+    Your Ref
+    Consignee / Invoice To:
+    ARROW CUSTOMER LTD
+    UNIT 3 TEST LANE
+    SOUTHAMPTON
+    SO16 9JW
+    INV00017249
+    11/09/2026
+    1 of 1
+    """
+    assert extract_invoice_number(sage) == 'INV00017249'
+    assert extract_invoice_number('INV00017249\nInvoice No:') == 'INV00017249'
+    assert extract_invoice_number('Invoice No: INV 00017249') == 'INV00017249'
+    padded = ('Address line\n' * 80) + 'INVOICE NO. IPGB025993\n'
+    assert extract_invoice_number(padded) == 'IPGB025993'
+    assert extract_invoice_number('(cc:85444290)\nINV00017252') == 'INV00017252'
+    assert extract_invoice_number('Invoice No: SO16') is None
+
+
+
 def test_export_cpc_defaults_to_1040():
     from parse_coverage import extract_cpc_code, default_cpc
     assert default_cpc('export') == '1040'
@@ -166,6 +193,7 @@ if __name__ == '__main__':
     test_invoice_number_ocr_ne_and_title()
     test_invoice_number_skips_consignee_invoice_to()
     test_invoice_number_standard_no_on_same_row_as_invoice_to()
+    test_invoice_number_sage_value_after_header_labels()
     test_export_cpc_defaults_to_1040()
     test_wrap_row_without_hs_merges()
     print('ok')
