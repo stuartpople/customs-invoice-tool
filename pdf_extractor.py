@@ -589,7 +589,7 @@ def extract_invoice_metadata(text: str) -> Dict:
             except:
                 pass
     
-    # Extract number of packages
+    # Extract number of packages (count only — type is always UN code PK for CDS)
     package_patterns = [
         r'(?:number\s*of\s*packages|no\.?\s*of\s*packages|packages)[\s:]*(\d+)',
         r'(\d+)\s*(?:box(?:es)?|carton(?:s)?|pallet(?:s)?|package(?:s)?)',
@@ -600,23 +600,12 @@ def extract_invoice_metadata(text: str) -> Dict:
             try:
                 metadata['number_of_packages'] = int(match.group(1))
                 break
-            except:
+            except Exception:
                 pass
-    
-    # Extract package type
-    pkgtype_pattern = r'(?:package\s*type|packing)[\s:]*(\w+)'
-    pkgtype_match = re.search(pkgtype_pattern, text, re.IGNORECASE)
-    if pkgtype_match:
-        metadata['package_type'] = pkgtype_match.group(1).capitalize()
-    elif metadata['number_of_packages']:
-        # Try to infer from context
-        if re.search(r'\bbox(?:es)?\b', text, re.IGNORECASE):
-            metadata['package_type'] = 'Box'
-        elif re.search(r'\bcarton(?:s)?\b', text, re.IGNORECASE):
-            metadata['package_type'] = 'Carton'
-        elif re.search(r'\bpallet(?:s)?\b', text, re.IGNORECASE):
-            metadata['package_type'] = 'Pallet'
-    
+
+    # CDS DE 6/9 package type — always PK (Package) for this tool's customers
+    metadata['package_type'] = 'PK'
+ 
     # Extract invoice number (SIN134283, 10-digit RS, OCR "Invoice Ne")
     try:
         from parse_coverage import extract_invoice_number as _extract_inv

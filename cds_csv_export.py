@@ -169,7 +169,8 @@ def _build_cds_data_rows(
     metadata = metadata or {}
     is_export = direction.lower() == 'export'
 
-    package_type = metadata.get('package_type', 'PK')
+    # CDS DE 6/9 — always PK (do not use invoice words like Box/Carton/Pallet)
+    package_type = 'PK'
     package_count = metadata.get('number_of_packages', '')
     invoice_ref = (
         metadata.get('invoice_number')
@@ -256,7 +257,7 @@ def _build_cds_data_rows(
             cpc = '4000'
         row[6] = cpc
         row[7] = gross_weight
-        row[9] = package_type if package_type else 'PK'
+        row[9] = 'PK'
         row[10] = package_count
         row[11] = country_orig
         row[14] = 'Z'

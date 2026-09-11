@@ -272,7 +272,8 @@ def _normalise_metadata(raw: dict) -> Dict:
         "total_gross_weight": _float_or_none(raw.get("total_gross_weight")),
         "total_net_weight": _float_or_none(raw.get("total_net_weight")),
         "number_of_packages": _int_or_none(raw.get("number_of_packages")),
-        "package_type": _str_or_none(raw.get("package_type")),
+        # CDS DE 6/9 — always PK for this tool
+        "package_type": "PK",
     }
 
 
