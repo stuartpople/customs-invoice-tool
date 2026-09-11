@@ -13,6 +13,15 @@ from hs_format import hs_digits, format_hs_for_sheet, resolve_hmrc_data
 __all_hs__ = ('hs_digits', 'format_hs_for_sheet', 'resolve_hmrc_data')
 
 
+# Residual TARIC endings that mean the CN8 itself / "Other". Safe for
+# supplementary units. UK tariff often uses 89/98 instead of 90/99.
+EXPORT_RESIDUAL_SUFFIXES = ('00', '90', '99', '89', '98')
+# Only used when every residual pad 404s. Document codes only — not NAR.
+EXPORT_SPECIALISED_SUFFIXES = (
+    '80', '91', '75', '70', '65', '60', '55', '50',
+    '45', '40', '35', '30', '23', '20', '10',
+)
+
 # Phrases in requirement text that indicate a non-restrictive / exemption code
 _EXEMPTION_PHRASES = [
     'not required',
@@ -94,7 +103,7 @@ class HMRCTariffAPI:
     # Bump when lookup semantics change so hot-reloaded Streamlit workers cannot
     # reuse results produced by older code.
     # Bump when lookup / validation semantics change so process-wide caches refresh.
-    CACHE_SCHEMA_VERSION = "export-cn8-sheet-v6"
+    CACHE_SCHEMA_VERSION = "export-cn8-residual-89-v7"
 
     @classmethod
     def clear_caches(cls) -> None:
@@ -415,12 +424,30 @@ class HMRCTariffAPI:
                     }
         return results
 
+    def _http_get(self, url: str, timeout: int = 15, retries: int = 3):
+        """GET with retries for timeouts and 429/5xx. Last response or raise."""
+        last_exc = None
+        last_resp = None
+        for attempt in range(retries):
+            try:
+                resp = self.session.get(url, timeout=timeout)
+                last_resp = resp
+                if resp.status_code in (429, 500, 502, 503, 504):
+                    time.sleep(0.4 * (attempt + 1))
+                    continue
+                return resp
+            except requests.RequestException as exc:
+                last_exc = exc
+                time.sleep(0.4 * (attempt + 1))
+        if last_resp is not None:
+            return last_resp
+        raise last_exc
+
     def _try_commodity(self, ten_digit_code: str) -> Optional[Dict]:
         """Hit the commodities endpoint; return attrs dict or None on 404."""
         try:
-            r = self.session.get(
-                f"{self.base_url}/uk/api/commodities/{ten_digit_code}",
-                timeout=10)
+            r = self._http_get(
+                f"{self.base_url}/uk/api/commodities/{ten_digit_code}")
             if r.status_code == 200:
                 attrs = r.json().get('data', {}).get('attributes', {})
                 return {
@@ -489,12 +516,15 @@ class HMRCTariffAPI:
         
         if len(clean_code) < 10:
             if len(clean_code) == 8:
-                # Export: invoice codes are CN8. Only pad with 00, then residual
-                # "Other" TARIC endings (90/99) for doc codes / supp-unit checks.
-                # Do NOT walk specialised subdivisions (10/20/…) — those belong to
-                # specific products and wrongly inherit measures like NAR.
+                # Export: invoice codes are CN8. Try residual pads first
+                # (00/90/99 and UK "Other" 89/98). Specialised 10/20/… only if
+                # those 404 — otherwise we miss relays/wiring (85364190,
+                # 85443000) whose residual is …89, and we used to inherit NAR
+                # from …10 when we walked those first (8544429010).
                 if direction.lower() == 'export':
-                    for suffix in ['00', '90', '99']:
+                    for suffix in EXPORT_RESIDUAL_SUFFIXES:
+                        code_variants.append(clean_code + suffix)
+                    for suffix in EXPORT_SPECIALISED_SUFFIXES:
                         code_variants.append(clean_code + suffix)
                 else:
                     for suffix in ['99', '91', '90', '80', '10', '00']:
@@ -516,95 +546,122 @@ class HMRCTariffAPI:
             code_variants.append(clean_code)
         
         last_error = None
+        transient_failure = False
+        tried = set()
         for variant_code in code_variants:
-            try:
-                # Use UK endpoint (GB tariff)
-                url = f"{self.base_url}/uk/api/commodities/{variant_code}"
-                params = {}
-                
-                response = self.session.get(url, params=params, timeout=10)
-                
-                if response.status_code == 200:
-                    data = response.json()
-                    attrs = data.get('data', {}).get('attributes', {})
-                    # An 8-digit CN lookup tries xx00 first, but xx00 is often a
-                    # non-declarable parent (e.g. 7014000000). Parent nodes have
-                    # no measures/doc codes, while the declarable xx10/xx90
-                    # children carry 9Y10 etc. Continue until a declarable leaf
-                    # is found instead of returning the first HTTP 200 response.
-                    if (
-                        attrs.get('declarable') is False
-                        and (len(clean_code) < 10 or is_padded_8_digit)
-                    ):
-                        last_error = {
-                            "error": (
-                                f"Code {commodity_code} resolved to non-declarable "
-                                f"parent {variant_code}; trying a declarable child"
-                            )
-                        }
-                        continue
-                    result = self._parse_commodity_response(data, direction, destination_country, export_only)
-                    self._commodity_cache[cache_key] = result
-                    return result
-                elif response.status_code == 404:
-                    last_error = {"error": f"Code {commodity_code} not found in HMRC database (tried {variant_code})"}
-                    continue  # Try next variant
-                else:
-                    last_error = {"error": f"API error: HTTP {response.status_code}"}
-                    continue
-            except requests.RequestException as e:
-                last_error = {"error": f"Network error: {str(e)}"}
-                continue
+            tried.add(variant_code)
+            result, last_error, was_transient = self._details_from_variant(
+                variant_code, commodity_code, clean_code, is_padded_8_digit,
+                direction, destination_country, export_only)
+            if was_transient:
+                transient_failure = True
+            if result:
+                self._commodity_cache[cache_key] = result
+                return result
         
         # If we get here, none of the variants worked under this CN8.
-        # Obsolete invoice codes (restructured CN) 404 on 00/90/99 — fall back
-        # to the suggested replacement so doc codes still resolve.
+        # Obsolete invoice codes (restructured CN) 404 on residual pads — fall
+        # back to the suggested replacement so doc codes still resolve.
+        # Same-CN8 specialised leaf from validation is also used (docs only).
         if len(clean_code) == 8 or is_padded_8_digit:
             base8 = clean_code[:8]
             validation = self.validate_commodity_code(
                 base8, direction=direction
             )
+            resolved = (validation.get('resolved_code') or '').replace(' ', '')
+            if (
+                validation.get('valid')
+                and resolved
+                and resolved[:8] == base8
+                and resolved not in tried
+            ):
+                result, last_error, was_transient = self._details_from_variant(
+                    resolved.ljust(10, '0')[:10], commodity_code, clean_code,
+                    is_padded_8_digit, direction, destination_country, export_only)
+                if was_transient:
+                    transient_failure = True
+                if result:
+                    self._commodity_cache[cache_key] = result
+                    return result
             suggested = (validation.get('suggested_resolved_code')
                          or validation.get('suggested_code')
                          or '')
             suggested = suggested.replace(' ', '')
             if suggested and suggested[:8] != base8:
                 lookup = suggested if len(suggested) >= 10 else suggested.ljust(10, '0')
-                # Prefer residual Other pad for the suggested CN8
                 retry_codes = []
                 if len(suggested) >= 10:
                     retry_codes.append(lookup)
                 cn8 = suggested[:8]
-                for suffix in ['00', '90', '99']:
+                for suffix in list(EXPORT_RESIDUAL_SUFFIXES) + list(EXPORT_SPECIALISED_SUFFIXES):
                     v = cn8 + suffix
                     if v not in retry_codes:
                         retry_codes.append(v)
                 for variant_code in retry_codes:
-                    try:
-                        url = f"{self.base_url}/uk/api/commodities/{variant_code}"
-                        response = self.session.get(url, timeout=10)
-                        if response.status_code != 200:
-                            continue
-                        data = response.json()
-                        attrs = data.get('data', {}).get('attributes', {})
-                        if attrs.get('declarable') is False:
-                            continue
-                        result = self._parse_commodity_response(
-                            data, direction, destination_country, export_only
-                        )
-                        result['obsolete_invoice_code'] = base8
-                        result['reclassified_from'] = base8
-                        result['commodity_code'] = (
-                            cn8 if direction.lower() == 'export' else variant_code
-                        )
-                        self._commodity_cache[cache_key] = result
-                        return result
-                    except requests.RequestException:
+                    result, last_error, was_transient = self._details_from_variant(
+                        variant_code, commodity_code, clean_code, is_padded_8_digit,
+                        direction, destination_country, export_only)
+                    if was_transient:
+                        transient_failure = True
+                    if not result:
                         continue
+                    result['obsolete_invoice_code'] = base8
+                    result['reclassified_from'] = base8
+                    result['commodity_code'] = (
+                        cn8 if direction.lower() == 'export' else variant_code
+                    )
+                    self._commodity_cache[cache_key] = result
+                    return result
 
         result = last_error or {"error": f"Code {commodity_code} not found"}
-        self._commodity_cache[cache_key] = result
+        if not transient_failure:
+            self._commodity_cache[cache_key] = result
         return result
+
+    def _details_from_variant(
+        self, variant_code, commodity_code, clean_code, is_padded_8_digit,
+        direction, destination_country, export_only
+    ):
+        """Fetch one 10-digit commodity. Returns (result|None, error_dict, transient)."""
+        try:
+            url = f"{self.base_url}/uk/api/commodities/{variant_code}"
+            response = self._http_get(url)
+            if response.status_code == 200:
+                data = response.json()
+                attrs = data.get('data', {}).get('attributes', {})
+                # xx00 is often a non-declarable parent (e.g. 7014000000).
+                if (
+                    attrs.get('declarable') is False
+                    and (len(clean_code) < 10 or is_padded_8_digit)
+                ):
+                    return None, {
+                        "error": (
+                            f"Code {commodity_code} resolved to non-declarable "
+                            f"parent {variant_code}; trying a declarable child"
+                        )
+                    }, False
+                result = self._parse_commodity_response(
+                    data, direction, destination_country, export_only)
+                suffix = variant_code[8:10] if len(variant_code) >= 10 else '00'
+                if (
+                    direction.lower() == 'export'
+                    and suffix not in EXPORT_RESIDUAL_SUFFIXES
+                ):
+                    # Specialised TARIC leaf — keep Y903/9Y10, not NAR supp units.
+                    result['supplementary_units'] = None
+                    result['specialised_taric_fallback'] = variant_code
+                return result, None, False
+            if response.status_code == 404:
+                return None, {
+                    "error": (
+                        f"Code {commodity_code} not found in HMRC database "
+                        f"(tried {variant_code})"
+                    )
+                }, False
+            transient = response.status_code in (429, 500, 502, 503, 504)
+            return None, {"error": f"API error: HTTP {response.status_code}"}, transient
+        except requests.RequestException as e:
+            return None, {"error": f"Network error: {str(e)}"}, True
     
     def _extract_duty_from_components(self, measure_components_data, component_lookup, duty_expression_lookup):
         """
@@ -892,7 +949,8 @@ class HMRCTariffAPI:
                 geo_area = geo_lookup.get(geo_id, {})
                 geo_attrs = geo_area.get('attributes', {})
                 geo_description = geo_attrs.get('description', '')
-                geo_country_code = geo_attrs.get('id', '')
+                # Relationship id is the ISO / group code; attributes.id is often missing.
+                geo_country_code = str(geo_id or geo_attrs.get('id') or '').upper()
                 
                 # Filter by destination/origin country if specified
                 if destination_country:
@@ -909,21 +967,29 @@ class HMRCTariffAPI:
                     )
                     
                     is_all_countries = (
-                        str(geo_country_code) == '1011' or 
+                        geo_country_code == '1011' or 
                         'erga omnes' in geo_desc_lower or
                         geo_desc_lower == '' or
                         'all countries' in geo_desc_lower or
                         is_universal_measure
                     )
                     
-                    # FIXED: Only use country CODE comparison, not substring matching!
-                    # Substring matching was catching "US" in "RUSSIA" and "BELARUS"
+                    # 2-letter ISO only. Country groups (1008, 2020, …) include
+                    # the destination — dropping them hid Y903/9Y10 on mixed ATI jobs.
+                    is_specific_country = (
+                        len(geo_country_code) == 2 and geo_country_code.isalpha()
+                    )
                     is_selected_country = (
-                        geo_country_code and geo_country_code.upper() == destination_country.upper()
+                        is_specific_country
+                        and geo_country_code == destination_country.upper()
                     )
                     
-                    # Debug tracking - ADD decision field!
-                    will_skip = (not is_all_countries and not is_selected_country)
+                    # Skip only another country's ISO measure. Keep groups.
+                    will_skip = (
+                        is_specific_country
+                        and not is_selected_country
+                        and not is_all_countries
+                    )
                     result['_debug_country_checks'].append({
                         'measure': measure_type[:50],
                         'geo_code': geo_country_code,
@@ -934,8 +1000,7 @@ class HMRCTariffAPI:
                         'decision': 'FILTERED' if will_skip else 'KEPT'
                     })
                     
-                    # Re-enabled: Skip if it's a different specific country (not ERGA OMNES, not selected country)
-                    if not is_all_countries and not is_selected_country:
+                    if will_skip:
                         result['_debug_filtered_count'] += 1
                         continue
                     

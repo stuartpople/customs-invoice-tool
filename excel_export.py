@@ -439,7 +439,23 @@ def _write_row(ws, row_num: int, row_data: Dict, hmrc_info: Optional[Dict],
     # Start of HMRC columns
     
     # Add HMRC data if available
-    if hmrc_info and 'error' not in hmrc_info:
+    if hmrc_info and hmrc_info.get('error'):
+        if direction == 'export':
+            ws.cell(row=row_num, column=col_num).value = 'N/A'
+            col_num += 1
+            ws.cell(row=row_num, column=col_num).value = 'LOOKUP FAILED'
+            ws.cell(row=row_num, column=col_num + 1).value = str(
+                hmrc_info.get('error') or '')[:120]
+        else:
+            ws.cell(row=row_num, column=col_num).value = metadata.get('cpc_code') or '4000'
+            col_num += 1
+            ws.cell(row=row_num, column=col_num).value = metadata.get('valuation_method', '1')
+            col_num += 1
+            ws.cell(row=row_num, column=col_num).value = 'LOOKUP FAILED'
+            col_num += 1
+            ws.cell(row=row_num, column=col_num).value = str(
+                hmrc_info.get('error') or '')[:80]
+    elif hmrc_info and 'error' not in hmrc_info:
         if direction == 'export':
             # Supplementary units
             supp_units = hmrc_info.get('supplementary_units') or 'N/A'
