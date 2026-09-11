@@ -156,6 +156,33 @@ def test_invoice_number_not_account_or_po():
     assert extract_invoice_number('Your Ref: PO-2026-001\nInvoice No:') is None
 
 
+def test_invoice_number_not_bank_account():
+    from parse_coverage import extract_invoice_number
+    blob = """
+    Invoice No: INV00017249
+    Invoice Date: 11/09/2026
+    Please quote invoice number on all payments.
+    Bank Details
+    Barclays Bank
+    Account No: 81839357
+    Sort code: 20-00-00
+    IBAN: GB68HBUK40052581839357
+    """
+    assert extract_invoice_number(blob) == 'INV00017249'
+    bank_only = """
+    Please quote invoice number
+    Bank Details
+    Account No: 81839357
+    Sort code: 40-05-25
+    IBAN GB68HBUK40052581839357
+    """
+    assert extract_invoice_number(bank_only) != '81839357'
+    assert extract_invoice_number(bank_only) is None
+    assert extract_invoice_number(
+        'Invoice No: 88421\nBank Details Account No: 81839357 Sort code: 20-00-00'
+    ) == '88421'
+
+
 def test_invoice_number_from_pdf_words_right_of_label():
     from parse_coverage import invoice_number_from_pdf_words
     # Invoice No: INV00017249     Your Ref: PO-2026-001
@@ -219,6 +246,7 @@ if __name__ == '__main__':
     test_invoice_number_standard_no_on_same_row_as_invoice_to()
     test_invoice_number_sage_value_after_header_labels()
     test_invoice_number_not_account_or_po()
+    test_invoice_number_not_bank_account()
     test_invoice_number_from_pdf_words_right_of_label()
     test_export_cpc_defaults_to_1040()
     test_wrap_row_without_hs_merges()

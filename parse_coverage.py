@@ -262,10 +262,11 @@ _PARTY_PHRASE_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Invoice No / Nr / Ne (OCR of No) / Number / # — not Invoice To / Date.
+# Invoice No / Nr / Ne (OCR of No) / Number: / # — not Invoice To / Date,
+# and not "quote invoice number on payments".
 _INV_LABEL_RE = re.compile(
     r'(?:invoice|inv)[\s.]*'
-    r'(?:no\.?|nr\.?|n0|ne(?![a-z])|num(?:ber)?|#)'
+    r'(?:no\.?|nr\.?|n0|ne(?![a-z])|#|num(?:ber)?\s*:|num(?:ber)?(?!\s+(?:on|as|for|must|should|when|with|to|in|at|and|or|if|please|of)\b))'
     r'(?!\s*(?:to|address|date|due|total|value|from)\b)',
     re.IGNORECASE,
 )
@@ -276,6 +277,16 @@ _INV_ID_RE = re.compile(
 _INV_SPACED_RE = re.compile(r'\b([A-Za-z]{1,8})\s+(\d{4,16})\b')
 _POSTCODE_OUTWARD_RE = re.compile(r'^[A-Z]{1,2}\d{1,2}[A-Z]?$', re.IGNORECASE)
 _PO_ID_RE = re.compile(r'^(?:P\.?O\.?|PO)[-/]?\d', re.IGNORECASE)
+_FALSE_LABEL_BEFORE_RE = re.compile(
+    r'(?:please\s+)?(?:quote|use|using|cite|mention|enter|put)\b|'
+    r'\b(?:bank|sort\s*code|iban|swift|bic)\b',
+    re.IGNORECASE,
+)
+_BANK_CONTEXT_RE = re.compile(
+    r'\b(?:bank\s+details|sort\s*code|iban|swift|bic|a/?c\s*no|'
+    r'account\s+no|barclays|hsbc|natwest|lloyds|bank\s*:)\b',
+    re.IGNORECASE,
+)
 _HEADER_WORDS = frozenset({
     'tax', 'point', 'page', 'account', 'your', 'our', 'ref', 'reference',
     'order', 'po', 'p.o', 'p.o.', 'delivery', 'date', 'customer', 'vat',
@@ -294,11 +305,21 @@ def looks_like_po(candidate: str) -> bool:
     return bool(_PO_ID_RE.match(cand))
 
 
-def looks_like_invoice_id(candidate: str) -> bool:
+def looks_like_bank_account(candidate: str, window: str = '') -> bool:
+    """UK bank account (8 digits) next to sort code / IBAN / Bank details."""
+    cand = (candidate or '').strip()
+    if not re.fullmatch(r'\d{8}', cand):
+        return False
+    return bool(_BANK_CONTEXT_RE.search(window or ''))
+
+
+def looks_like_invoice_id(candidate: str, window: str = '') -> bool:
     cand = (candidate or '').strip().strip('.:#')
     if not cand or cand.upper() in _INV_STOP:
         return False
     if looks_like_po(cand):
+        return False
+    if looks_like_bank_account(cand, window):
         return False
     if not re.search(r'\d', cand):
         return False
@@ -327,12 +348,12 @@ def _norm_invoice_id(cand: str) -> str:
 
 
 def _id_after_invoice_no_label(span: str) -> Optional[str]:
-    """Value sitting next to 'Invoice No' — not a PO/account 800 characters away."""
+    """Value sitting next to 'Invoice No' — not a PO or bank account."""
     window = span[:120]
     glued = _INV_SPACED_RE.match(window.lstrip(' :.-'))
     if glued:
         cand = f"{glued.group(1)}{glued.group(2)}"
-        if looks_like_invoice_id(cand):
+        if looks_like_invoice_id(cand, window):
             return _norm_invoice_id(cand)
     for tok in re.split(r'\s+', window.strip()):
         clean = tok.strip('.:#|,;')
@@ -340,19 +361,19 @@ def _id_after_invoice_no_label(span: str) -> Optional[str]:
             continue
         if clean.lower().rstrip('.') in _HEADER_WORDS:
             continue
-        if looks_like_invoice_id(clean):
+        if looks_like_invoice_id(clean, window):
             return _norm_invoice_id(clean)
         m = _INV_ID_RE.match(clean)
-        if m and looks_like_invoice_id(m.group(1)):
+        if m and looks_like_invoice_id(m.group(1), window):
             return _norm_invoice_id(m.group(1))
     return None
 
 
 def extract_invoice_number(text: str) -> Optional[str]:
-    """The token next to 'Invoice No:' / 'Invoice Ne:' / 'Invoice number'.
+    """The token next to the 'Invoice No:' field.
 
-    Ignores Consignee / Invoice To, Invoice Date, account numbers and POs.
-    Does not wander across the page looking for a 'better' ID.
+    Ignores Consignee / Invoice To, 'please quote invoice number', POs, and
+    8-digit bank accounts in the Bank Details block.
     """
     if not text:
         return None
@@ -361,25 +382,26 @@ def extract_invoice_number(text: str) -> Optional[str]:
     flat = re.sub(r'[\s|]+', ' ', masked).strip()
 
     for m in _INV_LABEL_RE.finditer(flat):
+        before = flat[max(0, m.start() - 48): m.start()]
+        if _FALSE_LABEL_BEFORE_RE.search(before):
+            continue
         found = _id_after_invoice_no_label(flat[m.end():])
         if found:
             return found
-        # Value printed immediately above/left of the label (one token).
-        before = flat[max(0, m.start() - 28): m.start()].strip()
-        if before:
-            last = before.split()[-1].strip('.:#|,;')
-            if looks_like_invoice_id(last):
+        prev = before.strip()
+        if prev:
+            last = prev.split()[-1].strip('.:#|,;')
+            if looks_like_invoice_id(last, before):
                 return _norm_invoice_id(last)
     return None
 
 
 def invoice_number_from_pdf_words(words) -> Optional[str]:
-    """Value to the right of, or just under, the 'Invoice No' label on the page."""
+    """Value to the right of, or just under, the topmost 'Invoice No' on the page."""
     if not words:
         return None
     texts = [(float(w[0]), float(w[1]), float(w[2]), float(w[3]), str(w[4])) for w in words]
-    label = None
-    label_i = None
+    labels = []
     for i, (_x0, y0, x1, y1, t) in enumerate(texts):
         if not re.fullmatch(r'invoice', t, re.I):
             continue
@@ -389,16 +411,22 @@ def invoice_number_from_pdf_words(words) -> Optional[str]:
         nxt2 = texts[i + 2] if i + 2 < len(texts) else None
         if nxt2 and re.fullmatch(r'(?:to|date|due|address)', nxt2[4], re.I):
             continue
-        label = nxt
-        label_i = i + 1
-        break
-    if label is None or label_i is None:
+        nearby = ' '.join(w[4] for w in texts[max(0, i - 6): i + 12])
+        if _FALSE_LABEL_BEFORE_RE.search(' '.join(w[4] for w in texts[max(0, i - 8): i])):
+            continue
+        if _BANK_CONTEXT_RE.search(nearby):
+            continue
+        labels.append((y0, i + 1, nxt))
+    if not labels:
         return None
+    labels.sort(key=lambda r: (r[0], r[1]))
+    _ly0, label_i, label = labels[0]
     _lx0, ly0, lx1, ly1, _ = label
     line_tol = max(4.0, (ly1 - ly0) * 0.7)
 
     def _from_tokens(seq):
         pending_prefix = None
+        blob = ' '.join(seq)
         for t in seq:
             clean = t.strip('.:#|,;')
             if not clean:
@@ -408,10 +436,10 @@ def invoice_number_from_pdf_words(words) -> Optional[str]:
                 continue
             if pending_prefix:
                 glued = pending_prefix + clean
-                if looks_like_invoice_id(glued):
+                if looks_like_invoice_id(glued, blob):
                     return _norm_invoice_id(glued)
                 pending_prefix = None
-            if looks_like_invoice_id(clean):
+            if looks_like_invoice_id(clean, blob):
                 return _norm_invoice_id(clean)
             if re.fullmatch(r'[A-Za-z]{1,8}', clean) and not looks_like_po(clean):
                 pending_prefix = clean
