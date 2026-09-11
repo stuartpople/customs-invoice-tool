@@ -287,11 +287,14 @@ _BANK_CONTEXT_RE = re.compile(
     r'account\s+no|barclays|hsbc|natwest|lloyds|bank\s*:)\b',
     re.IGNORECASE,
 )
-_HEADER_WORDS = frozenset({
-    'tax', 'point', 'page', 'account', 'your', 'our', 'ref', 'reference',
-    'order', 'po', 'p.o', 'p.o.', 'delivery', 'date', 'customer', 'vat',
-    'due', 'total', 'number', 'no', 'nr', 'ne', 'n0', 'of', 'acc', 'a/c',
-    'code', 'from', 'to', 'terms', 'payment', 'currency', 'of', '1',
+_SKIP_ROW_LABELS = frozenset({
+    'tax', 'point', 'page', 'of', '1', 'number', 'no', 'nr', 'ne', 'n0',
+})
+_STOP_FIELD_LABELS = frozenset({
+    'account', 'acc', 'a/c', 'a/c.', 'sort', 'iban', 'swift', 'bic', 'bank',
+    'your', 'our', 'order', 'po', 'p.o', 'p.o.', 'vat', 'payment', 'barclays',
+    'hsbc', 'natwest', 'lloyds', 'customer', 'delivery', 'terms', 'currency',
+    'code', 'ref', 'reference', 'date', 'due', 'from', 'to',
 })
 _OVERFLOW_PREFIX_RE = re.compile(
     r'^(LENGTH|WIDTH|HEIGHT|DEPTH|BREAKLOAD|COLOUR|COLOR|SIZE|DIMS?|'
@@ -348,7 +351,7 @@ def _norm_invoice_id(cand: str) -> str:
 
 
 def _id_after_invoice_no_label(span: str) -> Optional[str]:
-    """Value sitting next to 'Invoice No' — not a PO or bank account."""
+    """Value sitting next to 'Invoice No' — stop at Account No / bank 'No:'."""
     window = span[:120]
     glued = _INV_SPACED_RE.match(window.lstrip(' :.-'))
     if glued:
@@ -359,7 +362,10 @@ def _id_after_invoice_no_label(span: str) -> Optional[str]:
         clean = tok.strip('.:#|,;')
         if not clean:
             continue
-        if clean.lower().rstrip('.') in _HEADER_WORDS:
+        key = clean.lower().rstrip('.')
+        if key in _STOP_FIELD_LABELS:
+            break
+        if key in _SKIP_ROW_LABELS:
             continue
         if looks_like_invoice_id(clean, window):
             return _norm_invoice_id(clean)
@@ -408,13 +414,15 @@ def invoice_number_from_pdf_words(words) -> Optional[str]:
         nxt = texts[i + 1] if i + 1 < len(texts) else None
         if not nxt or not re.fullmatch(r'(?:no\.?|nr\.?|n0|ne|num(?:ber)?|#):?', nxt[4], re.I):
             continue
+        # 'Invoice' and 'No' must be the same label, not title 'Invoice' + bank 'No:'
+        if abs(nxt[1] - y0) > max(4.0, (y1 - y0) * 0.8):
+            continue
+        if nxt[0] - x1 > 50:
+            continue
         nxt2 = texts[i + 2] if i + 2 < len(texts) else None
         if nxt2 and re.fullmatch(r'(?:to|date|due|address)', nxt2[4], re.I):
             continue
-        nearby = ' '.join(w[4] for w in texts[max(0, i - 6): i + 12])
         if _FALSE_LABEL_BEFORE_RE.search(' '.join(w[4] for w in texts[max(0, i - 8): i])):
-            continue
-        if _BANK_CONTEXT_RE.search(nearby):
             continue
         labels.append((y0, i + 1, nxt))
     if not labels:
@@ -431,7 +439,10 @@ def invoice_number_from_pdf_words(words) -> Optional[str]:
             clean = t.strip('.:#|,;')
             if not clean:
                 continue
-            if clean.lower().rstrip('.') in _HEADER_WORDS:
+            key = clean.lower().rstrip('.')
+            if key in _STOP_FIELD_LABELS:
+                break
+            if key in _SKIP_ROW_LABELS:
                 pending_prefix = None
                 continue
             if pending_prefix:
@@ -453,9 +464,11 @@ def invoice_number_from_pdf_words(words) -> Optional[str]:
     found = _from_tokens([t for _x, t in right])
     if found:
         return found
+    # Only the Invoice No column — not Account No to the right (bank/header).
+    col_right = lx1 + max(36.0, (lx1 - _lx0) * 2)
     below = sorted(
         ((y0, x0, t) for x0, y0, _x1, _y1, t in texts[label_i + 1:]
-         if y0 >= ly1 - 2 and y0 <= ly1 + (ly1 - ly0) * 4 and x0 <= lx1 + 180),
+         if y0 >= ly1 - 2 and y0 <= ly1 + (ly1 - ly0) * 4 and x0 <= col_right),
         key=lambda r: (r[0], r[1]),
     )
     return _from_tokens([t for _y, _x, t in below])

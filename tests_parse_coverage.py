@@ -143,7 +143,16 @@ def test_invoice_number_not_account_or_po():
         'Invoice No: 88421 Your Ref: PO-99'
     ) == '88421'
     assert extract_invoice_number(
-        'Invoice No. Account Your Ref\nINV00017249 33404927 PO-99'
+        'Invoice No: INV00017249 Account Your Ref 33404927 PO-99'
+    ) == 'INV00017249'
+    assert extract_invoice_number(
+        'Invoice No. Account No: 81839357 Sort code: 20-00-00'
+    ) not in ('81839357', '200000', '20-00-00')
+    assert extract_invoice_number(
+        'Invoice No. Account No: 81839357 Sort code: 20-00-00'
+    ) is None
+    assert extract_invoice_number(
+        'Invoice No: INV00017249\nBank Details\nAccount No: 81839357\nSort code: 40-05-25'
     ) == 'INV00017249'
     assert extract_invoice_number(
         'Account No.: 33404927\nInvoice No: SIN134283'
@@ -197,6 +206,21 @@ def test_invoice_number_from_pdf_words_right_of_label():
     assert invoice_number_from_pdf_words(words) == 'INV00017249'
 
 
+def test_invoice_number_from_pdf_words_ignores_account_no():
+    from parse_coverage import invoice_number_from_pdf_words
+    # Invoice No: (value below)     Account No: 81839357
+    words = [
+        (10, 20, 50, 32, 'Invoice', 0, 0, 0),
+        (52, 20, 70, 32, 'No:', 0, 0, 1),
+        (220, 20, 270, 32, 'Account', 0, 0, 2),
+        (272, 20, 300, 32, 'No:', 0, 0, 3),
+        (310, 20, 380, 32, '81839357', 0, 0, 4),
+        (10, 40, 90, 52, 'INV00017249', 0, 1, 0),
+    ]
+    assert invoice_number_from_pdf_words(words) == 'INV00017249'
+    assert invoice_number_from_pdf_words(words) != '81839357'
+
+
 
 def test_export_cpc_defaults_to_1040():
     from parse_coverage import extract_cpc_code, default_cpc
@@ -248,6 +272,7 @@ if __name__ == '__main__':
     test_invoice_number_not_account_or_po()
     test_invoice_number_not_bank_account()
     test_invoice_number_from_pdf_words_right_of_label()
+    test_invoice_number_from_pdf_words_ignores_account_no()
     test_export_cpc_defaults_to_1040()
     test_wrap_row_without_hs_merges()
     print('ok')
