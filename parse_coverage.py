@@ -264,6 +264,12 @@ _PARTY_PHRASE_RE = re.compile(
     r'\bship(?:ped)?\s+to\b',
     re.IGNORECASE,
 )
+# Sage/Arrow put Account next to Invoice No; the account value must not win.
+_ACCOUNT_FIELD_RE = re.compile(
+    r'\b(?:account|a/?c)\s*(?:no\.?|nr\.?|number|#|code)?\s*[:.\-]?\s*'
+    r'[A-Z0-9][A-Z0-9\-/]{2,}',
+    re.IGNORECASE,
+)
 
 # Invoice No / Nr / Ne (OCR of No) / Number / # — not Invoice To / Date / Ref.
 _INV_LABEL_RE = re.compile(
@@ -317,13 +323,8 @@ def _norm_invoice_id(cand: str) -> str:
     return cand.upper() if re.search(r'[A-Za-z]', cand) else cand
 
 
-def _invoice_ids_in(span: str, limit: int = 600) -> List[str]:
-    """Invoice-like tokens after a label, nearest first.
-
-    Sage/Arrow dumps column headers before the value, so the ID may sit
-    hundreds of characters after 'Invoice No'. Do not scan the whole window
-    for 'GB 377109145' style spaced pairs — only glue the first tokens.
-    """
+def _invoice_ids_in(span: str, limit: int = 800) -> List[str]:
+    """Invoice-like tokens after a label, nearest first."""
     chunk = span[:limit]
     found: List[str] = []
     immediate = _INV_SPACED_RE.search(chunk[:48])
@@ -337,33 +338,42 @@ def _invoice_ids_in(span: str, limit: int = 600) -> List[str]:
             normed = _norm_invoice_id(cand)
             if normed not in found:
                 found.append(normed)
-    sage = _SAGE_INV_RE.search(chunk)
-    if sage and looks_like_invoice_id(sage.group(1)):
-        normed = _norm_invoice_id(sage.group(1))
-        if normed not in found:
-            found.append(normed)
     return found
+
+
+def _pick_invoice_candidate(span: str) -> Optional[str]:
+    """Prefer Sage INV000… / letter+digit refs over a neighbouring account number."""
+    sage = _SAGE_INV_RE.search(span[:800])
+    if sage and looks_like_invoice_id(sage.group(1)):
+        return _norm_invoice_id(sage.group(1))
+    ids = _invoice_ids_in(span, limit=800)
+    alpha = [i for i in ids if re.search(r'[A-Z]', i)]
+    if alpha:
+        return alpha[0]
+    near = _invoice_ids_in(span, limit=64)
+    return near[0] if near else None
 
 
 def extract_invoice_number(text: str) -> Optional[str]:
     """Find the commercial invoice number for CDS previous-document (Z/380).
 
-    Reads the standard 'Invoice No:' field even when PDF reading-order puts the
-    value on a later line or before the label. Ignores 'Consignee / Invoice To'.
+    Reads 'Invoice No:' even when PDF reading-order puts the value later.
+    Account numbers sitting next to that field are ignored.
     """
     if not text:
         return None
 
     masked = _PARTY_PHRASE_RE.sub(' ', text)
+    masked = _ACCOUNT_FIELD_RE.sub(' ', masked)
     flat = re.sub(r'[\s|]+', ' ', masked).strip()
 
     for m in _INV_LABEL_RE.finditer(flat):
-        after = _invoice_ids_in(flat[m.end():])
-        if after:
-            return after[0]
-        before = _invoice_ids_in(flat[max(0, m.start() - 80): m.start()])
-        if before:
-            return before[-1]
+        found = _pick_invoice_candidate(flat[m.end():])
+        if found:
+            return found
+        found = _pick_invoice_candidate(flat[max(0, m.start() - 80): m.start()])
+        if found:
+            return found
 
     sage = _SAGE_INV_RE.search(flat)
     if sage and looks_like_invoice_id(sage.group(1)):

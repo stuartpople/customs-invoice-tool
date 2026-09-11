@@ -146,6 +146,31 @@ def test_invoice_number_sage_value_after_header_labels():
     assert extract_invoice_number('Invoice No: SO16') is None
 
 
+def test_invoice_number_not_account_number():
+    from parse_coverage import extract_invoice_number
+    interleaved = """
+    Invoice No.
+    Account
+    33404927
+    Your Ref
+    PO-99
+    INV00017249
+    11/09/2026
+    """
+    assert extract_invoice_number(interleaved) == 'INV00017249'
+    assert extract_invoice_number(
+        'Invoice No. Account Your Ref\n33404927 INV00017249 PO-99'
+    ) == 'INV00017249'
+    assert extract_invoice_number(
+        'Invoice No: INV00017249\nAccount No: 33404927'
+    ) == 'INV00017249'
+    assert extract_invoice_number(
+        'Account No.: 33404927\nInvoice No: SIN134283'
+    ) == 'SIN134283'
+    assert extract_invoice_number('Invoice No: 88421') == '88421'
+    assert extract_invoice_number('Invoice number\n2221875953') == '2221875953'
+
+
 
 def test_export_cpc_defaults_to_1040():
     from parse_coverage import extract_cpc_code, default_cpc
@@ -194,6 +219,7 @@ if __name__ == '__main__':
     test_invoice_number_skips_consignee_invoice_to()
     test_invoice_number_standard_no_on_same_row_as_invoice_to()
     test_invoice_number_sage_value_after_header_labels()
+    test_invoice_number_not_account_number()
     test_export_cpc_defaults_to_1040()
     test_wrap_row_without_hs_merges()
     print('ok')
