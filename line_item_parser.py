@@ -494,7 +494,7 @@ class LineItemParser:
                 merge_overflow_items,
             )
         except ImportError:
-            items = self._postprocess_items(items or [])
+            items = self._postprocess_items(items or [], source_text=all_text or "")
             result = {
                 "total_items": len(items),
                 "items": items,
@@ -508,7 +508,7 @@ class LineItemParser:
 
         items = [self._coerce_parser_item(it) for it in (items or [])]
         items = merge_overflow_items(items)
-        items = self._postprocess_items(items)
+        items = self._postprocess_items(items, source_text=all_text or "")
         pad_to_10 = (direction or "").lower() == "import"
         currency = "GBP" if re.search(r"\bGBP\b", all_text or "") else "USD"
         lines = (all_text or "").split("\n")
@@ -532,7 +532,7 @@ class LineItemParser:
                 currency=currency,
             )
             items.extend(harvested)
-            items = self._postprocess_items(items)
+            items = self._postprocess_items(items, source_text=all_text or "")
             doc_hs, parsed_hs, warnings = coverage_warnings(items, all_text)
             missing = doc_hs - parsed_hs
 
@@ -604,7 +604,7 @@ class LineItemParser:
         # Fall back to environment variable (local dev)
         return os.getenv(key_name) or None
 
-    def _postprocess_items(self, items: List[Dict]) -> List[Dict]:
+    def _postprocess_items(self, items: List[Dict], source_text: str = "") -> List[Dict]:
         """Filter out obvious invoice-level rows (totals/terms/etc.) and dedupe.
 
         Strategy:
@@ -617,6 +617,8 @@ class LineItemParser:
         """
         if not items:
             return items
+
+        banned_digits = self.bank_account_digit_blacklist(source_text)
 
         footer_tokens = [
             'total product', 'shipping cost', 'in total', 'terms & conditions',
@@ -671,7 +673,7 @@ class LineItemParser:
                 continue
             seen_keys.add(key)
 
-            self._sanitize_item_commodity_code(it)
+            self._sanitize_item_commodity_code(it, banned_digits=banned_digits)
 
             from countries import normalize_item_country_fields
             normalize_item_country_fields(it)
@@ -680,14 +682,39 @@ class LineItemParser:
 
         return kept
 
-    def _sanitize_item_commodity_code(self, item: Dict) -> None:
-        """Drop commodity codes that are stock numbers or other non-tariff digits."""
+    @staticmethod
+    def bank_account_digit_blacklist(text: str) -> set:
+        """Extract 6–10 digit bank account / IBAN tail numbers from remittance text."""
+        found = set()
+        if not text:
+            return found
+        for match in re.finditer(
+            r'account\s*(?:no\.?|number)?\s*[:#]?\s*(\d{6,10})\b',
+            text,
+            re.IGNORECASE,
+        ):
+            found.add(match.group(1))
+        for match in re.finditer(
+            r'\bIBAN\s*[:#]?\s*[A-Z]{2}\d{2}[A-Z0-9]*?(\d{8})\b',
+            text,
+            re.IGNORECASE,
+        ):
+            found.add(match.group(1))
+        return found
+
+    def _sanitize_item_commodity_code(self, item: Dict, banned_digits=None) -> None:
+        """Drop commodity codes that are stock numbers, bank accounts, or other non-tariff digits."""
         raw = (item.get('commodity_code') or '').strip()
         if not raw:
             return
         digits = re.sub(r'\D', '', raw)
         if not digits:
             item['commodity_code'] = ''
+            return
+        if banned_digits and digits in banned_digits:
+            item['commodity_code'] = ''
+            if 'hs_code' in item:
+                item['hs_code'] = ''
             return
         stock = re.sub(r'\D', '', str(item.get('stock_number') or ''))
         if stock and digits == stock:
@@ -701,13 +728,36 @@ class LineItemParser:
             digits = digits[:10]
         try:
             chapter = int(digits[:2])
+            heading = int(digits[:4])
         except ValueError:
             item['commodity_code'] = ''
             return
         if chapter < 1 or (chapter > 97 and chapter != 99):
             item['commodity_code'] = ''
             return
+        # Chapter 70 (glass) ends at heading 7020 — 7021… is never a tariff code
+        # (common false positive: UK 8-digit bank account numbers like 70216529).
+        if chapter == 70 and heading > 7020:
+            item['commodity_code'] = ''
+            return
+
+        ctx = ' '.join(
+            str(item.get(k) or '')
+            for k in ('description', 'raw_text', 'stock_number')
+        ).lower()
+        if any(
+            tok in ctx
+            for tok in (
+                'account number', 'iban', 'sort code', 'bank information',
+                'bank name', 'bank address', 'bic:', 'please remit',
+            )
+        ):
+            item['commodity_code'] = ''
+            return
+
         item['commodity_code'] = digits[:8] if len(digits) >= 8 else digits
+        if 'hs_code' in item:
+            item['hs_code'] = item['commodity_code']
     
     @staticmethod
     def _looks_like_goods_description_commodity_table(text: str) -> bool:
@@ -4423,6 +4473,18 @@ class LineItemParser:
         re.IGNORECASE,
     )
 
+    @classmethod
+    def _ati_is_stock_before_hs(cls, lines: list, index: int) -> bool:
+        """True when lines[index] is an 8-digit stock number followed by COC + HS."""
+        if index + 2 >= len(lines):
+            return False
+        if not cls._ATI_HS_RE.match(lines[index] or ""):
+            return False
+        return (
+            lines[index + 1] in cls._ATI_COC_SET
+            and bool(cls._ATI_HS_RE.match(lines[index + 2] or ""))
+        )
+
     def _parse_ati_format(self, doc, direction: str, page_map: Dict) -> List[Dict]:
         """
         Parse Applied Technologies International (ATI) commercial invoices.
@@ -4542,6 +4604,18 @@ class LineItemParser:
                 if bwidth < DATA_MIN_W:
                     continue
 
+                # Never treat bank / remittance footers as line items
+                # (Account Number: 70216529 looks like an 8-digit HS code).
+                _blk_lower = (text or '').lower()
+                if any(
+                    tok in _blk_lower
+                    for tok in (
+                        'bank information', 'account number', 'iban:', 'sort code',
+                        'please remit', 'invoice total',
+                    )
+                ):
+                    continue
+
                 lines = [ln.strip() for ln in text.split('\n') if ln.strip()]
                 i = 0
                 while i < len(lines):
@@ -4554,13 +4628,19 @@ class LineItemParser:
                     item_num = int(ln)
                     i += 1
 
-                    # Collect stock_no — lines until a COC or HS code is found
+                    # Collect stock_no — lines until a COC or HS code is found.
+                    # Stock numbers can themselves be 8 digits (e.g. 49162771).
+                    # Disambiguate: digits + COC + digits ⇒ stock then HS.
                     stock_parts: List[str] = []
                     while i < len(lines) and len(stock_parts) < 3:
                         nxt = lines[i]
                         if nxt in self._ATI_COC_SET:
                             break
                         if self._ATI_HS_RE.match(nxt):
+                            if self._ati_is_stock_before_hs(lines, i):
+                                stock_parts.append(nxt)
+                                i += 1
+                                continue
                             break
                         # UoM line signals no stock no was present
                         if re.match(r'^\d+\s+(OF|METER|METRE|SET|PACK|KIT|REEL)\b',

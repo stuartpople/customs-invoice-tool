@@ -12,7 +12,8 @@ from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 
 _JUNK_LINE_RE = re.compile(
-    r'account\s*no|sort\s*code|iban|swift|vat\s*no|eori|'
+    r'account\s*(?:number|no\.?)(?:\b|:)|sort\s*code|iban|swift|vat\s*no|eori|'
+    r'bank\s+information|bank\s+details|please\s+remit|'
     r'phone\s*:|fax\s*:|invoice\s*no|invoice\s*date|invoice\s+due|'
     r'consignee|exporter:|page\s+\d+\s+of|tax\s+exclusive|'
     r'total\s+(gbp|usd|eur)\s+incl|grand\s+total|payment\s+terms|'
@@ -42,7 +43,13 @@ def is_commodity_hs(code: str) -> bool:
     if any(digits.startswith(p) for p in _JUNK_HS_PREFIXES):
         return False
     chapter = int(digits[:2])
-    return 1 <= chapter <= 97 or chapter == 99
+    if not (1 <= chapter <= 97 or chapter == 99):
+        return False
+    # Chapter 70 (glass) ends at heading 7020 — 70216529 is a bank account, not HS
+    heading = int(digits[:4])
+    if chapter == 70 and heading > 7020:
+        return False
+    return True
 
 
 def cn8(code: str) -> str:
@@ -151,6 +158,15 @@ def harvest_hs_rows(
     for i, raw in enumerate(lines):
         line = (raw or '').strip()
         if not line or _JUNK_LINE_RE.search(line):
+            continue
+        # Remittance footers: "Account Number: 70216529" / IBAN tails
+        if looks_like_bank_account(
+            next(
+                (m.group(1) for m in _HS_RE.finditer(line) if len(m.group(1)) in (8, 10)),
+                '',
+            ),
+            line,
+        ):
             continue
         hs_m = None
         for m in _HS_RE.finditer(line):
@@ -283,8 +299,9 @@ _FALSE_LABEL_BEFORE_RE = re.compile(
     re.IGNORECASE,
 )
 _BANK_CONTEXT_RE = re.compile(
-    r'\b(?:bank\s+details|sort\s*code|iban|swift|bic|a/?c\s*no|'
-    r'account\s+no|barclays|hsbc|natwest|lloyds|bank\s*:)\b',
+    r'(?:bank\s+details|bank\s+information|sort\s*code|\biban\b|\bswift\b|\bbic\b|'
+    r'a/?c\s*no|account\s*(?:number|no\.?)|barclays|hsbc|natwest|lloyds|clyde|'
+    r'bank\s*:)',
     re.IGNORECASE,
 )
 _COL_HEADERS = frozenset({

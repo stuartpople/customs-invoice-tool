@@ -221,6 +221,9 @@ def _validate_commodity_code(code: Optional[str], value: Optional[float], unit_p
     chapter = int(digits[:2])
     if chapter not in _VALID_HS_CHAPTERS:
         return None
+    # Chapter 70 ends at 7020 — bank accounts like 70216529 are not glass HS codes
+    if chapter == 70 and int(digits[:4]) > 7020:
+        return None
     # Reject if the numeric value of the code matches the line value or unit_price
     code_num = int(digits)
     for monetary in [value, unit_price]:
