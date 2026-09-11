@@ -250,30 +250,38 @@ _INV_STOP = frozenset({
     'CUSTOMER', 'SUPPLIER', 'COMPANY', 'ACCOUNT',
 })
 
-# Party-role lines that contain the word Invoice but are not the invoice number
-_PARTY_INVOICE_LINE_RE = re.compile(
+# Party phrases that contain "invoice" but are not the invoice-number label.
+# Mask these; do not skip the whole line — Arrow/two-column PDFs often extract
+# "Consignee / Invoice To:" and "Invoice No: INV00017249" on the same row.
+_PARTY_PHRASE_RE = re.compile(
+    r'consignee\s*/\s*invoice\s*to|'
     r'consignee\s*/\s*invoice|'
-    r'invoice\s+to\b|'
-    r'invoice\s+address|'
-    r'invoice\s+for\b|'
-    r'bill\s+to\b|'
-    r'sold\s+to\b|'
-    r'ship(?:ped)?\s+to\b',
+    r'\binvoice\s+to\b|'
+    r'\binvoice\s+address\b|'
+    r'\binvoice\s+for\b|'
+    r'\bbill(?:ed)?\s+to\b|'
+    r'\bsold\s+to\b|'
+    r'\bship(?:ped)?\s+to\b',
     re.IGNORECASE,
 )
 
-# Invoice No / Nr / Ne (OCR of No) / Number / Ref / #  then SIN134283 or 6+ digits
+# Invoice No / Nr / Ne (OCR of No) / Number / Ref / # then the ID.
+# Allow a single-letter prefix (S81217) and 4+ digit numbers (88421).
 _INV_LABEL_ID_RE = re.compile(
-    r'(?:invoice|inv)\s*(?:no\.?|nr\.?|ne|n0|num(?:ber)?|ref(?:erence)?|#)\s*[:.\-]?\s*'
-    r'([A-Z]{2,8}[-/]?\d{2,}[A-Z0-9\-/]*|\d{6,12})',
+    r'(?:invoice|inv)[\s.]*'
+    r'(?:no\.?|nr\.?|n0|ne(?![a-z])|num(?:ber)?|ref(?:erence)?|#)'
+    r'(?!\s*(?:to|address|date|due|total|value|from)\b)\s*[:.\-]?\s*'
+    r'([A-Za-z]{1,10}[-/]?\d{2,}[A-Za-z0-9\-/]*|\d{4,16})',
     re.IGNORECASE,
 )
 _INV_LABEL_RE = re.compile(
-    r'(?:invoice|inv)\s*(?:no\.?|nr\.?|ne|n0|num(?:ber)?|ref(?:erence)?|#)\b',
+    r'(?:invoice|inv)[\s.]*'
+    r'(?:no\.?|nr\.?|n0|ne(?![a-z])|num(?:ber)?|ref(?:erence)?|#)'
+    r'(?!\s*(?:to|address|date|due|total|value|from)\b)',
     re.IGNORECASE,
 )
 _INV_ID_RE = re.compile(
-    r'\b([A-Z]{2,8}[-/]?\d{2,}[A-Z0-9\-/]*|\d{6,12})\b',
+    r'\b([A-Za-z]{1,10}[-/]?\d{2,}[A-Za-z0-9\-/]*|\d{4,16})\b',
     re.IGNORECASE,
 )
 _OVERFLOW_PREFIX_RE = re.compile(
@@ -289,22 +297,28 @@ def looks_like_invoice_id(candidate: str) -> bool:
         return False
     if not re.search(r'\d', cand):
         return False
-    if re.fullmatch(r'[A-Z]{2,8}[-/]?\d{2,}[A-Z0-9\-/]*', cand, re.I):
+    if len(cand) < 4 or len(cand) > 24:
+        return False
+    if re.search(r'\d{1,2}[./-]\d{1,2}[./-]\d{2,4}', cand):
+        return False
+    if re.fullmatch(r'[A-Z]{1,10}[-/]?\d{2,}[A-Z0-9\-/]*', cand, re.I):
         return True
-    if re.fullmatch(r'\d{6,12}', cand):
-        # Phone / VAT / sort-code fragments
-        if cand.startswith(('1323', '377109', '4470', '44')):
+    if re.fullmatch(r'\d{4,16}', cand):
+        # Phone / VAT / sort-code fragments / a lone year
+        if cand.startswith(('1323', '377109', '4470')):
             return False
-        return 6 <= len(cand) <= 12
+        if re.fullmatch(r'(?:19|20)\d{2}', cand):
+            return False
+        return True
     return False
 
 
 def extract_invoice_number(text: str) -> Optional[str]:
     """Find the commercial invoice number for CDS previous-document (Z/380).
 
-    Handles two-column headers and OCR (`Invoice Ne: SIN134283`). Ignores the
-    'Commercial Invoice' title, Invoice Date / Due Date, and party labels
-    like 'Consignee / Invoice To:'.
+    Reads the standard 'Invoice No:' field even when it shares a PDF row with
+    'Consignee / Invoice To:'. OCR 'Invoice Ne' / wrapped 'Invoice\\nNo:' still
+    count. Party labels never become the number.
     """
     if not text:
         return None
@@ -312,25 +326,20 @@ def extract_invoice_number(text: str) -> Optional[str]:
     def _norm(cand: str) -> str:
         return cand.upper() if re.search(r'[A-Za-z]', cand) else cand
 
-    lines = text.splitlines()
-    for line in lines:
-        if _PARTY_INVOICE_LINE_RE.search(line):
-            continue
-        m = _INV_LABEL_ID_RE.search(line)
-        if m and looks_like_invoice_id(m.group(1)):
-            return _norm(m.group(1))
+    header = '\n'.join(text.splitlines()[:120])
+    masked = _PARTY_PHRASE_RE.sub(' ', header)
+    flat = re.sub(r'[\s|]+', ' ', masked).strip()
 
-    for i, line in enumerate(lines):
-        if _PARTY_INVOICE_LINE_RE.search(line):
-            continue
-        if re.search(r'commercial\s+invoice', line, re.I):
-            continue
-        if re.search(r'invoice\s+date|invoice\s+due', line, re.I):
-            continue
-        if not _INV_LABEL_RE.search(line):
-            continue
-        window = ' '.join(lines[i:i + 3])
-        for m in _INV_ID_RE.finditer(window):
+    for m in _INV_LABEL_ID_RE.finditer(flat):
+        cand = m.group(1)
+        if looks_like_invoice_id(cand):
+            return _norm(cand)
+
+    # Label present but ID on the following tokens (rare leftover spacing)
+    label = _INV_LABEL_RE.search(flat)
+    if label:
+        tail = flat[label.end():label.end() + 80]
+        for m in _INV_ID_RE.finditer(tail):
             cand = m.group(1)
             if looks_like_invoice_id(cand):
                 return _norm(cand)

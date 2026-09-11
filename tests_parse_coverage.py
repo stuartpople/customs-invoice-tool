@@ -102,6 +102,24 @@ def test_invoice_number_skips_consignee_invoice_to():
     assert extract_invoice_number('Consignee / Invoice To:\nACME LTD') is None
 
 
+def test_invoice_number_standard_no_on_same_row_as_invoice_to():
+    """PDF two-column headers glue 'Invoice To' and 'Invoice No' onto one line."""
+    from parse_coverage import extract_invoice_number
+    arrow = (
+        "Consignee / Invoice To: ARROW CUSTOMER LTD "
+        "Invoice No: INV00017249 Invoice Date: 11/09/2026"
+    )
+    assert extract_invoice_number(arrow) == 'INV00017249'
+    assert extract_invoice_number('Invoice To: ACME LTD\nInvoice No: INV00017252') == 'INV00017252'
+    assert extract_invoice_number('Invoice\nNo:\nINV00017249') == 'INV00017249'
+    assert extract_invoice_number('Invoice No: 88421') == '88421'
+    assert extract_invoice_number('Invoice No: S81217') == 'S81217'
+    assert extract_invoice_number('Invoice No:') is None
+    assert extract_invoice_number('Invoice To: CONSIGNEE LTD') is None
+    assert extract_invoice_number('Invoice Date: 11/09/2026') is None
+    assert extract_invoice_number('Invoice No: INV-2026-001') == 'INV-2026-001'
+
+
 def test_export_cpc_defaults_to_1040():
     from parse_coverage import extract_cpc_code, default_cpc
     assert default_cpc('export') == '1040'
@@ -147,6 +165,7 @@ if __name__ == '__main__':
     test_not_commodity()
     test_invoice_number_ocr_ne_and_title()
     test_invoice_number_skips_consignee_invoice_to()
+    test_invoice_number_standard_no_on_same_row_as_invoice_to()
     test_export_cpc_defaults_to_1040()
     test_wrap_row_without_hs_merges()
     print('ok')

@@ -76,7 +76,7 @@ import shutil
 
 
 # Version tracking for cache busting
-APP_VERSION = "v3.39"
+APP_VERSION = "v3.40"
 
 
 def _normalize_items_hs_for_direction(items: list, direction: str) -> list:
@@ -395,7 +395,11 @@ st.markdown("""
 if 'app_version' not in st.session_state or st.session_state.app_version != APP_VERSION:
     # Clear both session and process-wide HMRC caches on version change.
     HMRCTariffAPI.clear_caches()
-    keys_to_clear = ['hmrc_results', 'hmrc_consolidate_state', 'hmrc_dest_country', 'parsed_items', 'parsed_job_ids', 'hs_validation_results']
+    keys_to_clear = [
+        'hmrc_results', 'hmrc_consolidate_state', 'hmrc_dest_country',
+        'parsed_items', 'parsed_job_ids', 'hs_validation_results',
+        'invoice_metadata', 'invoice_number_field', 'invoice_number_input',
+    ]
     for key in keys_to_clear:
         if key in st.session_state:
             del st.session_state[key]
@@ -1248,17 +1252,21 @@ elif st.session_state.processing_started and st.session_state.current_job_id:
                                 fmt = result.get('format_type', 'unknown')
                                 all_items.extend(items)
                                 _meta = dict(result.get('metadata') or {})
-                                if result.get('invoice_number'):
-                                    _meta['invoice_number'] = result['invoice_number']
+                                _inv = str(
+                                    result.get('invoice_number')
+                                    or _meta.get('invoice_number')
+                                    or ''
+                                ).strip()
+                                _meta['invoice_number'] = _inv
                                 if _meta:
                                     st.session_state.invoice_metadata = {
                                         **st.session_state.get('invoice_metadata', {}),
                                         **{k: v for k, v in _meta.items() if v not in (None, '')},
                                     }
-                                    st.session_state.invoice_number_input = str(
-                                        st.session_state.invoice_metadata.get('invoice_number') or ''
-                                    )
-                                    st.session_state.invoice_number_field = st.session_state.invoice_number_input
+                                    # Always replace — do not keep a previous CONSIGNEE/blank
+                                    st.session_state.invoice_metadata['invoice_number'] = _inv
+                                    st.session_state.invoice_number_input = _inv
+                                    st.session_state.invoice_number_field = _inv
                                 if items:
                                     pw = result.get('parse_warning')
                                     hs_doc = result.get('hs_in_document') or []
