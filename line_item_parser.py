@@ -137,9 +137,14 @@ class LineItemParser:
         #               Total Item Weight | Unit Price | Total Amount
         # SOR/PSHPT/POR order-reference lines are interspersed and must be skipped.
         _is_marlow = (
-            re.search(r'\bHS Code\b', all_text) is not None
-            and re.search(r'\bItem No\.', all_text) is not None
-            and re.search(r'\bUoM\b', all_text) is not None
+            (
+                re.search(r'Marlow\s+Ropes', all_text, re.IGNORECASE) is not None
+                or 'marlowropes.com' in all_text.lower()
+            )
+            and (
+                re.search(r'HS\s*Code', all_text, re.IGNORECASE) is not None
+                or re.search(r'\bItem\s*No', all_text, re.IGNORECASE) is not None
+            )
         )
         if _is_marlow:
             print("[Parser] Marlow Ropes 'HS Code / UoM' table format detected — using dedicated parser")
@@ -2697,18 +2702,21 @@ class LineItemParser:
         items: List[Dict] = []
         pad_to_10 = direction.lower() == "import"
 
-        # Item number at line start: 2–3 uppercase letters + 3–4 digits
-        # e.g. PK0357, WTW034, JLN005, FAB114, EDA003
-        _item_re = re.compile(r'^([A-Z]{2,3}\d{3,4})\b')
+        # Item number at line start. OCR on scans often turns S→5 and 0→O
+        # (DRS125→DR5125, TAE003→TAEOO3, FAF000→FAFOOO) and random case
+        # (Ty4107). Must be case-insensitive or the next SKU is swallowed
+        # as a continuation and steals that row's HS/total.
+        _item_re = re.compile(r'^([A-Z]{2,4}[A-Z0-9]{3,5})\b', re.IGNORECASE)
 
         # Lines to skip unconditionally
         _skip_re = re.compile(
             r'^SOR\d'                           # SOR order references
+            r'|PSHPT'                           # packed-on / shipment refs (OCR may use O for 0)
             r'|^Page \d+ of'                    # page numbers
             r'|^Exporter:'
             r'|^Commercial Invoice'
             r'|^Our Standard'
-            r'|^Item No\.'                       # column header
+            r'|^Item No'                         # column header (Item No. / Item No)
             r'|^VAT No[: ]'
             r'|^UK EORI:'
             r'|^EU EORI:'
@@ -2737,19 +2745,43 @@ class LineItemParser:
             r'|^Great Britain'
             r'|^Tax Exclusive'
             r'|^VAT Amount'
-            r'|^Total USD'
+            r'|^Total (USD|GBP)'
             r'|^Comments'
             r'|^Marlow Ropes USD'
             r'|---\s*PAGE',
             re.IGNORECASE,
         )
 
-        _hs_re = re.compile(r'\b(\d{10})\b')
-        _money_re = re.compile(r'([\d,]+\.\d{2})')
+        _hs_re = re.compile(r'\b(\d{8,10})\b')
+        _money_re = re.compile(r'([\d]+[.,]\d{2})')
+        _ocr_row_re = re.compile(
+            r'(?P<sku>[A-Z]{2,4}[A-Z0-9]{3,5})\b.+'
+            r'\s\|?\s*(?P<qty>\d+)\s*\|?\s*(?P<uom>EA|M|PC|PCS)\s*\|?\s*'
+            r'(?P<hs>\d{8,10})'
+            r'(?:\s*\|?\s*(?P<coo>[A-Z]{2}))?',
+            re.IGNORECASE,
+        )
+        joined_source = '\n'.join(lines)
+        currency = 'GBP' if re.search(r'\bGBP\b', joined_source) else 'USD'
+
+        def _is_commodity_hs(code: str) -> bool:
+            if not code or not code.isdigit() or len(code) not in (8, 10):
+                return False
+            chapter = int(code[:2])
+            if chapter < 1 or chapter > 97:
+                return False
+            # VAT / phone / EORI fragments that OCR presents as 8–10 digits
+            if code.startswith('377109') or code.startswith('13234444'):
+                return False
+            return True
 
         def _build_item(item_no: str, buf_lines: List[str], line_idx: int) -> Optional[Dict]:
             all_text = ' '.join(buf_lines)
-            hs_m = _hs_re.search(all_text)
+            hs_m = None
+            for m in _hs_re.finditer(all_text):
+                if _is_commodity_hs(m.group(1)):
+                    hs_m = m
+                    break
             if not hs_m:
                 return None
 
@@ -2757,8 +2789,8 @@ class LineItemParser:
             before_hs = all_text[:hs_m.start()].strip()
             after_hs = all_text[hs_m.end():].strip()
 
-            # before_hs: "DESCRIPTION... QTY UOM"
-            btokens = before_hs.split()
+            # before_hs: "DESCRIPTION... QTY UOM" (OCR may leave table pipes)
+            btokens = [t for t in before_hs.split() if t not in ('|', '||', '¦')]
             uom, qty, desc_end = "EA", "1", len(btokens)
             for j in range(len(btokens) - 1, max(-1, len(btokens) - 6), -1):
                 t = btokens[j].upper()
@@ -2769,10 +2801,10 @@ class LineItemParser:
                         qty = btokens[j - 1]
                         desc_end = j - 1
                     break
-            description = ' '.join(btokens[:desc_end])
+            description = ' '.join(btokens[:desc_end]).strip(' -|~')
 
             # after_hs: "COO  WEIGHT  [unit_price_possibly_overflowing]  TOTAL"
-            atokens = after_hs.split()
+            atokens = [t for t in after_hs.split() if t not in ('|', '||', '¦')]
             coo, weight = "", ""
             idx = 0
             if idx < len(atokens) and re.match(r'^[A-Z]{2}$', atokens[idx]):
@@ -2784,9 +2816,12 @@ class LineItemParser:
 
             # Remaining tokens may include long float overflow; find money values
             remaining = ' '.join(atokens[idx:])
-            money_vals = _money_re.findall(remaining)
-            total_value = money_vals[-1].replace(',', '') if money_vals else ""
-            unit_value = money_vals[-2].replace(',', '') if len(money_vals) >= 2 else total_value
+            money_vals = [
+                v.replace(',', '.') if v.count(',') == 1 and '.' not in v else v.replace(',', '')
+                for v in _money_re.findall(remaining)
+            ]
+            total_value = money_vals[-1] if money_vals else ""
+            unit_value = money_vals[-2] if len(money_vals) >= 2 else total_value
 
             hs_code = self._pad_hs_code(hs_code_raw, pad_to_10)
             char_pos = sum(len(lines[k]) + 1 for k in range(line_idx))
@@ -2800,7 +2835,7 @@ class LineItemParser:
                 "uom": uom.upper(),
                 "unit_value": unit_value,
                 "total_value": total_value,
-                "currency": "USD",
+                "currency": currency,
                 "commodity_code": hs_code,
                 "country_of_origin": coo.upper() if coo else "GB",
                 "net_weight": weight,
@@ -2815,6 +2850,7 @@ class LineItemParser:
         pending_no: Optional[str] = None
         pending_lines: List[str] = []
         pending_idx: int = 0
+        flushed_idxs = set()
 
         def _flush():
             nonlocal pending_no, pending_lines
@@ -2822,11 +2858,12 @@ class LineItemParser:
                 it = _build_item(pending_no, pending_lines, pending_idx)
                 if it:
                     items.append(it)
+                    flushed_idxs.add(pending_idx)
             pending_no = None
             pending_lines = []
 
         for i, raw_line in enumerate(lines):
-            line = raw_line.strip()
+            line = raw_line.strip().lstrip('~-_|• ')
             if not line:
                 continue
 
@@ -2838,7 +2875,7 @@ class LineItemParser:
             item_m = _item_re.match(line)
             if item_m:
                 _flush()
-                pending_no = item_m.group(1)
+                pending_no = item_m.group(1).upper()
                 pending_lines = [line[item_m.end():].strip()]
                 pending_idx = i
             elif pending_no:
@@ -2846,6 +2883,70 @@ class LineItemParser:
                 pending_lines.append(line)
 
         _flush()
+
+        def _sku_key(sku: str) -> str:
+            return (sku or '').upper().replace('O', '0')
+
+        def _item_key(it: dict) -> tuple:
+            try:
+                tot = f"{float(it.get('total_value') or 0):.2f}"
+            except (TypeError, ValueError):
+                tot = str(it.get('total_value') or '')
+            return (
+                _sku_key(it.get('stock_number') or ''),
+                (it.get('commodity_code') or '')[:8],
+                str(it.get('quantity') or ''),
+                tot,
+            )
+
+        # OCR fallback: grid-stripped scans still put SKU … qty UoM HS [COO] on one line
+        seen = {_item_key(it) for it in items}
+        for i, raw_line in enumerate(lines):
+            if i in flushed_idxs:
+                continue
+            line = raw_line.strip().lstrip('~-_|• ')
+            if not line or _skip_re.search(line):
+                continue
+            m = _ocr_row_re.search(line)
+            if not m or not _is_commodity_hs(m.group('hs')):
+                continue
+            sku = m.group('sku').upper()
+            hs_code = self._pad_hs_code(m.group('hs'), pad_to_10)
+            qty = m.group('qty')
+            desc = line[:m.start('qty')].replace(m.group('sku'), '', 1).strip(' -|~')
+            tail = line[m.end():]
+            money_vals = [
+                v.replace(',', '.') if v.count(',') == 1 and '.' not in v else v.replace(',', '')
+                for v in _money_re.findall(tail)
+            ]
+            total_value = money_vals[-1] if money_vals else ''
+            unit_value = money_vals[-2] if len(money_vals) >= 2 else total_value
+            coo = (m.group('coo') or 'GB').upper()
+            cand = {
+                "line_number": str(len(items) + 1),
+                "stock_number": sku,
+                "description": desc or sku,
+                "quantity": qty,
+                "uom": m.group('uom').upper(),
+                "unit_value": unit_value,
+                "total_value": total_value,
+                "currency": currency,
+                "commodity_code": hs_code,
+                "country_of_origin": coo,
+                "net_weight": "",
+                "unit_weight": "",
+                "hs_code": hs_code,
+                "pages": [self._page_at(page_map, sum(len(lines[k]) + 1 for k in range(i)), 1)],
+                "confidence": 0.8,
+                "needs_review": False,
+                "raw_text": line[:200],
+            }
+            key = _item_key(cand)
+            if key in seen:
+                continue
+            items.append(cand)
+            seen.add(key)
+
         return items
 
     def _parse_solarlux_format(self, lines: List[str], direction: str, page_map: Dict) -> List[Dict]:

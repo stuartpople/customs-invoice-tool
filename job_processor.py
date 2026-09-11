@@ -106,6 +106,49 @@ def _detect_skew_angle(image: Image.Image, max_angle: float = 5.0) -> float:
     return round(best_angle, 2)
 
 
+def remove_table_lines(image: Image.Image) -> Image.Image:
+    """Wipe long ruled lines so Tesseract can read table cells.
+
+    Scanned commercial invoices (Marlow etc.) put HS codes in boxed columns.
+    Those grid lines glue digits together or drop whole rows, so OCR returns
+    one HS code instead of every line. Fast numpy pass — no OpenCV.
+    """
+    gray = image.convert('L')
+    arr = np.array(gray)
+    ink = arr < 200
+    h, w = ink.shape
+    if h < 40 or w < 40:
+        return image
+
+    out = arr.copy()
+    row_density = ink.mean(axis=1)
+    col_density = ink.mean(axis=0)
+    # Horizontal rules span most of the page width
+    for y in range(h):
+        if row_density[y] > 0.40:
+            y0, y1 = max(0, y - 1), min(h, y + 2)
+            out[y0:y1, :] = 255
+    # Vertical rules (table column borders)
+    for x in range(w):
+        if col_density[x] > 0.22:
+            x0, x1 = max(0, x - 1), min(w, x + 2)
+            out[:, x0:x1] = 255
+    return Image.fromarray(out)
+
+
+def prepare_ocr_image(image: Image.Image) -> Image.Image:
+    """Deskew then strip table grid lines before Tesseract."""
+    try:
+        image, _ = deskew_image(image)
+    except Exception:
+        pass
+    try:
+        image = remove_table_lines(image)
+    except Exception:
+        pass
+    return image
+
+
 def deskew_image(image: Image.Image, max_angle: float = 5.0) -> Tuple[Image.Image, float]:
     """
     Detect and correct skew in a scanned document image.
@@ -314,15 +357,13 @@ class JobProcessor:
                         # If OSD fails, try all 4 orientations and pick best
                         pass
                     
-                    # Deskew: correct slight skew from scanning
+                    # Deskew + wipe table grid lines (cells OCR as rows, not one HS)
                     try:
-                        image, skew_angle = deskew_image(image)
-                        if abs(skew_angle) >= 0.2:
-                            # Save the deskewed image back so the UI shows it corrected
-                            image.save(str(page_image_path))
+                        image = prepare_ocr_image(image)
+                        image.save(str(page_image_path))
                     except Exception:
-                        pass  # deskew is best-effort, never block OCR
-                    
+                        pass
+
                     # Use PSM 6 (uniform block) to better preserve table layout
                     return pytesseract.image_to_string(image, config='--psm 6').strip()
                 
@@ -384,12 +425,11 @@ class JobProcessor:
                     # If OSD fails, continue with current orientation
                     pass
                 
-                # Deskew: correct slight skew from scanning
                 try:
-                    image, _ = deskew_image(image)
+                    image = prepare_ocr_image(image)
                 except Exception:
-                    pass  # deskew is best-effort
-                
+                    pass
+
                 # Use PSM 6 (uniform block) to better preserve table layout
                 return pytesseract.image_to_string(image, config='--psm 6').strip()
             
