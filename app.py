@@ -76,7 +76,7 @@ import shutil
 
 
 # Version tracking for cache busting
-APP_VERSION = "v3.36"
+APP_VERSION = "v3.37"
 
 
 def _normalize_items_hs_for_direction(items: list, direction: str) -> list:
@@ -1204,6 +1204,7 @@ elif st.session_state.processing_started and st.session_state.current_job_id:
                 with st.spinner(f"Parsing line items from {len(pdf_job_ids)} PDF file(s)..."):
                     all_items = []
                     errors = []
+                    warnings_acc = []
                     fmt = 'unknown'
                     
                     # Parse each PDF and combine items
@@ -1224,7 +1225,18 @@ elif st.session_state.processing_started and st.session_state.current_job_id:
                                 fmt = result.get('format_type', 'unknown')
                                 all_items.extend(items)
                                 if items:
-                                    st.success(f"✅ PDF {idx} ({filename}): {len(items)} items parsed (format: {fmt})")
+                                    pw = result.get('parse_warning')
+                                    hs_doc = result.get('hs_in_document') or []
+                                    hs_got = result.get('hs_parsed') or []
+                                    msg = f"PDF {idx} ({filename}): {len(items)} items parsed (format: {fmt})"
+                                    if hs_doc:
+                                        msg += f" — HS on document {len(hs_doc)}, parsed {len(hs_got)}"
+                                    if pw:
+                                        warnings_acc.append(pw)
+                                        st.warning(f"⚠️ {msg}")
+                                        st.warning(pw)
+                                    else:
+                                        st.success(f"✅ {msg}")
                                 else:
                                     pw = result.get('parse_warning')
                                     if pw:
@@ -1247,7 +1259,11 @@ elif st.session_state.processing_started and st.session_state.current_job_id:
                             st.text(f"  • {err}")
                     
                     # Store combined results
-                    st.session_state.parsed_items = {'items': all_items, 'format_type': fmt}
+                    st.session_state.parsed_items = {
+                        'items': all_items,
+                        'format_type': fmt,
+                        'parse_warning': ' '.join(warnings_acc) if warnings_acc else None,
+                    }
                     st.session_state.parsed_job_ids = pdf_job_ids
                     st.session_state.pop('hs_validation_results', None)
                     st.rerun()
@@ -1327,7 +1343,12 @@ elif st.session_state.processing_started and st.session_state.current_job_id:
                     items = items + non_pdf_items
                     st.info(f"📂 Combined items from PDFs and Excel/Word files")
                 
-                st.success(f"✅ **Total: {len(items)} line items parsed**")
+                pw = result.get('parse_warning')
+                if pw:
+                    st.warning(f"⚠️ **Parsed {len(items)} line items, but coverage check failed**")
+                    st.warning(pw)
+                else:
+                    st.success(f"✅ **Total: {len(items)} line items parsed**")
                 
                 # Show format detection feedback
                 fmt_type = result.get('format_type', 'unknown')

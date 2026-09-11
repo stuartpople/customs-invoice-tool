@@ -99,14 +99,9 @@ class LineItemParser:
             print("[Parser] RS Components SITPRO format detected — using regex parser directly")
             lines = all_text.split('\n')
             items = self._parse_pattern_format(lines, direction, page_map, explicit_only=True)
-            items = self._postprocess_items(items)
-            return {
-                "total_items": len(items),
-                "items": items,
-                "pages_analyzed": len(pages_data.get("pages", [])),
-                "direction": direction,
-                "format_type": "rs_sitpro",
-            }
+            return self._pack_result(
+                items, pages_data, direction, "rs_sitpro", all_text, page_map, allow_ai=False
+            )
 
         # ── Solarlux / "Comm. code" table format ──────────────────────────────
         # Invoices with "Article no." and "Comm. code" column headers use a
@@ -122,14 +117,7 @@ class LineItemParser:
             print("[Parser] Solarlux 'Comm. code' table format detected — using dedicated parser")
             lines = all_text.split('\n')
             items = self._parse_solarlux_format(lines, direction, page_map)
-            items = self._postprocess_items(items)
-            return {
-                "total_items": len(items),
-                "items": items,
-                "pages_analyzed": len(pages_data.get("pages", [])),
-                "direction": direction,
-                "format_type": "solarlux",
-            }
+            return self._pack_result(items, pages_data, direction, "solarlux", all_text, page_map)
 
         # ── Marlow Ropes / "Item No. … HS Code … UoM" table format ───────────
         # Invoices with "Item No.", "HS Code", and "UoM" column headers.
@@ -150,14 +138,7 @@ class LineItemParser:
             print("[Parser] Marlow Ropes 'HS Code / UoM' table format detected — using dedicated parser")
             lines = all_text.split('\n')
             items = self._parse_marlow_format(lines, direction, page_map)
-            items = self._postprocess_items(items)
-            return {
-                "total_items": len(items),
-                "items": items,
-                "pages_analyzed": len(pages_data.get("pages", [])),
-                "direction": direction,
-                "format_type": "marlow",
-            }
+            return self._pack_result(items, pages_data, direction, "marlow", all_text, page_map)
 
         # ── IKF / RS Components vertical table (HS Codes + CofO per line) ─────
         # PyMuPDF emits one field per line: item#, stock, description, UOM, qty,
@@ -210,14 +191,9 @@ class LineItemParser:
             if not items:
                 # Fallback: previous tabular detector (still includes stride fix)
                 items, _fmt = self._parse_line_items_proven(all_text, direction, page_map)
-            items = self._postprocess_items(items)
-            return {
-                "total_items": len(items),
-                "items": items,
-                "pages_analyzed": len(pages_data.get("pages", [])),
-                "direction": direction,
-                "format_type": "vertical_table_ikf",
-            }
+            return self._pack_result(
+                items, pages_data, direction, "vertical_table_ikf", all_text, page_map, allow_ai=False
+            )
 
         # ── Arrow Export / (cc:XXXXXXXXXX) bracket HS code format ─────────────
         # Invoices from Arrow Export (and similar) embed HS codes inline as
@@ -229,14 +205,7 @@ class LineItemParser:
             print("[Parser] Arrow Export '(cc:...)' bracket HS code format detected — using dedicated parser")
             lines = all_text.split('\n')
             items = self._parse_arrow_export_format(lines, direction, page_map)
-            items = self._postprocess_items(items)
-            return {
-                "total_items": len(items),
-                "items": items,
-                "pages_analyzed": len(pages_data.get("pages", [])),
-                "direction": direction,
-                "format_type": "arrow_export",
-            }
+            return self._pack_result(items, pages_data, direction, "arrow_export", all_text, page_map)
 
         # ── X-OSIL (Ocean Scientific) / "HS DDDD DDDD DD" spaced HS code format ─
         # Invoices from Ocean Scientific International have HS codes formatted as
@@ -247,14 +216,7 @@ class LineItemParser:
         if _is_xosil:
             print("[Parser] X-OSIL 'HS DDDD DDDD DD' spaced HS code format detected — using dedicated parser")
             items = self._parse_xosil_format(all_text, direction, page_map)
-            items = self._postprocess_items(items)
-            return {
-                "total_items": len(items),
-                "items": items,
-                "pages_analyzed": len(pages_data.get("pages", [])),
-                "direction": direction,
-                "format_type": "xosil",
-            }
+            return self._pack_result(items, pages_data, direction, "xosil", all_text, page_map)
 
         # ── Sugatsune Kogyo (UK) hardware invoices ────────────────────────────
         # Layout: STOCK CODE / PRODUCT / DESCRIPTION / QTY / PRICE / UNIT / VALUE
@@ -263,13 +225,7 @@ class LineItemParser:
             print("[Parser] Sugatsune invoice detected — using dedicated parser")
             items = self._parse_sugatsune_format(all_text.split("\n"), direction, page_map)
             items = self._finalize_parsed_items(items, all_text)
-            return {
-                "total_items": len(items),
-                "items": items,
-                "pages_analyzed": len(pages_data.get("pages", [])),
-                "direction": direction,
-                "format_type": "sugatsune",
-            }
+            return self._pack_result(items, pages_data, direction, "sugatsune", all_text, page_map)
 
         # ── BAS (British Antarctic Survey) / BoL-grouped vertical commodity table ──
         # Never fall through to Gemini for this layout — AI invents lines (e.g. tampons).
@@ -282,13 +238,9 @@ class LineItemParser:
                 if self._is_bas_commercial_invoice(all_text)
                 else "goods_description_commodity"
             )
-            return {
-                "total_items": len(items),
-                "items": items,
-                "pages_analyzed": len(pages_data.get("pages", [])),
-                "direction": direction,
-                "format_type": fmt,
-            }
+            return self._pack_result(
+                items, pages_data, direction, fmt, all_text, page_map, allow_ai=False
+            )
 
         # ── ATI (Applied Technologies International) / "COC / HS Code / Unit of Measure" table ──
         # Invoices with "Description / HS Code / CofO", "COC", "Unit of Measure",
@@ -318,15 +270,8 @@ class LineItemParser:
                 _ati_doc = _fitz_ati.open(pdf_path)
                 items = self._parse_ati_format(_ati_doc, direction, page_map)
                 _ati_doc.close()
-                items = self._postprocess_items(items)
                 if items:
-                    return {
-                        "total_items": len(items),
-                        "items": items,
-                        "pages_analyzed": len(pages_data.get("pages", [])),
-                        "direction": direction,
-                        "format_type": "ati",
-                    }
+                    return self._pack_result(items, pages_data, direction, "ati", all_text, page_map)
                 # If block parser returned nothing, fall through to LLM
                 print("[Parser] ATI block parser found no items — falling back to LLM")
 
@@ -388,27 +333,19 @@ class LineItemParser:
                 _rx_items, _rx_fmt = self._parse_line_items_proven(all_text, direction, page_map)
             _rx_items = self._finalize_parsed_items(_rx_items, all_text)
             if _llm_quality_ok(_rx_items, all_text):
-                print(f"[Parser] Regex-first ({_rx_fmt}) — {len(_rx_items)} items, skipping AI")
-                return {
-                    "total_items": len(_rx_items),
-                    "items": _rx_items,
-                    "pages_analyzed": len(pages_data.get("pages", [])),
-                    "direction": direction,
-                    "format_type": _rx_fmt or "regex_first",
-                }
+                print(f"[Parser] Regex-first ({_rx_fmt}) — {len(_rx_items)} items, skipping AI unless coverage fails")
+                return self._pack_result(
+                    _rx_items, pages_data, direction, _rx_fmt or "regex_first", all_text, page_map
+                )
 
         # BAS-style invoices must never use AI — it hallucinates plausible tariff lines.
         if self._should_use_bas_parser(all_text):
             print("[Parser] BAS-style layout — refusing AI, returning regex-only result")
             items, format_type = self._parse_line_items_proven(all_text, direction, page_map)
             items = self._finalize_parsed_items(items, all_text)
-            return {
-                "total_items": len(items),
-                "items": items,
-                "pages_analyzed": len(pages_data.get("pages", [])),
-                "direction": direction,
-                "format_type": format_type or "bas_commercial",
-            }
+            return self._pack_result(
+                items, pages_data, direction, format_type or "bas_commercial", all_text, page_map, allow_ai=False
+            )
 
         # 1. Google Gemini Flash — free tier, 1,500 req/day, no credit card needed
         google_key = self._get_secret("GOOGLE_API_KEY")
@@ -417,14 +354,11 @@ class LineItemParser:
                 from llm_extractor import extract_with_gemini
                 llm_items, llm_meta = extract_with_gemini(all_text, google_key)
                 if _llm_quality_ok(llm_items, all_text):
-                    return {
-                        "total_items": len(llm_items),
-                        "items": llm_items,
-                        "metadata": llm_meta,
-                        "pages_analyzed": len(pages_data.get("pages", [])),
-                        "direction": direction,
-                        "format_type": "llm_gemini",
-                    }
+                    packed = self._pack_result(
+                        llm_items, pages_data, direction, "llm_gemini", all_text, page_map, allow_ai=False
+                    )
+                    packed["metadata"] = llm_meta
+                    return packed
                 elif llm_items:
                     print(f"[Gemini extractor] returned {len(llm_items)} items but failed quality/grounding — falling back to regex")
             except Exception as _err:
@@ -437,14 +371,11 @@ class LineItemParser:
                 from llm_extractor import extract_with_llm
                 llm_items, llm_meta = extract_with_llm(all_text, openai_key)
                 if _llm_quality_ok(llm_items, all_text):
-                    return {
-                        "total_items": len(llm_items),
-                        "items": llm_items,
-                        "metadata": llm_meta,
-                        "pages_analyzed": len(pages_data.get("pages", [])),
-                        "direction": direction,
-                        "format_type": "llm_gpt4o_mini",
-                    }
+                    packed = self._pack_result(
+                        llm_items, pages_data, direction, "llm_gpt4o_mini", all_text, page_map, allow_ai=False
+                    )
+                    packed["metadata"] = llm_meta
+                    return packed
                 elif llm_items:
                     print(f"[OpenAI extractor] returned {len(llm_items)} items but failed quality/grounding — falling back to regex")
             except Exception as _err:
@@ -478,34 +409,158 @@ class LineItemParser:
                     _lr_items = self._filter_llm_items_to_source_text(_lr_items or [], all_text)
                     if _lr_items and _llm_quality_ok(_lr_items, all_text):
                         print(f"[Parser] Last-resort {_lr_label} recovered {len(_lr_items)} grounded items")
-                        return {
-                            "total_items": len(_lr_items),
-                            "items": _lr_items,
-                            "metadata": _lr_meta,
-                            "pages_analyzed": len(pages_data.get("pages", [])),
-                            "direction": direction,
-                            "format_type": _lr_label,
-                        }
+                        packed = self._pack_result(
+                            _lr_items, pages_data, direction, _lr_label, all_text, page_map, allow_ai=False
+                        )
+                        packed["metadata"] = _lr_meta
+                        return packed
                 except Exception as _lr_err:
                     print(f"[Parser] Last-resort {_lr_label} failed: {_lr_err}")
 
-        # Build result — include a parse_warning when we got nothing so the UI
-        # can surface a prominent, actionable error rather than a silent empty list.
+        extra = None
+        if not items and len(all_text.strip()) > 800:
+            extra = (
+                f"No line items could be extracted from this document "
+                f"(format detected: {format_type}, OCR chars: {len(all_text)}). "
+                "The invoice layout may be unrecognised. Configure a Gemini or OpenAI "
+                "API key to enable AI extraction for unknown formats."
+            )
+        packed = self._pack_result(
+            items, pages_data, direction, format_type, all_text, page_map, extra_warning=extra
+        )
+        if extra:
+            packed["ocr_text_snippet"] = all_text[:2000]
+        return packed
+
+    def _coerce_parser_item(self, it: Dict) -> Dict:
+        """Normalise LLM `value`/`unit` fields onto the regex item shape."""
+        out = dict(it or {})
+        if not out.get('total_value') and out.get('value') is not None:
+            out['total_value'] = str(out['value'])
+        if not out.get('unit_value') and out.get('unit_price') is not None:
+            out['unit_value'] = str(out['unit_price'])
+        if not out.get('uom') and out.get('unit'):
+            out['uom'] = str(out['unit']).upper()
+        if not out.get('hs_code') and out.get('commodity_code'):
+            out['hs_code'] = out['commodity_code']
+        if not out.get('country_of_origin') and out.get('country_origin'):
+            out['country_of_origin'] = out['country_origin']
+        qty = out.get('quantity')
+        if isinstance(qty, float):
+            out['quantity'] = str(int(qty)) if qty == int(qty) else str(qty)
+        elif qty is not None:
+            out['quantity'] = str(qty)
+        return out
+
+    def _try_ai_coverage_items(self, all_text: str) -> List[Dict]:
+        """One-shot grounded AI extract used only to fill HS codes a layout parser missed."""
+        for key_name, label in (("GOOGLE_API_KEY", "gemini"), ("OPENAI_API_KEY", "openai")):
+            key = self._get_secret(key_name)
+            if not key:
+                continue
+            try:
+                from llm_extractor import extract_with_gemini, extract_with_llm
+                fn = extract_with_gemini if label == "gemini" else extract_with_llm
+                llm_items, _ = fn(all_text, key)
+                grounded = self._filter_llm_items_to_source_text(llm_items or [], all_text)
+                return [self._coerce_parser_item(it) for it in grounded]
+            except Exception as err:
+                print(f"[Coverage] AI {label} failed: {err}")
+        return []
+
+    def _pack_result(
+        self,
+        items: List[Dict],
+        pages_data: Dict,
+        direction: str,
+        format_type: str,
+        all_text: str,
+        page_map: Dict,
+        *,
+        allow_ai: bool = True,
+        extra_warning: Optional[str] = None,
+    ) -> Dict:
+        """Post-process, then refuse to silently drop HS codes still visible in the text."""
+        try:
+            from parse_coverage import (
+                cn8 as _cn8,
+                coverage_warnings,
+                harvest_hs_rows,
+                item_key,
+                items_total,
+            )
+        except ImportError:
+            items = self._postprocess_items(items or [])
+            result = {
+                "total_items": len(items),
+                "items": items,
+                "pages_analyzed": len(pages_data.get("pages", [])),
+                "direction": direction,
+                "format_type": format_type,
+            }
+            if extra_warning:
+                result["parse_warning"] = extra_warning
+            return result
+
+        items = [self._coerce_parser_item(it) for it in (items or [])]
+        items = self._postprocess_items(items)
+        pad_to_10 = (direction or "").lower() == "import"
+        currency = "GBP" if re.search(r"\bGBP\b", all_text or "") else "USD"
+        lines = (all_text or "").split("\n")
+
+        def _pad(code: str) -> str:
+            return self._pad_hs_code(code, pad_to_10)
+
+        def _page(line_idx: int) -> int:
+            char_pos = sum(len(lines[k]) + 1 for k in range(max(0, min(line_idx, len(lines)))))
+            return self._page_at(page_map, char_pos, 1)
+
+        doc_hs, parsed_hs, warnings = coverage_warnings(items, all_text)
+        missing = doc_hs - parsed_hs
+        if missing:
+            print(f"[Coverage] {format_type} missed HS {sorted(missing)} — harvesting rows")
+            harvested = harvest_hs_rows(
+                lines,
+                pad_hs=_pad,
+                page_at=_page,
+                existing_keys={item_key(it) for it in items},
+                currency=currency,
+            )
+            items.extend(harvested)
+            items = self._postprocess_items(items)
+            doc_hs, parsed_hs, warnings = coverage_warnings(items, all_text)
+            missing = doc_hs - parsed_hs
+
+        if missing and allow_ai and not self._should_use_bas_parser(all_text):
+            print(f"[Coverage] Still missing {sorted(missing)} — trying AI merge")
+            for it in self._try_ai_coverage_items(all_text):
+                code = _cn8(it.get("commodity_code") or "")
+                if code in missing:
+                    it["needs_review"] = True
+                    it.setdefault(
+                        "review_notes",
+                        "Added because the layout parser missed this HS code",
+                    )
+                    items.append(it)
+            items = self._postprocess_items(items)
+            doc_hs, parsed_hs, warnings = coverage_warnings(items, all_text)
+
+        if extra_warning:
+            warnings = [extra_warning] + list(warnings)
+
         result = {
             "total_items": len(items),
             "items": items,
             "pages_analyzed": len(pages_data.get("pages", [])),
             "direction": direction,
             "format_type": format_type,
+            "hs_in_document": sorted(doc_hs),
+            "hs_parsed": sorted(parsed_hs),
+            "line_total": items_total(items),
         }
-        if not items and len(all_text.strip()) > 800:
-            result["parse_warning"] = (
-                f"No line items could be extracted from this document "
-                f"(format detected: {format_type}, OCR chars: {len(all_text)}). "
-                "The invoice layout may be unrecognised. Configure a Gemini or OpenAI "
-                "API key to enable AI extraction for unknown formats."
-            )
-            result["ocr_text_snippet"] = all_text[:2000]
+        if warnings:
+            result["parse_warning"] = " ".join(warnings)
+            print(f"[Coverage] {result['parse_warning']}")
         return result
 
     def _get_secret(self, key_name: str) -> Optional[str]:
