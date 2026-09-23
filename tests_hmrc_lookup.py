@@ -29,6 +29,23 @@ def test_relay_and_wiring_cn8s_resolve_doc_codes():
         assert not d.get('specialised_taric_fallback'), (code, d.get('specialised_taric_fallback'))
 
 
+def test_yeti_bottle_obsolete_96170011_remaps_to_heading():
+    """96170011 is not in the current UK tariff; heading 9617 is declarable as 96170000."""
+    HMRCTariffAPI.clear_caches()
+    api = HMRCTariffAPI()
+    v = api.validate_commodity_code('96170011', direction='export')
+    assert not v.get('valid')
+    assert (v.get('suggested_code') or '')[:8] == '96170000', v
+
+    HMRCTariffAPI.clear_caches()
+    d = api.get_commodity_details(
+        '96170011', direction='export', destination_country='IT', export_only=True)
+    assert not d.get('error'), d.get('error')
+    assert d.get('commodity_code') == '96170000'
+    assert d.get('reclassified_from') == '96170011'
+    assert (d.get('resolved_taric_code') or '').startswith('96170000')
+
+
 def test_parts_cn8_no_longer_404s_on_residual_89():
     """Lookup used to fail entirely; empty AZ export-only docs is a filter, not a 404."""
     HMRCTariffAPI.clear_caches()

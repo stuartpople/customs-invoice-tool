@@ -103,7 +103,7 @@ class HMRCTariffAPI:
     # Bump when lookup semantics change so hot-reloaded Streamlit workers cannot
     # reuse results produced by older code.
     # Bump when lookup / validation semantics change so process-wide caches refresh.
-    CACHE_SCHEMA_VERSION = "export-cn8-residual-89-v7"
+    CACHE_SCHEMA_VERSION = "heading-declarable-remap-v8"
 
     @classmethod
     def clear_caches(cls) -> None:
@@ -295,13 +295,17 @@ class HMRCTariffAPI:
         heading_desc = ''
         candidates: List[Dict] = []
         try:
-            r = self.session.get(
-                f"{self.base_url}/uk/api/headings/{heading}", timeout=10)
+            r = self._http_get(
+                f"{self.base_url}/uk/api/headings/{heading}")
             if r.status_code == 200:
                 hdata = r.json()
                 hd = hdata.get('data', {}).get('attributes', {})
                 heading_desc = hd.get('description_plain',
                                       hd.get('description', ''))
+                heading_code = (
+                    hd.get('goods_nomenclature_item_id')
+                    or (heading + '000000')
+                )
                 prefix6 = clean[:6]
                 prefix4 = clean[:4]
                 base8 = clean[:8].ljust(8, '0') if len(clean) >= 6 else clean
@@ -340,6 +344,29 @@ class HMRCTariffAPI:
                             cdesc = (attrs.get('description_plain') or
                                      attrs.get('formatted_description', '')).strip()
                             candidates.append({'code': ccode, 'description': cdesc})
+
+                # Some headings are themselves declarable with no commodity
+                # children (e.g. 9617 → 9617000000). Invoice codes like
+                # 96170011 then 404 on every pad and need the heading CN8.
+                if not candidates and (
+                    hd.get('declarable') is True
+                    or self._commodity_usable(self._try_commodity(
+                        (heading_code or '').ljust(10, '0')[:10]
+                    ))
+                ):
+                    candidates.append({
+                        'code': heading_code.ljust(10, '0')[:10],
+                        'description': heading_desc,
+                    })
+                # Also try HS6 residual …0000 when heading has no leaves
+                if not any(c['code'][:8] == (prefix6 + '00') for c in candidates):
+                    hs6_pad = prefix6 + '0000'
+                    res6 = self._try_commodity(hs6_pad)
+                    if self._commodity_usable(res6):
+                        candidates.append({
+                            'code': hs6_pad,
+                            'description': res6.get('description') or heading_desc,
+                        })
         except requests.RequestException:
             pass
 
