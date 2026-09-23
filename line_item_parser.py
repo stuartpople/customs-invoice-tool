@@ -10,7 +10,7 @@ from typing import List, Dict, Tuple, Optional
 import json
 from pathlib import Path
 from ocr_utils import clean_ocr_text
-from countries import normalize_country_iso
+from countries import normalize_country_iso, looks_like_country_token
 
 
 _IKF_UOM_TOKENS = frozenset({
@@ -226,6 +226,22 @@ class LineItemParser:
             items = self._parse_sugatsune_format(all_text.split("\n"), direction, page_map)
             items = self._finalize_parsed_items(items, all_text)
             return self._pack_result(items, pages_data, direction, "sugatsune", all_text, page_map)
+
+        # ── NOC / scientific equipment packing list (HS CODE + Ex Licence) ─────
+        # National Oceanography Centre / University of Plymouth research kits:
+        # vertical columns Item/Barcode or BOX ID → Origin → Weight → Value → HS CODE.
+        # Excel→PDF conversions of the same sheet land here too. Never AI — layout
+        # is regular enough for regex and AI invents spare lines on long kits.
+        if self._is_noc_scientific_packing_list(all_text):
+            print("[Parser] NOC scientific packing list detected — dedicated parser (AI disabled)")
+            items = self._parse_noc_scientific_format(
+                all_text.split("\n"), direction, page_map
+            )
+            items = self._finalize_parsed_items(items, all_text)
+            return self._pack_result(
+                items, pages_data, direction, "noc_scientific", all_text, page_map,
+                allow_ai=False,
+            )
 
         # ── BAS (British Antarctic Survey) / BoL-grouped vertical commodity table ──
         # Never fall through to Gemini for this layout — AI invents lines (e.g. tampons).
@@ -659,14 +675,16 @@ class LineItemParser:
             qty = str(it.get('quantity') or '').strip()
             tv = str(it.get('total_value') or '').strip()
             sn = (it.get('stock_number') or '').strip()
-            ln = str(it.get('line_number') or '').strip()
+            ln = str(it.get('line_number') or it.get('item_number') or '').strip()
             if sn:
                 key_parts = [sn, qty, tv, ln] if ln else [sn, qty, tv]
             elif cc:
-                key_parts = [cc, qty, tv]
+                # Include item/line number so identical HS/qty/value rows
+                # (e.g. three steel anchors) are not collapsed.
+                key_parts = [cc, qty, tv, ln] if ln else [cc, qty, tv]
             else:
                 # fallback to normalized description prefix
-                key_parts = [desc_l[:40], qty, tv]
+                key_parts = [desc_l[:40], qty, tv, ln] if ln else [desc_l[:40], qty, tv]
 
             key = tuple(key_parts)
             if key in seen_keys:
@@ -759,6 +777,31 @@ class LineItemParser:
         if 'hs_code' in item:
             item['hs_code'] = item['commodity_code']
     
+    @staticmethod
+    def _is_noc_scientific_packing_list(text: str) -> bool:
+        """NOC / research-vessel customs invoice or Excel→PDF shipping list.
+
+        Distinctive headers: ``HS CODE`` + ``Ex Licence`` with either Item/Barcode
+        (Laura Bassi style) or ``BOX ID`` (scientist kit packing list).
+        """
+        if not text:
+            return False
+        if not re.search(r'\bHS\s*CODE\b', text, re.IGNORECASE):
+            return False
+        if not re.search(r'\bEx\s*Licence\b', text, re.IGNORECASE):
+            return False
+        has_item_barcode = (
+            re.search(r'\bBarcode\b', text, re.IGNORECASE) is not None
+            and re.search(r'\bItem\b', text, re.IGNORECASE) is not None
+        )
+        has_box_id = re.search(r'\bBOX\s*ID\b', text, re.IGNORECASE) is not None
+        has_noc = bool(re.search(
+            r'National Oceanography|noc\.ac\.uk|Temporary Export.*Scientific|'
+            r'Scientific Equipment|RV\s+LAURA|LAURA BASSI',
+            text, re.IGNORECASE | re.DOTALL,
+        ))
+        return has_item_barcode or has_box_id or has_noc
+
     @staticmethod
     def _looks_like_goods_description_commodity_table(text: str) -> bool:
         """Vertical/inline table: GOODS DESCRIPTION + COMMODITY + QTY + VALUE."""
@@ -3970,6 +4013,262 @@ class LineItemParser:
                     i += 4
                     continue
             i += 1
+
+        return items
+
+    def _parse_noc_scientific_format(
+        self, lines: List[str], direction: str, page_map: Dict
+    ) -> List[Dict]:
+        """Parse NOC / scientific research packing lists (Item/Barcode or BOX ID).
+
+        PyMuPDF emits one field per line after the column headers::
+
+            Item/Barcode variant:
+              item# → barcode? → description → serial? → origin → weight → £value → HS
+            BOX ID variant:
+              ACEJGnn → dims → qty → description → serial → origin → weight → value → HS
+              …then content rows: qty → description → serial → origin → weight → value → HS
+        """
+        pad_to_10 = direction.lower() == "import"
+        stripped = [ln.strip() for ln in lines]
+        # Drop page markers inserted by parse_job_items
+        cleaned: List[str] = []
+        for ln in stripped:
+            if re.match(r'^---\s*PAGE\s+\d+\s*---$', ln, re.IGNORECASE):
+                continue
+            if ln:
+                cleaned.append(ln)
+        stripped = cleaned
+
+        hs_re = re.compile(r'^(\d{4}\s+\d{4}\s+\d{2}|\d{8,10})$')
+        value_re = re.compile(r'^£?\s*[\d,]+(?:\.\d+)?$')
+        weight_re = re.compile(r'^\d+(?:\.\d+)?$')
+        dims_re = re.compile(r'^\d+\s*x\s*\d+\s*x\s*\d+$', re.IGNORECASE)
+        box_id_re = re.compile(r'^[A-Z]{2,6}\d{2,}$', re.IGNORECASE)
+        status_re = re.compile(r'^(FCG|CW|FG|T1|T2)$', re.IGNORECASE)
+        yes_no_re = re.compile(r'^(YES|NO|Y|N)$', re.IGNORECASE)
+        header_skip = {
+            'item', 'barcode', 'description', 'serial no.', 'serial no', 'origin',
+            'weight (kg)', 'value (£)', 'value (£)', 'hs code', 'status', 'haz',
+            'ex licence', 'box id', 'box dims (lxwxh)cm', 'quantity', 'serial no.',
+        }
+
+        def is_hs(s: str) -> bool:
+            if not s or s.lower() in ('na', 'n/a', '-', 'none'):
+                return False
+            compact = re.sub(r'\s+', '', s)
+            return bool(re.fullmatch(r'\d{8,10}', compact))
+
+        def is_origin(s: str) -> bool:
+            if not s or len(s) > 40:
+                return False
+            if re.fullmatch(r'[\d.,£\s]+', s):
+                return False
+            if dims_re.match(s) or is_hs(s):
+                return False
+            return looks_like_country_token(s)
+        def parse_hs(s: str) -> str:
+            digits = re.sub(r'\D', '', s)
+            return self._pad_hs_code(digits, pad_to_10) if digits else ''
+
+        def parse_value(s: str) -> str:
+            return s.replace('£', '').replace(',', '').strip()
+
+        def is_barcode(s: str) -> bool:
+            # NOC asset barcodes are typically 9-digit (250000429) — not HS (8/10)
+            return bool(re.fullmatch(r'\d{9}', s))
+
+        def is_item_num(s: str) -> bool:
+            return bool(re.fullmatch(r'\d{1,3}', s)) and 1 <= int(s) <= 500
+
+        def is_qty(s: str) -> bool:
+            return bool(re.fullmatch(r'\d{1,5}', s)) and int(s) >= 1
+
+        box_mode = any(
+            box_id_re.match(ln)
+            and idx + 1 < len(stripped)
+            and dims_re.match(stripped[idx + 1])
+            for idx, ln in enumerate(stripped)
+        )
+
+        items: List[Dict] = []
+        # Prefer first data line after the last header block
+        i = 0
+        for idx, ln in enumerate(stripped):
+            if ln.lower() == 'ex licence':
+                i = idx + 1
+
+        while i < len(stripped):
+            line = stripped[i]
+            if line.lower() in header_skip:
+                i += 1
+                continue
+            # Totals / footer — do NOT match mid-doc page headers such as
+            # "Customs Invoice/ Packing List" or "Scientific Equipment - Shipping List".
+            if re.match(
+                r'^(Temporary Export|Goods are the property|No commercial|'
+                r'Value for Customs|Number of Packages In Total|'
+                r'Total Weight\s*kg|GBP$)',
+                line, re.IGNORECASE,
+            ):
+                break
+            if line.lower() in ('gbp',):
+                i += 1
+                continue
+            # Repeated column-header fragments between pages
+            if line.lower() in header_skip or line.lower() == 'description':
+                i += 1
+                continue
+
+            box_id = ''
+            barcode = ''
+            item_num = ''
+            qty = '1'
+            description = ''
+            serial = ''
+            origin = ''
+            weight = ''
+            value = ''
+            hs = ''
+            start_i = i
+
+            if box_id_re.match(line) and i + 2 < len(stripped) and dims_re.match(stripped[i + 1]):
+                box_id = line
+                i += 2  # skip dims
+                if i < len(stripped) and is_qty(stripped[i]):
+                    qty = stripped[i]
+                    i += 1
+                else:
+                    i = start_i + 1
+                    continue
+            elif ((is_qty(line) if box_mode else is_item_num(line))
+                  and i + 1 < len(stripped)):
+                peek = stripped[i + 1]
+                if is_barcode(peek):
+                    # Laura Bassi full row: item# + barcode
+                    item_num = line
+                    barcode = peek
+                    qty = '1'
+                    i += 2
+                elif box_mode:
+                    # Scientist kit content: qty + description (qty may be 1500+)
+                    qty = line
+                    item_num = ''
+                    i += 1
+                else:
+                    # Laura Bassi without barcode (anchors, batteries, …)
+                    item_num = line
+                    qty = '1'
+                    i += 1
+            else:
+                i += 1
+                continue
+
+            # Description (one or more lines until serial/origin)
+            desc_parts: List[str] = []
+            while i < len(stripped):
+                cand = stripped[i]
+                if is_origin(cand) or is_hs(cand) or dims_re.match(cand):
+                    break
+                if weight_re.match(cand) and i + 1 < len(stripped) and value_re.match(stripped[i + 1]):
+                    break
+                if status_re.match(cand) or yes_no_re.match(cand):
+                    break
+                if box_id_re.match(cand) and i + 1 < len(stripped) and dims_re.match(stripped[i + 1]):
+                    break
+                if (is_item_num(cand) or is_barcode(cand)) and desc_parts:
+                    break
+                # Next line is origin → this line is description (if none yet) or serial
+                if i + 1 < len(stripped) and is_origin(stripped[i + 1]):
+                    if not desc_parts:
+                        desc_parts.append(cand)
+                        i += 1
+                    break
+                desc_parts.append(cand)
+                i += 1
+                if len(desc_parts) >= 4:
+                    break
+
+            description = " ".join(desc_parts).strip()
+            if not description:
+                i = max(i, start_i + 1)
+                continue
+
+            # Optional serial
+            if i < len(stripped) and not is_origin(stripped[i]):
+                if i + 1 < len(stripped) and is_origin(stripped[i + 1]):
+                    serial = stripped[i]
+                    i += 1
+
+            if i >= len(stripped) or not is_origin(stripped[i]):
+                i = max(i, start_i + 1)
+                continue
+            origin = normalize_country_iso(stripped[i])
+            i += 1
+
+            if i >= len(stripped) or not weight_re.match(stripped[i]):
+                i = max(i, start_i + 1)
+                continue
+            weight = stripped[i]
+            i += 1
+
+            if i >= len(stripped) or not value_re.match(stripped[i]):
+                i = max(i, start_i + 1)
+                continue
+            value = parse_value(stripped[i])
+            i += 1
+
+            if i >= len(stripped) or not is_hs(stripped[i]):
+                # e.g. HS marked "na" — skip row
+                if i < len(stripped) and stripped[i].lower() in ('na', 'n/a'):
+                    i += 1
+                    while i < len(stripped) and (
+                        status_re.match(stripped[i]) or yes_no_re.match(stripped[i])
+                    ):
+                        i += 1
+                else:
+                    i = max(i, start_i + 1)
+                continue
+            hs = parse_hs(stripped[i])
+            i += 1
+
+            # Consume status / haz / licence
+            while i < len(stripped) and (
+                status_re.match(stripped[i]) or yes_no_re.match(stripped[i])
+            ):
+                i += 1
+
+            if not hs or not self._is_valid_item(description, barcode, qty, value):
+                continue
+
+            unit_value = ''
+            try:
+                qty_f = float(qty)
+                val_f = float(value)
+                if qty_f > 0:
+                    unit_value = f"{val_f / qty_f:.4f}".rstrip('0').rstrip('.')
+            except ValueError:
+                pass
+
+            line_pos = sum(len(raw) + 1 for raw in lines[: min(start_i, len(lines) - 1)])
+            stock = barcode or serial or box_id
+            desc_out = f"[{box_id}] {description}" if box_id else description
+            items.append({
+                "item_number": item_num or str(len(items) + 1),
+                "stock_number": stock,
+                "description": desc_out,
+                "quantity": qty,
+                "uom": "EA",
+                "unit_value": unit_value,
+                "total_value": value,
+                "currency": "GBP",
+                "commodity_code": hs,
+                "country_of_origin": origin,
+                "net_weight": weight,
+                "pages": [self._page_at(page_map, line_pos, 1)],
+                "confidence": 0.92,
+                "needs_review": False,
+            })
 
         return items
     

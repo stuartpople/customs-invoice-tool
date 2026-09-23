@@ -189,6 +189,41 @@ _VALID_ALPHA2 = set(COUNTRY_TO_ISO.values()) | {
 }
 
 
+def looks_like_country_token(value: str | None) -> bool:
+    """True when *value* is an ISO code or known country name — not free text.
+
+    Unlike ``normalize_country_iso``, this does **not** treat the first two
+    letters of an arbitrary product description as a country.
+    """
+    if value is None:
+        return False
+    raw = str(value).strip()
+    if not raw or len(raw) > 40:
+        return False
+    if raw.lower() in ('null', 'none', 'n/a', 'na', '-', '—'):
+        return False
+    token = raw.upper().replace('.', '').replace('  ', ' ')
+    if token in ('UK', 'U K'):
+        return True
+    if len(token) == 2 and token.isalpha():
+        return token in _VALID_ALPHA2 or token == 'UK'
+    if len(token) == 3 and token.isalpha():
+        return token in _ISO_ALPHA3_TO_ALPHA2
+    key = raw.lower().strip()
+    if key in _NAME_TO_ISO or key.replace(',', '') in _NAME_TO_ISO:
+        return True
+    # Truncated Excel→PDF names e.g. "Myanma" for "Myanmar (Burma)"
+    if len(key) >= 5:
+        for name in _NAME_TO_ISO:
+            primary = name.split('(')[0].strip()
+            if len(primary) < 5:
+                continue
+            if primary.startswith(key) or key.startswith(primary[:5]):
+                if abs(len(primary) - len(key)) <= 3:
+                    return True
+    return False
+
+
 def normalize_country_iso(value: str | None) -> str:
     """
     Normalise country of origin / destination to ISO 3166-1 alpha-2 for HMRC/CDS.
