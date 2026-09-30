@@ -73,6 +73,42 @@ def test_not_commodity():
     assert is_commodity_hs('56074911')
 
 
+def test_part_numbers_and_supplier_refs_are_not_hs():
+    blob = """
+    Supplier references
+    2223411569, 2223407988, 2223393961, 2223384778
+    28
+    Chauvin Arnoux P03652920
+    NL
+    90279000
+    1  OF 1
+    5
+    68.32
+    341.60
+    Spontex 95020044 Scourer
+    ES
+    68053000
+    Tivoly 1111177750M Drill Accessory
+    US
+    84603900
+    """
+    codes = document_commodity_codes(blob)
+    assert '03652920' not in codes
+    assert '11111777' not in codes
+    assert '22234115' not in codes
+    assert '95020044' not in codes
+    harvested = harvest_hs_rows(
+        blob.split('\n'),
+        pad_hs=lambda c: c[:8],
+        page_at=lambda _i: 1,
+        only_codes={'90279000'},
+    )
+    got = {it['commodity_code'] for it in harvested}
+    assert got == {'90279000'}
+    assert '95020044' not in got
+    assert '03652920' not in got
+
+
 def test_invoice_number_ocr_ne_and_title():
     from parse_coverage import extract_invoice_number
     blob = """

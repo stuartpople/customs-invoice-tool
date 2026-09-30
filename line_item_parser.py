@@ -268,7 +268,7 @@ class LineItemParser:
         _is_ati = (
             re.search(r'Description\s*/\s*HS Code\s*/\s*CofO', all_text) is not None
             and re.search(r'\bCOC\b', all_text) is not None
-            and re.search(r'Unit of Measure', all_text) is not None
+            and re.search(r'Unit of Measure|\bUoM\b', all_text) is not None
             and re.search(r'Unit Weight', all_text) is not None
             and re.search(r'Line Weight', all_text) is not None
         )
@@ -287,7 +287,10 @@ class LineItemParser:
                 items = self._parse_ati_format(_ati_doc, direction, page_map)
                 _ati_doc.close()
                 if items:
-                    return self._pack_result(items, pages_data, direction, "ati", all_text, page_map)
+                    return self._pack_result(
+                        items, pages_data, direction, "ati", all_text, page_map,
+                        allow_ai=False,
+                    )
                 # If block parser returned nothing, fall through to LLM
                 print("[Parser] ATI block parser found no items — falling back to LLM")
 
@@ -546,6 +549,7 @@ class LineItemParser:
                 page_at=_page,
                 existing_keys={item_key(it) for it in items},
                 currency=currency,
+                only_codes=missing,
             )
             items.extend(harvested)
             items = self._postprocess_items(items, source_text=all_text or "")

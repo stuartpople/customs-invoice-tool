@@ -21,7 +21,10 @@ _JUNK_LINE_RE = re.compile(
     re.IGNORECASE,
 )
 
-_HS_RE = re.compile(r'(?<!\d)(\d{8,10})(?!\d)')
+# Not glued to a letter — P03652920 / 1111177750M are part numbers, not HS.
+_HS_RE = re.compile(r'(?<![A-Za-z\d])(\d{8,10})(?![A-Za-z\d])')
+# Comma-separated supplier / shipment refs (RS invoices list these above the table).
+_REF_LIST_RE = re.compile(r'(?:\d{9,12}\s*,\s*){2,}\d{9,12}')
 _UOM_RE = re.compile(r'\b(EA|PCS|PC|SET|KG|BAG|BOX|PK|PACK|M|REEL|ROLL)\b', re.IGNORECASE)
 _MONEY_RE = re.compile(r'[\d]+[.,]\d{2}')
 _SKU_RE = re.compile(r'^[\|~\-\s_•]*([A-Z]{2,4}[A-Z0-9]{3,6})\b', re.IGNORECASE)
@@ -62,7 +65,7 @@ def document_commodity_codes(text: str) -> Set[str]:
     counts: Dict[str, int] = {}
     signalled: Set[str] = set()
     for line in (text or '').splitlines():
-        if _JUNK_LINE_RE.search(line):
+        if _JUNK_LINE_RE.search(line) or _REF_LIST_RE.search(line):
             continue
         has_signal = bool(_UOM_RE.search(line) or _MONEY_RE.search(line))
         for m in _HS_RE.finditer(line):
@@ -147,17 +150,21 @@ def harvest_hs_rows(
     page_at,
     existing_keys: Optional[Set[Tuple]] = None,
     currency: str = 'GBP',
+    only_codes: Optional[Set[str]] = None,
 ) -> List[Dict]:
     """Pull a line item from any OCR row that contains a commodity HS code.
 
     Not vendor-specific: SKU … qty UoM HS … money. Used when a dedicated
-    parser recognised the layout but dropped rows.
+    parser recognised the layout but dropped rows. ``only_codes`` limits
+    recovery to CN8s the coverage gate actually reported as missing, so a
+    part number sitting in a description (P03652920, 95020044) is not
+    turned into an extra line.
     """
     existing_keys = existing_keys or set()
     items: List[Dict] = []
     for i, raw in enumerate(lines):
         line = (raw or '').strip()
-        if not line or _JUNK_LINE_RE.search(line):
+        if not line or _JUNK_LINE_RE.search(line) or _REF_LIST_RE.search(line):
             continue
         # Remittance footers: "Account Number: 70216529" / IBAN tails
         if looks_like_bank_account(
@@ -174,6 +181,8 @@ def harvest_hs_rows(
                 hs_m = m
                 break
         if not hs_m:
+            continue
+        if only_codes is not None and hs_m.group(1)[:8] not in only_codes:
             continue
         before = line[:hs_m.start()].strip(' -|~_')
         after = line[hs_m.end():]
