@@ -5,6 +5,7 @@ current with HMRC's official country/territory list.
 """
 import json
 import logging
+import re
 from pathlib import Path
 
 import requests
@@ -301,3 +302,79 @@ COMMON_COUNTRIES = [
     "Ireland", "Belgium", "Spain", "Italy", "India", "Japan", "Canada", "Australia",
     "Hong Kong", "Singapore", "South Korea", "Taiwan",
 ]
+
+
+def format_country_option(name: str) -> str:
+    """Label for the dropdown: ``United Kingdom (GB)`` so users can type either."""
+    if not name or name == "---":
+        return name
+    iso = COUNTRY_TO_ISO.get(name) or ""
+    if not iso:
+        iso = normalize_country_iso(name)
+    if iso and len(iso) == 2 and iso.isalpha():
+        return f"{name} ({iso})"
+    return name
+
+
+def country_select_options(*, include_blank: bool = True) -> list:
+    """Deduped origin/destination options: common partners, then A–Z with ISO codes.
+
+    Common countries used to be listed again in the full HMRC list, which made
+    Streamlit's search show duplicates (e.g. two ``China`` rows).
+    """
+    seen: set[str] = set()
+    options: list[str] = []
+    if include_blank:
+        options.append("")
+    for name in COMMON_COUNTRIES:
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        options.append(format_country_option(name))
+    options.append("---")
+    for name in COUNTRIES:
+        if not name or name in seen or name == "---":
+            continue
+        seen.add(name)
+        options.append(format_country_option(name))
+    return options
+
+
+def parse_country_selection(selection: str | None) -> str:
+    """Canonical country name from a selectbox value (plain name or ``Name (XX)``)."""
+    if selection is None:
+        return ""
+    raw = str(selection).strip()
+    if not raw or raw == "---":
+        return ""
+    m = re.match(r"^(.+)\s+\(([A-Za-z]{2})\)\s*$", raw)
+    if m:
+        name, code = m.group(1).strip(), m.group(2).upper()
+        if name in COUNTRY_TO_ISO:
+            return name
+        for n, iso in COUNTRY_TO_ISO.items():
+            if iso == code:
+                return n
+        return name
+    if raw in COUNTRY_TO_ISO:
+        return raw
+    # Typed ISO only (rare — selectbox normally returns full label)
+    if len(raw) == 2 and raw.isalpha():
+        code = raw.upper()
+        if code == "UK":
+            return "United Kingdom"
+        for n, iso in COUNTRY_TO_ISO.items():
+            if iso == code:
+                return n
+    return raw
+
+
+def selection_to_iso(selection: str | None) -> str | None:
+    """ISO alpha-2 for a selectbox / metadata country value, or None."""
+    name = parse_country_selection(selection)
+    if not name:
+        return None
+    iso = COUNTRY_TO_ISO.get(name) or normalize_country_iso(name)
+    if iso and len(iso) == 2 and iso.isalpha():
+        return iso.upper()
+    return None

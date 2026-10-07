@@ -70,13 +70,18 @@ except ImportError:  # pragma: no cover
                 return ''
             return digits[:8] if (direction or 'export').lower() == 'export' else digits[:10].ljust(10, '0')
 
-from countries import COUNTRIES, COMMON_COUNTRIES, COUNTRY_TO_ISO, normalize_items_country_fields
+from countries import (
+    country_select_options,
+    normalize_items_country_fields,
+    parse_country_selection,
+    selection_to_iso,
+)
 from file_extractor import extract_from_file
 import shutil
 
 
 # Version tracking for cache busting
-APP_VERSION = "v3.53"
+APP_VERSION = "v3.54"
 
 
 def _normalize_items_hs_for_direction(items: list, direction: str) -> list:
@@ -502,16 +507,19 @@ with col1:
     )
 
 with col2:
-    # Country dropdown with common countries at top
-    country_options = [""] + COMMON_COUNTRIES + ["---"] + COUNTRIES
-    # Label changes based on direction
+    # Deduped list with ISO codes so users can search by name or code (e.g. GB / United Kingdom)
     country_label = "Origin Country" if direction == "Import" else "Destination Country"
-    country_help = "Country of origin for goods" if direction == "Import" else "Country of destination for goods"
-    country = st.selectbox(
-        country_label,
-        options=country_options,
-        help=country_help
+    country_help = (
+        "Country of origin — type a name or 2-letter code (e.g. China or CN)"
+        if direction == "Import"
+        else "Country of destination — type a name or 2-letter code (e.g. United Kingdom or GB)"
     )
+    country_raw = st.selectbox(
+        country_label,
+        options=country_select_options(),
+        help=country_help,
+    )
+    country = parse_country_selection(country_raw)
     
     uploaded_files = st.file_uploader(
         "Upload Invoice Files",
@@ -942,8 +950,7 @@ if st.session_state.get('non_pdf_processed', False):
                 # Get unique commodity codes from the final items
                 codes = list(set(it.get('commodity_code', '') for it in display_items if it.get('commodity_code')))
                 
-                # Map country name to ISO code via HMRC-sourced lookup
-                dest_country_code = COUNTRY_TO_ISO.get(country, country[:2].upper() if country else None)
+                dest_country_code = selection_to_iso(country)
                 
                 with st.spinner(f"Looking up {len(codes)} commodity codes in HMRC API..."):
                     hmrc_results = {}
@@ -980,7 +987,7 @@ if st.session_state.get('non_pdf_processed', False):
                     items=display_items,
                     hmrc_data=_apply_selected_doc_codes(hmrc_results),
                     direction=current_direction,
-                    country='',
+                    country=country or '',
                     consolidate=False,  # Already consolidated above
                     metadata=_inv_meta
                 )
@@ -1721,10 +1728,8 @@ elif st.session_state.processing_started and st.session_state.current_job_id:
                         if st.button("🔍 Lookup HMRC Data", type="primary", use_container_width=True):
                             metadata = processor.get_job_metadata(job_id)
                             direction = metadata.get('direction', 'export')
-                            dest_country = metadata.get('country', '')
-                            
-                            # Map country name to ISO code via HMRC-sourced lookup
-                            dest_country_code = COUNTRY_TO_ISO.get(dest_country, dest_country[:2].upper() if dest_country else None)
+                            dest_country = parse_country_selection(metadata.get('country', ''))
+                            dest_country_code = selection_to_iso(dest_country)
                             
                             with st.spinner("Looking up commodity codes in HMRC API..."):
                                 # Get unique codes (df_items has commodity_code column regardless of consolidation)
