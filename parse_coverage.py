@@ -100,6 +100,7 @@ def parse_money(token: str) -> Optional[float]:
 def invoice_total_hint(text: str) -> Optional[float]:
     """Best-effort invoice grand total from footer text."""
     patterns = (
+        r'Total\s+Value\s*£?\s*([\d,]+(?:\.\d{2})?)',
         r'Total\s+(?:GBP|USD|EUR)\s+Incl\.?\s*VAT\s*([\d,]+(?:\.\d{2})?)',
         r'Tax\s+Exclusive(?:\s+Value)?[^\d]{0,40}([\d,]+(?:\.\d{2})?)',
         r'(?:Grand\s+)?Invoice\s+Total[^\d]{0,20}([\d,]+(?:\.\d{2})?)',

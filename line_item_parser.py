@@ -227,6 +227,21 @@ class LineItemParser:
             items = self._finalize_parsed_items(items, all_text)
             return self._pack_result(items, pages_data, direction, "sugatsune", all_text, page_map)
 
+        # ── Yacht / shipyard package commercial invoice (Pendennis / YSCI…) ───
+        # Package-grouped vertical table: Quantity → Item → Origin → HS → £Value
+        # (optional Ply M3). Header often states a total that doesn't match the
+        # listed packages — parser still extracts every printed line.
+        if self._is_yacht_package_invoice(all_text):
+            print("[Parser] Yacht package commercial invoice detected — dedicated parser")
+            items = self._parse_yacht_package_format(
+                all_text.split("\n"), direction, page_map
+            )
+            items = self._finalize_parsed_items(items, all_text)
+            return self._pack_result(
+                items, pages_data, direction, "yacht_package", all_text, page_map,
+                allow_ai=False,
+            )
+
         # ── NOC / scientific equipment packing list (HS CODE + Ex Licence) ─────
         # National Oceanography Centre / University of Plymouth research kits:
         # vertical columns Item/Barcode or BOX ID → Origin → Weight → Value → HS CODE.
@@ -782,6 +797,25 @@ class LineItemParser:
             item['hs_code'] = item['commodity_code']
     
     @staticmethod
+    def _is_yacht_package_invoice(text: str) -> bool:
+        """Package-grouped yacht/shipyard customs invoice (vertical qty/item/HS/£)."""
+        if not text:
+            return False
+        lower = text.lower()
+        has_package = bool(re.search(r'\bPackage:\s*\n?\s*\d+', text, re.IGNORECASE))
+        has_hs_header = bool(re.search(r'\bHS\s*Code\b', text, re.IGNORECASE))
+        has_qty_item = (
+            'quantity' in lower and 'item' in lower
+            and ('country of' in lower or 'origin' in lower)
+        )
+        yachtish = bool(re.search(
+            r'Commercial Invoice for Shipping|Invoice for Customs Purposes Only|'
+            r'M/Y\s+|Pendennis|YSCI\d+|Blue water shipping|shipyard',
+            text, re.IGNORECASE,
+        ))
+        return has_package and has_hs_header and has_qty_item and yachtish
+
+    @staticmethod
     def _is_noc_scientific_packing_list(text: str) -> bool:
         """NOC / research-vessel customs invoice or Excel→PDF shipping list.
 
@@ -885,6 +919,8 @@ class LineItemParser:
             if len(desc) < 3:
                 continue
             desc_l = desc.lower()
+            # Strip parser annotations like "[Pkg 3] Desktop" before grounding
+            desc_l = re.sub(r'^\[pkg\s*\d+\]\s*', '', desc_l).strip()
             # Prefer a distinctive substring of the description
             probe = desc_l
             for piece in re.split(r"[,;/\(\)\[\]]+", desc_l):
@@ -892,6 +928,9 @@ class LineItemParser:
                 if len(piece) >= 8:
                     probe = piece
                     break
+            # Short product names (Desktop, Hinges…) — accept whole cleaned desc
+            if len(probe) < 8 and len(desc_l) >= 3:
+                probe = desc_l
             probe_compact = re.sub(r"[^a-z0-9]+", "", probe)
             sku_match = re.search(r"\b([A-Z0-9][A-Z0-9._-]{4,})\b", desc)
             sku_ok = False
@@ -4017,6 +4056,141 @@ class LineItemParser:
                     i += 4
                     continue
             i += 1
+
+        return items
+
+    def _parse_yacht_package_format(
+        self, lines: List[str], direction: str, page_map: Dict
+    ) -> List[Dict]:
+        """Parse package-grouped yacht/shipyard commercial invoices.
+
+        Vertical columns after each Package block::
+
+            Quantity → Item (may wrap) → Origin → HS Code → £Value → [Ply M3]
+
+        Anchored on HS + £value so page numbers / package headers are ignored.
+        """
+        pad_to_10 = direction.lower() == "import"
+        stripped = [ln.strip() for ln in lines if (ln or "").strip()]
+        stripped = [
+            ln for ln in stripped
+            if not re.match(r'^---\s*PAGE\s+\d+\s*---$', ln, re.IGNORECASE)
+        ]
+
+        hs_re = re.compile(r'^\d{8}(?:\d{2})?$')
+        money_re = re.compile(r'^£\s*([\d,]+(?:\.\d{2})?)$')
+        qty_re = re.compile(r'^\d{1,4}$')
+
+        def is_pkg_meta(s: str) -> bool:
+            low = s.lower()
+            return (
+                low.startswith('package')
+                or low.startswith('dimensions')
+                or low.startswith('net weight')
+                or low.startswith('gross weight')
+                or low.startswith('value:')
+                or low.startswith('total ')
+                or low in (
+                    'quantity', 'item', 'hs code', 'value', 'ply m3',
+                    'country of', 'origin',
+                )
+                or re.match(r'^\d+\s*x\s*\d+\s*x\s*\d+', low)
+                or re.match(r'^\d+(?:\.\d+)?\s*kg\b', low)
+            )
+
+        # Map each line index → nearest preceding package number
+        package_at: List[str] = [''] * len(stripped)
+        current = ''
+        for idx, ln in enumerate(stripped):
+            low = ln.lower()
+            m = re.match(r'package:\s*(\d+)\s*$', low)
+            if m:
+                current = m.group(1)
+            elif low in ('package:', 'package') and idx + 1 < len(stripped) and qty_re.match(stripped[idx + 1]):
+                current = stripped[idx + 1]
+            package_at[idx] = current
+
+        items: List[Dict] = []
+        used_hs_idx: set = set()
+        for i, line in enumerate(stripped):
+            if i in used_hs_idx or not hs_re.match(line):
+                continue
+            if i < 1 or not looks_like_country_token(stripped[i - 1]):
+                continue
+            if i + 1 >= len(stripped) or not money_re.match(stripped[i + 1]):
+                continue
+
+            origin = normalize_country_iso(stripped[i - 1])
+            value = money_re.match(stripped[i + 1]).group(1).replace(',', '')
+            hs = self._pad_hs_code(re.sub(r'\D', '', line), pad_to_10)
+
+            # Walk back: description lines, then quantity
+            j = i - 2
+            desc_parts: List[str] = []
+            while j >= 0:
+                cand = stripped[j]
+                if qty_re.match(cand) and not is_pkg_meta(cand):
+                    # qty line — stop collecting desc
+                    break
+                if (
+                    is_pkg_meta(cand)
+                    or money_re.match(cand)
+                    or hs_re.match(cand)
+                    or looks_like_country_token(cand)
+                ):
+                    break
+                desc_parts.insert(0, cand)
+                j -= 1
+                if len(desc_parts) >= 6:
+                    break
+
+            if j < 0 or not qty_re.match(stripped[j]):
+                continue
+            qty = stripped[j]
+            # Reject package-number false starts: qty immediately after "Package:"
+            if j >= 1 and stripped[j - 1].lower().rstrip(':') == 'package':
+                continue
+
+            description = " ".join(desc_parts).strip()
+            if not description or not self._is_valid_item(
+                description, quantity=qty, total_value=value
+            ):
+                continue
+            if re.search(
+                r'commercial invoice|preferential origin|shipping\s+address|'
+                r'invoice for customs|total value',
+                description, re.IGNORECASE,
+            ):
+                continue
+
+            unit_value = ''
+            try:
+                qty_f = float(qty)
+                val_f = float(value)
+                if qty_f > 0:
+                    unit_value = f"{val_f / qty_f:.4f}".rstrip('0').rstrip('.')
+            except ValueError:
+                pass
+
+            pkg = package_at[i]
+            line_pos = sum(len(raw) + 1 for raw in lines[: min(j, len(lines) - 1)])
+            items.append({
+                "item_number": str(len(items) + 1),
+                "stock_number": f"PKG{pkg}" if pkg else "",
+                "description": description,
+                "quantity": qty,
+                "uom": "EA",
+                "unit_value": unit_value,
+                "total_value": value,
+                "currency": "GBP",
+                "commodity_code": hs,
+                "country_of_origin": origin,
+                "net_weight": "",
+                "pages": [self._page_at(page_map, line_pos, 1)],
+                "confidence": 0.9,
+                "needs_review": False,
+            })
+            used_hs_idx.add(i)
 
         return items
 
