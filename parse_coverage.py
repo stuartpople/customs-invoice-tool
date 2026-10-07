@@ -13,16 +13,20 @@ from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 _JUNK_LINE_RE = re.compile(
     r'account\s*(?:number|no\.?)(?:\b|:)|sort\s*code|iban|swift|vat\s*no|eori|'
-    r'bank\s+information|bank\s+details|please\s+remit|'
+    r'bank\s+information|bank\s+details|please\s+remit|credit\s+transf|'
     r'phone\s*:|fax\s*:|invoice\s*no|invoice\s*date|invoice\s+due|'
     r'consignee|exporter:|page\s+\d+\s+of|tax\s+exclusive|'
     r'total\s+(gbp|usd|eur)\s+incl|grand\s+total|payment\s+terms|'
-    r'barclays|approved\s+exporter',
+    r'barclays|hsbc|natwest|lloyds|approved\s+exporter|'
+    # Tintometer remittance: "GBP: 40-42-18 32871957, USD: 40-12-76 74882967"
+    r'\b(?:GBP|USD|EUR)\s*[:;]\s*\d{2}-\d{2}-\d{2}\b',
     re.IGNORECASE,
 )
 
 # Not glued to a letter — P03652920 / 1111177750M are part numbers, not HS.
 _HS_RE = re.compile(r'(?<![A-Za-z\d])(\d{8,10})(?![A-Za-z\d])')
+# Lovibond / Tintometer print HS as 3822.90.0000 (not contiguous digits).
+_DOTTED_HS_RE = re.compile(r'(?<![A-Za-z\d])(\d{4}\.\d{2}\.\d{4})(?![A-Za-z\d])')
 # Comma-separated supplier / shipment refs (RS invoices list these above the table).
 _REF_LIST_RE = re.compile(r'(?:\d{9,12}\s*,\s*){2,}\d{9,12}')
 _UOM_RE = re.compile(r'\b(EA|PCS|PC|SET|KG|BAG|BOX|PK|PACK|M|REEL|ROLL)\b', re.IGNORECASE)
@@ -68,8 +72,22 @@ def document_commodity_codes(text: str) -> Set[str]:
         if _JUNK_LINE_RE.search(line) or _REF_LIST_RE.search(line):
             continue
         has_signal = bool(_UOM_RE.search(line) or _MONEY_RE.search(line))
+        # Prefer dotted HS (3822.90.0000) — contiguous 8-digit bank accounts
+        # on remittance lines must not drown out real tariff codes.
+        dotted_hits = list(_DOTTED_HS_RE.finditer(line))
+        for m in dotted_hits:
+            raw = re.sub(r'\D', '', m.group(1))
+            if not is_commodity_hs(raw):
+                continue
+            code = raw[:8]
+            counts[code] = counts.get(code, 0) + 1
+            signalled.add(code)  # dotted form is always a printed tariff code
+        if dotted_hits:
+            continue
         for m in _HS_RE.finditer(line):
             raw = m.group(1)
+            if looks_like_bank_account(raw, line):
+                continue
             if not is_commodity_hs(raw):
                 continue
             code = raw[:8]
@@ -116,6 +134,18 @@ def invoice_total_hint(text: str) -> Optional[float]:
                 found.append(val)
     if not found:
         return None
+    # Multi-invoice PDFs (e.g. Tintometer batch): sum distinct labeled Invoice Totals
+    inv_totals = []
+    for m in re.finditer(
+        r'Invoice\s+Total\s*£?\s*([\d,]+(?:\.\d{2})?)',
+        blob,
+        re.IGNORECASE,
+    ):
+        val = parse_money(m.group(1))
+        if val and val > 0:
+            inv_totals.append(val)
+    if len(inv_totals) >= 2:
+        return round(sum(inv_totals), 2)
     # Prefer the largest plausible total (VAT 0.00 and line amounts also match)
     return max(found)
 
@@ -257,10 +287,17 @@ def coverage_warnings(
     inv_total = invoice_total_hint(text)
     line_sum = items_total(items)
     pkg_sum = package_header_values_sum(text)
+    carriage = _carriage_charges_sum(text)
     if inv_total and inv_total > 1:
+        # Goods lines often exclude freight/carriage printed as Dil Chrg / Carriage
+        adjusted = line_sum + (carriage or 0.0)
         delta = abs(inv_total - line_sum)
-        gap = delta / inv_total
-        if delta > 5 and gap > min(total_tolerance, 0.02):
+        delta_adj = abs(inv_total - adjusted)
+        if carriage and delta_adj <= max(5.0, inv_total * 0.02):
+            # Explained by carriage — not a missing product row
+            pass
+        elif delta > 5 and (delta / inv_total) > min(total_tolerance, 0.02):
+            gap = delta / inv_total
             extra = ''
             if pkg_sum and abs(pkg_sum - line_sum) <= 1:
                 extra = (
@@ -270,11 +307,35 @@ def coverage_warnings(
                 )
             elif pkg_sum and abs(pkg_sum - inv_total) > 5:
                 extra = f' Package header Values on the PDF only sum to {pkg_sum:.2f}.'
+            elif carriage:
+                extra = (
+                    f' Carriage/freight on the invoice is about {carriage:.2f} '
+                    f'(not included in product lines).'
+                )
             warnings.append(
                 f'Line totals {line_sum:.2f} do not match invoice total {inv_total:.2f} '
                 f'({gap:.0%} off) — rows are probably missing.{extra}'
             )
     return doc_hs, parsed_hs, warnings
+
+
+def _carriage_charges_sum(text: str) -> Optional[float]:
+    """Sum Dil Chrg / Carriage amounts from Tintometer-style footers."""
+    if not text:
+        return None
+    vals = []
+    for pat in (
+        r'Dil\s*Chrg[^0-9]{0,20}([\d,]+(?:\.\d{1,3})?)',
+        r'\bCarriage\s+([\d,]+(?:\.\d{2})?)',
+    ):
+        for m in re.finditer(pat, text, re.IGNORECASE):
+            v = parse_money(m.group(1))
+            if v and v > 0:
+                vals.append(v)
+    if not vals:
+        return None
+    # Dedupe OCR echoes of the same charge (838.500 vs 838.50)
+    return round(sum({round(v, 2) for v in vals}), 2)
 
 
 def package_header_values_sum(text: str) -> Optional[float]:
@@ -338,7 +399,9 @@ _FALSE_LABEL_BEFORE_RE = re.compile(
 _BANK_CONTEXT_RE = re.compile(
     r'(?:bank\s+details|bank\s+information|sort\s*code|\biban\b|\bswift\b|\bbic\b|'
     r'a/?c\s*no|account\s*(?:number|no\.?)|barclays|hsbc|natwest|lloyds|clyde|'
-    r'bank\s*:)',
+    r'bank\s*:|credit\s+transf|'
+    r'\b(?:GBP|USD|EUR)\s*[:;]|'
+    r'\b\d{2}-\d{2}-\d{2}\b)',
     re.IGNORECASE,
 )
 _COL_HEADERS = frozenset({
@@ -363,7 +426,15 @@ def looks_like_bank_account(candidate: str, window: str = '') -> bool:
     cand = (candidate or '').strip()
     if not re.fullmatch(r'\d{8}', cand):
         return False
-    return bool(_BANK_CONTEXT_RE.search(window or ''))
+    w = window or ''
+    if _BANK_CONTEXT_RE.search(w):
+        return True
+    # Explicit "USD: 40-12-76 74882967" / sort-code then account
+    if re.search(rf'(?:GBP|USD|EUR)\s*[:;].{{0,40}}{re.escape(cand)}', w, re.I):
+        return True
+    if re.search(rf'\b\d{{2}}-\d{{2}}-\d{{2}}\s+{re.escape(cand)}\b', w):
+        return True
+    return False
 
 
 def looks_like_invoice_id(candidate: str, window: str = '') -> bool:

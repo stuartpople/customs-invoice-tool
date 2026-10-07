@@ -227,6 +227,21 @@ class LineItemParser:
             items = self._finalize_parsed_items(items, all_text)
             return self._pack_result(items, pages_data, direction, "sugatsune", all_text, page_map)
 
+        # ── Tintometer / Lovibond / DTK Water commercial invoices ────────────
+        # STOCK + pack line + dotted HS (3822.90.0000) + description + UOM +
+        # qty/price floats. OCR often uses European commas (154,06). Never AI —
+        # remittance footers contain 8-digit bank accounts that look like HS.
+        if self._is_tintometer_invoice(all_text):
+            print("[Parser] Tintometer/Lovibond invoice detected — dedicated parser")
+            items = self._parse_tintometer_format(
+                all_text.split("\n"), direction, page_map
+            )
+            items = self._finalize_parsed_items(items, all_text)
+            return self._pack_result(
+                items, pages_data, direction, "tintometer", all_text, page_map,
+                allow_ai=False,
+            )
+
         # ── Yacht / shipyard package commercial invoice (Pendennis / YSCI…) ───
         # Package-grouped vertical table: Quantity → Item → Origin → HS → £Value
         # (optional Ply M3). Header often states a total that doesn't match the
@@ -725,6 +740,15 @@ class LineItemParser:
             re.IGNORECASE,
         ):
             found.add(match.group(1))
+        # Tintometer / HSBC remittance: "GBP: 40-42-18 32871957, USD: 40-12-76 74882967"
+        for match in re.finditer(
+            r'(?:GBP|USD|EUR)\s*[:;]?\s*(?:\d{2}-\d{2}-\d{2}\s+)?(\d{8})\b',
+            text,
+            re.IGNORECASE,
+        ):
+            found.add(match.group(1))
+        for match in re.finditer(r'\b\d{2}-\d{2}-\d{2}\s+(\d{8})\b', text):
+            found.add(match.group(1))
         return found
 
     def _sanitize_item_commodity_code(self, item: Dict, banned_digits=None) -> None:
@@ -784,6 +808,153 @@ class LineItemParser:
         if 'hs_code' in item:
             item['hs_code'] = item['commodity_code']
     
+    @staticmethod
+    def _is_tintometer_invoice(text: str) -> bool:
+        """Tintometer / Lovibond / DTK Water export invoices with dotted HS codes."""
+        if not text:
+            return False
+        lower = text.lower()
+        brand = bool(re.search(r'tintometer|lovibond|\bdtk\s*water\b', text, re.I))
+        dotted = bool(re.search(r'\b\d{4}\.\d{2}\.\d{4}\b', text))
+        cols = (
+            'commodity' in lower
+            and (
+                'product description' in lower
+                or 'our product' in lower
+                or 'pack line' in lower
+            )
+        )
+        return brand and dotted and cols
+
+    @staticmethod
+    def _tintometer_money(token: str) -> str:
+        """Normalise ``154,06`` / ``154.06`` to a decimal string."""
+        t = (token or '').replace('£', '').replace('$', '').strip()
+        if re.match(r'^\d+,\d{2}$', t) or re.match(r'^\d{1,3}(?:\.\d{3})+,\d{2}$', t):
+            return t.replace('.', '').replace(',', '.')
+        return t.replace(',', '')
+
+    def _parse_tintometer_format(
+        self, lines: List[str], direction: str, page_map: Dict
+    ) -> List[Dict]:
+        """Parse Tintometer/Lovibond rows::
+
+            STOCK  PACK_LINE  3822.90.0000  Description…  EA  1.00  154.06  0.00  154.06  ROW
+        """
+        pad_to_10 = direction.lower() == "import"
+        row_re = re.compile(
+            r'^(?P<stock>\d{5,7})\s+(?P<pack>\d{1,3})\s+'
+            r'(?P<hs>\d{4}\.\d{2}\.\d{4})\s+'
+            r'(?P<desc>.+?)\s+'
+            r'(?P<uom>EA|PK|BAG|SET|PCS|BOX|PACK)\s+'
+            r'(?P<qty>\d+[.,]\d{2})\s+'
+            r'(?P<unit>\d+[.,]\d{2})\s+'
+            r'(?P<tax>\d+[.,]\d{2,4})\s+'
+            r'(?P<total>\d+[.,]\d{2})'
+            # OCR often appends "AS ROW |" / "ROW i" / stamps after the total
+            r'(?:\s+(?P<vat>[A-Z]{2,5}))?'
+            r'(?:\s.*)?$',
+            re.IGNORECASE,
+        )
+        coo_re = re.compile(
+            r'Country\s+of\s+Origin\s*:\s*([A-Z0-9]{2})\b', re.IGNORECASE
+        )
+        wt_re = re.compile(
+            r'Total\s+Net\s+Weight\s+(\d+(?:[.,]\d+)?)', re.IGNORECASE
+        )
+
+        stripped = [
+            ln.strip()
+            for ln in lines
+            if (ln or '').strip()
+            and not re.match(r'^---\s*PAGE\s+\d+\s*---$', ln or '', re.I)
+        ]
+        items: List[Dict] = []
+        seen = set()
+        for i, line in enumerate(stripped):
+            m = row_re.match(line)
+            if not m:
+                continue
+            stock = m.group('stock')
+            pack = m.group('pack')
+            hs_digits = re.sub(r'\D', '', m.group('hs'))
+            if hs_digits.startswith('1') and len(hs_digits) < 8:
+                continue
+            description = re.sub(r'\s+', ' ', m.group('desc')).strip()
+            # Drop trailing OCR junk glued to description
+            description = re.sub(r'\s+[|/\\]+$', '', description).strip()
+            # Soften OCR angle-bracket noise in specs: 0.4(<0.5) → 0.4(~0.5)
+            description = description.replace('<', '~').replace('>', '~')
+
+            qty_s = self._tintometer_money(m.group('qty'))
+            unit_s = self._tintometer_money(m.group('unit'))
+            total_s = self._tintometer_money(m.group('total'))
+            if not description or not self._is_valid_item(
+                description, stock, qty_s, total_s
+            ):
+                continue
+            try:
+                qty_f = float(qty_s)
+                qty = str(int(qty_f)) if qty_f == int(qty_f) else qty_s
+            except ValueError:
+                qty = qty_s
+            try:
+                unit_f = float(unit_s)
+                total_f = float(total_s)
+            except ValueError:
+                unit_f, total_f = 0.0, 0.0
+            # OCR sometimes zeros the unit price but keeps line total (qty × list)
+            if total_f > 0 and unit_f <= 0 and qty_f > 0:
+                unit_s = f"{total_f / qty_f:.2f}"
+            elif total_f <= 0 and unit_f > 0 and qty_f > 0:
+                total_s = f"{unit_f * qty_f:.2f}"
+                total_f = float(total_s)
+
+            # Look ahead a few lines for COO / weight (printed under each row)
+            origin = ''
+            net_weight = ''
+            for j in range(i + 1, min(i + 6, len(stripped))):
+                nxt = stripped[j]
+                if row_re.match(nxt):
+                    break
+                cm = coo_re.search(nxt)
+                if cm and not origin:
+                    origin = cm.group(1).upper()
+                    if origin in ('G8', 'G6', 'C8'):  # OCR of GB / CN
+                        origin = 'GB' if origin.startswith('G') else 'CN'
+                wm = wt_re.search(nxt)
+                if wm and not net_weight:
+                    net_weight = self._tintometer_money(wm.group(1))
+
+            hs = self._pad_hs_code(hs_digits, pad_to_10)
+            key = (stock, pack, hs, qty, total_s)
+            if key in seen:
+                continue
+            seen.add(key)
+
+            line_pos = sum(len(raw) + 1 for raw in lines[: min(i, len(lines) - 1)])
+            items.append({
+                "item_number": str(len(items) + 1),
+                "line_number": pack,
+                "stock_number": stock,
+                "description": description,
+                "quantity": qty,
+                "uom": m.group('uom').upper(),
+                "unit_value": unit_s,
+                "total_value": total_s if total_f > 0 else total_s,
+                "currency": "GBP",
+                "vat_code": (m.group('vat') or '').upper(),
+                "commodity_code": hs,
+                "country_of_origin": origin,
+                "net_weight": net_weight,
+                "hs_code": hs,
+                "pages": [self._page_at(page_map, line_pos, 1)],
+                "confidence": 0.9,
+                "needs_review": False,
+                "raw_text": line[:200],
+            })
+        return items
+
     @staticmethod
     def _is_yacht_package_invoice(text: str) -> bool:
         """Package-grouped yacht/shipyard customs invoice (vertical qty/item/HS/£)."""
@@ -2535,10 +2706,15 @@ class LineItemParser:
         if punct_count > len(description) * 0.4:  # More than 40% punctuation
             return False
         
-        # Rule 9: If quantity provided, must be reasonable
+        # Rule 9: If quantity provided, must be reasonable (accept European 1,00)
         if quantity:
             try:
-                qty = float(quantity)
+                q_raw = str(quantity).strip()
+                if re.match(r'^\d+,\d{1,4}$', q_raw):
+                    q_raw = q_raw.replace(',', '.')
+                else:
+                    q_raw = q_raw.replace(',', '')
+                qty = float(q_raw)
                 if qty <= 0 or qty > 100000:
                     return False
             except (ValueError, TypeError):
@@ -2703,8 +2879,14 @@ class LineItemParser:
             # Extract numeric-looking tokens for qty and prices (with positions)
             num_tokens = []  # list of (idx_in_tokens_after, type, value)
             for idx, t in enumerate(tokens_after):
-                # normalize common money formatting
-                t_clean = t.replace('$', '').replace('US$', '').replace(',', '')
+                # normalize common money formatting (incl. European 154,06)
+                t_raw = t.replace('$', '').replace('US$', '').replace('£', '').strip()
+                if re.match(r'^\d+,\d{2}$', t_raw) or re.match(
+                    r'^\d{1,3}(?:\.\d{3})+,\d{2}$', t_raw
+                ):
+                    t_clean = t_raw.replace('.', '').replace(',', '.')
+                else:
+                    t_clean = t_raw.replace(',', '')
                 if re.match(r'^\d+$', t_clean):
                     num_tokens.append((idx, 'int', t_clean))
                 elif re.match(r'^\d+\.\d{1,4}$', t_clean):
