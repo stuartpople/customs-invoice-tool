@@ -681,31 +681,19 @@ class LineItemParser:
             if not self._is_valid_item(desc, it.get('stock_number', ''), it.get('quantity', ''), it.get('total_value', '')):
                 continue
 
-            # Build dedupe key — include stock number when available so that
-            # two different products with the same HS/qty/value are not merged.
-            # Also include line_number: the same article can legitimately appear
-            # in multiple shipment bundles on the same invoice (e.g. Solarlux
-            # sections 1(5) and 1(6) both have the same article/qty/total), so
-            # we must not collapse them — but we still want to drop exact
-            # duplicates that arise from multi-page OCR overlap (same line
-            # number + same stock + same values).
-            key_parts = []
+            # Build dedupe key — never key on HS/qty/value alone: yacht/package
+            # invoices often have several different items in the same package
+            # with the same qty+£value (e.g. three £2,500 wardrobe kits under
+            # 94039100), and collapsing those under-reports the declaration.
+            # Include description + line/item number; keep stock when present
+            # so multi-page OCR exact duplicates still drop.
             cc = (it.get('commodity_code') or '').strip()
             qty = str(it.get('quantity') or '').strip()
             tv = str(it.get('total_value') or '').strip()
             sn = (it.get('stock_number') or '').strip()
             ln = str(it.get('line_number') or it.get('item_number') or '').strip()
-            if sn:
-                key_parts = [sn, qty, tv, ln] if ln else [sn, qty, tv]
-            elif cc:
-                # Include item/line number so identical HS/qty/value rows
-                # (e.g. three steel anchors) are not collapsed.
-                key_parts = [cc, qty, tv, ln] if ln else [cc, qty, tv]
-            else:
-                # fallback to normalized description prefix
-                key_parts = [desc_l[:40], qty, tv, ln] if ln else [desc_l[:40], qty, tv]
-
-            key = tuple(key_parts)
+            desc_key = re.sub(r'\s+', ' ', desc_l)[:60]
+            key = (sn, cc, qty, tv, ln, desc_key)
             if key in seen_keys:
                 continue
             seen_keys.add(key)
@@ -4174,9 +4162,13 @@ class LineItemParser:
 
             pkg = package_at[i]
             line_pos = sum(len(raw) + 1 for raw in lines[: min(j, len(lines) - 1)])
+            seq = len(items) + 1
+            # Unique per line (not just per package) so postprocess dedupe cannot
+            # merge two £2,500 wardrobe kits that share PKG3 / qty 6 / HS.
+            stock = f"PKG{pkg}-{seq}" if pkg else f"LINE-{seq}"
             items.append({
-                "item_number": str(len(items) + 1),
-                "stock_number": f"PKG{pkg}" if pkg else "",
+                "item_number": str(seq),
+                "stock_number": stock,
                 "description": description,
                 "quantity": qty,
                 "uom": "EA",

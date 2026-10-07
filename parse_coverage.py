@@ -256,15 +256,42 @@ def coverage_warnings(
         )
     inv_total = invoice_total_hint(text)
     line_sum = items_total(items)
+    pkg_sum = package_header_values_sum(text)
     if inv_total and inv_total > 1:
         delta = abs(inv_total - line_sum)
         gap = delta / inv_total
         if delta > 5 and gap > min(total_tolerance, 0.02):
+            extra = ''
+            if pkg_sum and abs(pkg_sum - line_sum) <= 1:
+                extra = (
+                    f' Listed package Values sum to {pkg_sum:.2f} and match the '
+                    f'extracted lines — the PDF likely omits further packages '
+                    f'needed to reach the header total.'
+                )
+            elif pkg_sum and abs(pkg_sum - inv_total) > 5:
+                extra = f' Package header Values on the PDF only sum to {pkg_sum:.2f}.'
             warnings.append(
                 f'Line totals {line_sum:.2f} do not match invoice total {inv_total:.2f} '
-                f'({gap:.0%} off) — rows are probably missing.'
+                f'({gap:.0%} off) — rows are probably missing.{extra}'
             )
     return doc_hs, parsed_hs, warnings
+
+
+def package_header_values_sum(text: str) -> Optional[float]:
+    """Sum ``Value: £X`` package headers (yacht / shipyard package invoices)."""
+    if not text:
+        return None
+    vals = []
+    for m in re.finditer(
+        r'(?im)^\s*Value:\s*£\s*([\d,]+(?:\.\d{2})?)\s*$',
+        text,
+    ):
+        v = parse_money(m.group(1))
+        if v and v > 0:
+            vals.append(v)
+    if len(vals) < 2:
+        return None
+    return round(sum(vals), 2)
 
 
 _INV_STOP = frozenset({
