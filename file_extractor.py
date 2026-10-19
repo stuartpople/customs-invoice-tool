@@ -774,8 +774,34 @@ def _word_decimal(raw) -> Optional[float]:
 
 
 def _parse_word_commercial_tables(doc, trade_direction: str) -> List[Dict]:
-    """Extract standard commercial-invoice rows directly from Word tables."""
+    """Extract commercial-invoice rows from Word tables.
+
+    Handles one product per row, and ARC-style tables that stack every
+    product as a new line inside the same description / value / HS cells.
+    """
     items: List[Dict] = []
+    default_origin = ''
+    header_blob = '\n'.join(p.text for p in getattr(doc, 'paragraphs', []) or [])
+    origin_match = re.search(
+        r'Country of Origin\s*:\s*([^\n\t]+)', header_blob, re.IGNORECASE
+    )
+    if origin_match:
+        default_origin = normalize_country_iso(origin_match.group(1).strip()) or ''
+
+    def cell_lines(text: str) -> List[str]:
+        return [ln.strip() for ln in (text or '').splitlines() if ln.strip()]
+
+    def qty_from_description(description: str, unit: Optional[float], total: Optional[float]) -> Optional[float]:
+        match = re.search(r'\bx\s*(\d+(?:\.\d+)?)\s*$', description, re.IGNORECASE)
+        if match:
+            return float(match.group(1))
+        if unit and total and unit > 0:
+            qty = total / unit
+            if abs(qty - round(qty)) < 0.02 and qty > 0:
+                return float(round(qty))
+        if total and total > 0:
+            return 1.0
+        return None
 
     for table in doc.tables:
         if not table.rows:
@@ -785,51 +811,93 @@ def _parse_word_commercial_tables(doc, trade_direction: str) -> List[Dict]:
             for cell in table.rows[0].cells
         ]
 
-        def column(*names):
+        def columns(*names):
+            hits = []
             for idx, header in enumerate(headers):
                 if any(name in header for name in names):
-                    return idx
-            return None
+                    hits.append(idx)
+            return hits
 
-        qty_col = column('quantity', 'qty')
-        desc_col = column('description', 'goods')
-        country_col = column('country of origin', 'origin')
-        hs_col = column('hs code', 'commodity code', 'tariff')
-        value_col = column('value', 'amount', 'line total')
-        if None in (qty_col, desc_col, hs_col, value_col):
+        qty_hits = columns('quantity', 'qty')
+        desc_hits = columns('description', 'goods')
+        country_hits = columns('country of origin', 'origin')
+        hs_hits = columns('hs code', 'commodity code', 'tariff')
+        value_hits = columns('value', 'amount', 'line total')
+        qty_col = qty_hits[0] if qty_hits else None
+        desc_col = desc_hits[0] if desc_hits else None
+        country_col = country_hits[0] if country_hits else None
+        hs_col = hs_hits[0] if hs_hits else None
+        value_col = next(
+            (idx for idx in value_hits if 'total' in headers[idx] and 'unit' not in headers[idx]),
+            value_hits[0] if value_hits else None,
+        )
+        unit_col = next(
+            (idx for idx in value_hits if 'unit' in headers[idx] and idx != value_col),
+            None,
+        )
+        if None in (desc_col, hs_col, value_col):
             continue
 
         for row in table.rows[1:]:
-            cells = [re.sub(r'\s+', ' ', cell.text).strip() for cell in row.cells]
-            if max(qty_col, desc_col, hs_col, value_col) >= len(cells):
+            cells = [cell.text.strip() for cell in row.cells]
+            if max(desc_col, hs_col, value_col) >= len(cells):
                 continue
 
-            description = cells[desc_col]
-            code = _normalize_hs_code(cells[hs_col], trade_direction)
-            qty = _word_decimal(cells[qty_col])
-            value = _word_decimal(cells[value_col])
-            if not description or not code or qty is None or value is None:
-                # Repeated headers and package separator rows land here.
-                continue
-            if qty <= 0 or value <= 0:
-                continue
+            descriptions = cell_lines(cells[desc_col])
+            totals = cell_lines(cells[value_col])
+            codes = cell_lines(cells[hs_col])
+            units = cell_lines(cells[unit_col]) if unit_col is not None and unit_col < len(cells) else []
+            countries = (
+                cell_lines(cells[country_col])
+                if country_col is not None and country_col < len(cells) else []
+            )
+            qtys = (
+                cell_lines(cells[qty_col])
+                if qty_col is not None and qty_col < len(cells) else []
+            )
+            stacked = (
+                len(descriptions) > 1
+                and len(descriptions) == len(totals) == len(codes)
+            )
+            if not stacked:
+                descriptions = [' '.join(descriptions)]
+                totals = [' '.join(totals)]
+                codes = [' '.join(codes)]
+                units = [' '.join(units)] if units else []
+                countries = [' '.join(countries)] if countries else []
+                qtys = [' '.join(qtys)] if qtys else []
 
-            country = ''
-            if country_col is not None and country_col < len(cells):
-                country = normalize_country_iso(cells[country_col])
-            item = {
-                'commodity_code': code,
-                'description': description,
-                'quantity': qty,
-                'uom': 'PCS',
-                'total_value': value,
-                'country_of_origin': country,
-                'net_weight': None,
-                'currency': 'GBP',
-                'needs_review': False,
-            }
-            normalize_item_country_fields(item)
-            items.append(item)
+            for idx, description in enumerate(descriptions):
+                if re.search(r'\btotal\b', description, re.IGNORECASE) and not re.search(r'\d{6,}', codes[idx] if idx < len(codes) else ''):
+                    continue
+                code = _normalize_hs_code(codes[idx] if idx < len(codes) else '', trade_direction)
+                value = _word_decimal(totals[idx] if idx < len(totals) else '')
+                unit = _word_decimal(units[idx]) if idx < len(units) else None
+                if qty_col is not None and idx < len(qtys):
+                    qty = _word_decimal(qtys[idx])
+                else:
+                    qty = qty_from_description(description, unit, value)
+                if not description or not code or qty is None or value is None:
+                    continue
+                if qty <= 0 or value <= 0:
+                    continue
+                country = default_origin
+                if idx < len(countries) and countries[idx]:
+                    country = normalize_country_iso(countries[idx]) or country
+                item = {
+                    'commodity_code': code,
+                    'description': description,
+                    'quantity': qty,
+                    'uom': 'PCS',
+                    'unit_value': unit,
+                    'total_value': value,
+                    'country_of_origin': country,
+                    'net_weight': None,
+                    'currency': 'GBP',
+                    'needs_review': False,
+                }
+                normalize_item_country_fields(item)
+                items.append(item)
 
     return items
 
@@ -942,12 +1010,17 @@ def extract_from_file(file_obj, filename: str, trade_direction: str = "export") 
             metadata.update(extract_invoice_metadata(text))
 
             invoice_ref = re.search(r'\bINV\s*:\s*([A-Z0-9/-]+)', text, re.IGNORECASE)
+            our_ref = re.search(
+                r'Our Reference\s*:\s*(.+)', text, re.IGNORECASE
+            )
             invoice_date = re.search(
                 r'\b(\d{1,2}/\d{1,2}/\d{4})\b', text, re.IGNORECASE
             )
             incoterm = re.search(r'\bINCO\s*Terms?\s+([A-Z]{3})\b', text, re.IGNORECASE)
             printed_total = re.search(
-                r'\bTotal\s+value\s*:\s*[£$€]?\s*([\d,.]+)', text, re.IGNORECASE
+                r'\bTotal\s+(?:Valor\s*/\s*)?[Vv]alue\s*\|?\s*[£$€]?\s*([\d,.]+)',
+                text,
+                re.IGNORECASE,
             )
             gross_total = re.search(
                 r'\bTotal\s+Weight\s*:\s*([\d,.]+)\s*kg', text, re.IGNORECASE
@@ -962,6 +1035,8 @@ def extract_from_file(file_obj, filename: str, trade_direction: str = "export") 
             ]
             if invoice_ref:
                 metadata['invoice_number'] = invoice_ref.group(1)
+            elif our_ref:
+                metadata['invoice_number'] = re.sub(r'\s+', ' ', our_ref.group(1)).strip()
             if invoice_date:
                 metadata['invoice_date'] = invoice_date.group(1)
             if incoterm:
