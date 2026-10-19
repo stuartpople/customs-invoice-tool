@@ -360,12 +360,13 @@ def extract_from_excel(file_obj, trade_direction: str = "export") -> List[Dict]:
             ])
             
             # Value columns — prefer "line total" over generic "total" or "cost"
-            value_columns = _find_columns(df.columns, col_lower, [
+            value_columns = _prefer_extended_amount(_find_columns(df.columns, col_lower, [
                 ['line total', 'line_total', 'line value'],          # exact line total
                 ['total value', 'total_value', 'invoice value'],
+                ['total price', 'extended price', 'ext price', 'extended'],
                 ['value', 'price'],
                 ['total', 'cost', 'amount'],                         # less specific
-            ])
+            ]), col_lower)
             # Fallback: unnamed column with numeric data (e.g. Rhenus format)
             if not value_columns:
                 _skip = set(c for cols in [code_columns, desc_columns, qty_columns] for c in cols)
@@ -383,11 +384,11 @@ def extract_from_excel(file_obj, trade_direction: str = "export") -> List[Dict]:
             # Weight columns — prefer line/total weight over unit weight.
             # 'Line Weight' is the per-row total (unit_weight * qty) and is
             # correct even when unit_weight rounds to 0 for very light items.
-            weight_columns = _find_columns(df.columns, col_lower, [
+            weight_columns = _prefer_extended_amount(_find_columns(df.columns, col_lower, [
                 ['total (kg)', 'total_kg', 'total weight', 'net weight', 'nett weight', 'line weight'],
                 ['net_weight', 'weight (kg)', 'weight_kg', 'line_weight'],
                 ['weight', 'net', 'gross', 'kg'],
-            ])
+            ]), col_lower)
             
             country_columns = _find_columns(df.columns, col_lower, [
                 ['country of destination', 'country of origin', 'destination', 'origin country'],
@@ -569,6 +570,24 @@ def _clean_numeric(val) -> str:
     for ch in ['£', '$', '€', '¥', ',', '\u00a3', '\u20ac']:
         s = s.replace(ch, '')
     return s.strip()
+
+
+def _prefer_extended_amount(columns, col_lower_map):
+    """When a sheet has both unit and line totals, use the extended amount.
+
+    Diverse / Wizard-style invoices label columns ``UNIT PRICE GBP`` and
+    ``TOTAL PRICE GBP``. Both match ``price``, and sheet order would otherwise
+    pick the unit price (under-reporting the declaration).
+    """
+    def rank(col):
+        name = col_lower_map.get(col, str(col).lower())
+        if 'total' in name or 'extended' in name or name.strip() in ('amount', 'value'):
+            if 'unit' not in name:
+                return 0
+        if 'unit' in name:
+            return 2
+        return 1
+    return sorted(columns, key=rank)
 
 
 def _find_columns(columns, col_lower_map, priority_groups):
