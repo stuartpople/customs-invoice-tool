@@ -41,3 +41,27 @@ def test_wizard_style_uses_line_total_not_unit_price():
     assert by_desc["Optical Tank Sensor Lo M8"]["total_value"] == 1152
     assert by_desc["Optical Tank Sensor Lo M8"]["needs_review"] is True
     assert abs(sum(it["total_value"] for it in goods) - (8542 + 4416 + 1152)) < 0.01
+
+
+def test_duplicate_line_and_unit_price_shadow_are_removed():
+    """£67,510 was the real £62,680 plus divert valve again (£4,416) and blink unit price (£414)."""
+    from file_extractor import _reconcile_to_printed_total
+
+    items = [
+        {"description": "S3 Divert valve assembly", "commodity_code": "84818085",
+         "quantity": 4, "unit_value": 1104, "total_value": 4416},
+        {"description": "S3 Divert valve assembly", "commodity_code": "84818085",
+         "quantity": 4, "unit_value": 1104, "total_value": 4416},
+        {"description": "8w Blink Panel", "commodity_code": "85371010",
+         "quantity": 2, "unit_value": 414, "total_value": 828},
+        {"description": "8w Blink Panel", "commodity_code": "85371010",
+         "quantity": 2, "unit_value": 414, "total_value": 414},
+        {"description": "S3 Scoop Assembly", "commodity_code": "84818081",
+         "quantity": 1, "unit_value": 4177.5, "total_value": 4177.5},
+    ]
+    # Other lines omitted; printed total is the sum of the genuine three lines.
+    printed = 4416 + 828 + 4177.5
+    kept = [it for it in _reconcile_to_printed_total(items, printed) if not it.get("_excel_metadata")]
+    assert abs(sum(it["total_value"] for it in kept) - printed) < 0.05
+    assert len(kept) == 3
+    assert sorted(it["total_value"] for it in kept) == [828, 4177.5, 4416]

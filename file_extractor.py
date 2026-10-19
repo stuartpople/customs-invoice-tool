@@ -227,6 +227,7 @@ def extract_from_excel(file_obj, trade_direction: str = "export") -> List[Dict]:
         # Read Excel file - try all sheets
         excel_file = pd.ExcelFile(file_obj)
         all_items = []
+        printed_total = None
         
         # Extract entry type (B1/H1) and type (E/I) from first few rows
         # These are typically in the header area before data
@@ -367,6 +368,14 @@ def extract_from_excel(file_obj, trade_direction: str = "export") -> List[Dict]:
                 ['value', 'price'],
                 ['total', 'cost', 'amount'],                         # less specific
             ]), col_lower)
+            unit_price_columns = [
+                col for col in df.columns
+                if 'unit' in col_lower.get(col, '') and 'price' in col_lower.get(col, '')
+                and 'total' not in col_lower.get(col, '')
+            ]
+            sheet_total = _printed_sheet_total(df, desc_columns)
+            if sheet_total:
+                printed_total = sheet_total
             # Fallback: unnamed column with numeric data (e.g. Rhenus format)
             if not value_columns:
                 _skip = set(c for cols in [code_columns, desc_columns, qty_columns] for c in cols)
@@ -468,6 +477,15 @@ def extract_from_excel(file_obj, trade_direction: str = "export") -> List[Dict]:
                                 break
                             except:
                                 pass
+
+                unit_price = None
+                for col in unit_price_columns:
+                    if pd.notna(row[col]):
+                        try:
+                            unit_price = float(_clean_numeric(row[col]))
+                            break
+                        except (TypeError, ValueError):
+                            pass
                 
                 weight = None
                 if weight_columns:
@@ -514,6 +532,7 @@ def extract_from_excel(file_obj, trade_direction: str = "export") -> List[Dict]:
                         "description": description,
                         "quantity": quantity,
                         "uom": uom or "PCS",
+                        "unit_value": unit_price,
                         "total_value": value,
                         "country_of_origin": country or "",
                         "net_weight": weight,
@@ -530,6 +549,7 @@ def extract_from_excel(file_obj, trade_direction: str = "export") -> List[Dict]:
                     "description": description if description else f"Item {commodity_code}",
                     "quantity": quantity,
                     "uom": uom or "PCS",
+                    "unit_value": unit_price,
                     "total_value": value,
                     "country_of_origin": country or "",
                     "net_weight": weight,
@@ -540,6 +560,20 @@ def extract_from_excel(file_obj, trade_direction: str = "export") -> List[Dict]:
         for item in all_items:
             if isinstance(item, dict) and not item.get('_excel_metadata'):
                 normalize_item_country_fields(item)
+
+        all_items = _reconcile_to_printed_total(all_items, printed_total)
+        if printed_total:
+            stamped = False
+            for item in all_items:
+                if item.get('_excel_metadata'):
+                    item['total_invoice_value'] = printed_total
+                    stamped = True
+                    break
+            if not stamped:
+                all_items.insert(0, {
+                    '_excel_metadata': True,
+                    'total_invoice_value': printed_total,
+                })
 
         data_items = _excel_data_items(all_items)
         if not data_items:
@@ -570,6 +604,106 @@ def _clean_numeric(val) -> str:
     for ch in ['£', '$', '€', '¥', ',', '\u00a3', '\u20ac']:
         s = s.replace(ch, '')
     return s.strip()
+
+
+def _printed_sheet_total(df, desc_columns):
+    """Grand total / sub total printed on the sheet, if there is one."""
+    if df is None or not desc_columns:
+        return None
+    markers = ('grand total', 'sub total', 'subtotal', 'invoice total')
+    found = None
+    for _, row in df.iterrows():
+        desc = ' '.join(
+            str(row[col]).lower()
+            for col in desc_columns
+            if col in row.index and pd.notna(row[col])
+        )
+        if not any(marker in desc for marker in markers):
+            continue
+        nums = []
+        for col in df.columns:
+            if pd.isna(row[col]):
+                continue
+            try:
+                nums.append(float(_clean_numeric(row[col])))
+            except (TypeError, ValueError):
+                continue
+        positive = [n for n in nums if n > 0]
+        if positive:
+            found = max(positive)
+    return found
+
+
+def _reconcile_to_printed_total(items, printed_total):
+    """Drop duplicate lines and unit-price shadows above the printed sheet total.
+
+    A first pass of the Wizard Ballast invoice totalled £67,510: the £4,416
+    divert-valve line was counted twice and the blink-panel unit price (£414)
+    was added on top of its £828 line total.
+    """
+    if not printed_total or printed_total <= 0:
+        return items
+
+    def line_sum(rows):
+        return round(sum(float(it.get('total_value') or 0) for it in rows if not it.get('_excel_metadata')), 2)
+
+    kept = []
+    seen = set()
+    for it in items:
+        if it.get('_excel_metadata'):
+            kept.append(it)
+            continue
+        key = (
+            (it.get('description') or '').strip().lower(),
+            str(it.get('commodity_code') or ''),
+            str(it.get('quantity') or ''),
+            round(float(it.get('total_value') or 0), 2),
+        )
+        if key[0] and key in seen:
+            continue
+        seen.add(key)
+        kept.append(it)
+
+    meta = [it for it in kept if it.get('_excel_metadata')]
+    data = [it for it in kept if not it.get('_excel_metadata')]
+    if line_sum(data) <= float(printed_total) + 0.05:
+        return meta + data
+
+    while line_sum(data) > float(printed_total) + 0.05:
+        units_by_desc = {}
+        for it in data:
+            desc = (it.get('description') or '').strip().lower()
+            unit = it.get('unit_value')
+            if not desc or unit in (None, ''):
+                continue
+            try:
+                units_by_desc.setdefault(desc, set()).add(round(float(unit), 2))
+            except (TypeError, ValueError):
+                continue
+        drop_at = None
+        for idx, it in enumerate(data):
+            desc = (it.get('description') or '').strip().lower()
+            try:
+                val = round(float(it.get('total_value') or 0), 2)
+            except (TypeError, ValueError):
+                continue
+            if val not in units_by_desc.get(desc, ()):
+                continue
+            has_extended = any(
+                (other.get('description') or '').strip().lower() == desc
+                and round(float(other.get('total_value') or 0), 2) > val + 0.01
+                for other in data
+            )
+            if not has_extended:
+                continue
+            if line_sum(data) - val + 0.05 >= float(printed_total):
+                drop_at = idx
+                break
+        if drop_at is None:
+            break
+        data.pop(drop_at)
+
+    return meta + data
 
 
 def _prefer_extended_amount(columns, col_lower_map):
@@ -793,6 +927,9 @@ def extract_from_file(file_obj, filename: str, trade_direction: str = "export") 
         
         elif file_ext in _EXCEL_EXTENSIONS:
             items = extract_from_excel(file_obj, trade_direction)
+            for item in items:
+                if item.get('_excel_metadata') and item.get('total_invoice_value'):
+                    metadata['total_invoice_value'] = item['total_invoice_value']
             # Create a text representation for debug view
             text = f"Excel file: {filename}\nExtracted {len(items)} items from spreadsheet"
             return text, items, metadata
