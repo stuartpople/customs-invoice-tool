@@ -541,6 +541,7 @@ class LineItemParser:
                 item_key,
                 items_total,
                 merge_overflow_items,
+                parse_money,
             )
         except ImportError:
             items = self._postprocess_items(items or [], source_text=all_text or "")
@@ -586,18 +587,59 @@ class LineItemParser:
             doc_hs, parsed_hs, warnings = coverage_warnings(items, all_text)
             missing = doc_hs - parsed_hs
 
-        if missing and allow_ai and not self._should_use_bas_parser(all_text):
-            print(f"[Coverage] Still missing {sorted(missing)} — trying AI merge")
+        # Dedicated parsers own known layouts for speed, but must not strand
+        # incomplete results: if HS codes or money totals are still short, let
+        # grounded AI fill the gaps (unless this format explicitly forbids AI).
+        total_gap = any("do not match invoice total" in (w or "") for w in warnings)
+        need_ai = bool(missing) or total_gap or (not items and len((all_text or "").strip()) > 400)
+        if need_ai and allow_ai and not self._should_use_bas_parser(all_text):
+            reason = (
+                f"missing HS {sorted(missing)}"
+                if missing
+                else ("line-total gap" if total_gap else "zero items")
+            )
+            print(f"[Coverage] {format_type} incomplete ({reason}) — trying AI merge")
+            existing_totals = {
+                f"{float(parse_money(str(it.get('total_value') or it.get('value') or '')) or 0):.2f}"
+                for it in items
+                if parse_money(str(it.get("total_value") or it.get("value") or ""))
+            }
+            existing_descs = {
+                re.sub(r"\s+", " ", str(it.get("description") or "").lower())[:48]
+                for it in items
+                if it.get("description")
+            }
+            added = 0
             for it in self._try_ai_coverage_items(all_text):
                 code = _cn8(it.get("commodity_code") or "")
-                if code in missing:
-                    it["needs_review"] = True
-                    it.setdefault(
-                        "review_notes",
-                        "Added because the layout parser missed this HS code",
-                    )
-                    items.append(it)
-            items = self._postprocess_items(items)
+                tot = parse_money(str(it.get("total_value") or it.get("value") or ""))
+                tot_key = f"{tot:.2f}" if tot else ""
+                desc_key = re.sub(r"\s+", " ", str(it.get("description") or "").lower())[:48]
+                fills_missing_hs = bool(code and code in missing)
+                fills_total_gap = bool(
+                    total_gap
+                    and tot_key
+                    and tot_key not in existing_totals
+                    and desc_key
+                    and desc_key not in existing_descs
+                )
+                fills_empty = (not items) and bool(it.get("description"))
+                if not (fills_missing_hs or fills_total_gap or fills_empty):
+                    continue
+                it["needs_review"] = True
+                it.setdefault(
+                    "review_notes",
+                    "Added by AI coverage pass after the layout parser was incomplete",
+                )
+                items.append(it)
+                if tot_key:
+                    existing_totals.add(tot_key)
+                if desc_key:
+                    existing_descs.add(desc_key)
+                added += 1
+            if added:
+                print(f"[Coverage] AI merge added {added} grounded line(s)")
+            items = self._postprocess_items(items, source_text=all_text or "")
             doc_hs, parsed_hs, warnings = coverage_warnings(items, all_text)
 
         if extra_warning:

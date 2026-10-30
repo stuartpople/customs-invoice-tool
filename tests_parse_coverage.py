@@ -296,6 +296,30 @@ def test_wrap_row_without_hs_merges():
     assert 'LENGTH: 200mm' in merged[0]['description']
 
 
+def test_labeled_cc_group_header_is_document_hs():
+    """Arrow-style Parts (cc:…) must count even with no money on that line."""
+    blob = """
+    MNT26-09-101442 ~ SORD27002
+    Parts (cc:8418999099)
+    SE impulse relay
+    Nos 10.00 91.05 910.50
+    Western Digital Hard Drive
+    (cc:8523291500)
+    Nos 5.00 917.70 4588.50
+    """
+    codes = document_commodity_codes(blob)
+    assert '84189990' in codes
+    assert '85232915' in codes
+    # Group header alone must not become a harvested product row
+    harvested = harvest_hs_rows(
+        blob.split('\n'),
+        pad_hs=lambda c: c[:8],
+        page_at=lambda _i: 1,
+        only_codes={'84189990'},
+    )
+    assert harvested == []
+
+
 if __name__ == '__main__':
     test_ignores_bank_account_as_hs()
     test_harvest_recovers_missed_hs()
@@ -311,4 +335,5 @@ if __name__ == '__main__':
     test_invoice_number_from_pdf_words_ignores_account_no()
     test_export_cpc_defaults_to_1040()
     test_wrap_row_without_hs_merges()
+    test_labeled_cc_group_header_is_document_hs()
     print('ok')

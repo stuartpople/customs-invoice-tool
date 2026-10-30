@@ -27,6 +27,20 @@ _JUNK_LINE_RE = re.compile(
 _HS_RE = re.compile(r'(?<![A-Za-z\d])(\d{8,10})(?![A-Za-z\d])')
 # Lovibond / Tintometer print HS as 3822.90.0000 (not contiguous digits).
 _DOTTED_HS_RE = re.compile(r'(?<![A-Za-z\d])(\d{4}\.\d{2}\.\d{4})(?![A-Za-z\d])')
+# Explicit tariff labels — always real HS, even with no money/UOM on the same line
+# (e.g. Arrow group header "Parts (cc:8418999099)" above several child lines).
+_LABELED_HS_RE = re.compile(
+    r'(?:'
+    r'\(cc:(\d{8,10})\)'
+    r'|(?:HS\s*(?:export|import)?\s*codes?|commodity\s*codes?|tariff\s*codes?|'
+    r'comm\.?\s*codes?)\s*[:=]?\s*(\d{8,10})'
+    r')',
+    re.IGNORECASE,
+)
+_GROUP_HEADER_ONLY_RE = re.compile(
+    r'^(?:parts?|goods?|items?|products?|accessories|hardware|spares?)\s*$',
+    re.IGNORECASE,
+)
 # Comma-separated supplier / shipment refs (RS invoices list these above the table).
 _REF_LIST_RE = re.compile(r'(?:\d{9,12}\s*,\s*){2,}\d{9,12}')
 _UOM_RE = re.compile(r'\b(EA|PCS|PC|SET|KG|BAG|BOX|PK|PACK|M|REEL|ROLL)\b', re.IGNORECASE)
@@ -84,7 +98,20 @@ def document_commodity_codes(text: str) -> Set[str]:
             signalled.add(code)  # dotted form is always a printed tariff code
         if dotted_hits:
             continue
+        # Explicit labels / (cc:…) are tariff codes even without money on the line
+        labeled_spans: List[Tuple[int, int]] = []
+        for m in _LABELED_HS_RE.finditer(line):
+            raw = m.group(1) or m.group(2) or ''
+            if not is_commodity_hs(raw):
+                continue
+            code = raw[:8]
+            counts[code] = counts.get(code, 0) + 1
+            signalled.add(code)
+            labeled_spans.append(m.span())
         for m in _HS_RE.finditer(line):
+            # Skip digits already counted via an explicit label on this line
+            if any(s <= m.start() and m.end() <= e for s, e in labeled_spans):
+                continue
             raw = m.group(1)
             if looks_like_bank_account(raw, line):
                 continue
@@ -215,7 +242,7 @@ def harvest_hs_rows(
             continue
         if only_codes is not None and hs_m.group(1)[:8] not in only_codes:
             continue
-        before = line[:hs_m.start()].strip(' -|~_')
+        before = line[:hs_m.start()].strip(' -|~_()')
         after = line[hs_m.end():]
         qty, uom = '1', 'EA'
         um = list(_QTY_UOM_RE.finditer(before))
@@ -229,12 +256,21 @@ def harvest_hs_rows(
             if before.upper().startswith(sku):
                 before = before[len(sku):].strip(' -|~_')
         money_vals = []
-        for tok in _MONEY_RE.findall(after):
+        for tok in _MONEY_RE.findall(after + ' ' + before):
             norm = f'{parse_money(tok):.2f}' if parse_money(tok) is not None else ''
             if norm:
                 money_vals.append(norm)
         total_value = money_vals[-1] if money_vals else ''
         unit_value = money_vals[-2] if len(money_vals) >= 2 else total_value
+        # Group headers like "Parts (cc:8418999099)" are not product rows —
+        # leave them for inheritance / AI rather than inventing a junk line.
+        desc_probe = re.sub(r'\(cc:\d{8,10}\)', '', before, flags=re.IGNORECASE).strip(' -|~_()')
+        if not total_value and (
+            not desc_probe
+            or _GROUP_HEADER_ONLY_RE.match(desc_probe)
+            or len(desc_probe) < 8
+        ):
+            continue
         coo = ''
         coo_m = re.match(r'\s*\|?\s*([A-Z]{2})\b', after)
         if coo_m:
