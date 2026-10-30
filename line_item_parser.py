@@ -3551,7 +3551,18 @@ class LineItemParser:
             #   BEFORE the item number; unit price is the line AFTER; block idx+2.
             # Layout C (INV00017252): no price before item; prices appear as a
             #   "UNIT  TOTAL" pair on one line WITHIN the block; block starts idx+1.
+            #
+            # Group HS headers: "Parts (cc:8418999099)" can sit above several
+            # numbered lines that share that code (INV00017388). Carry the last
+            # seen (cc:) forward when a child block has no code of its own.
+            last_group_hs = ""
             for k, idx in enumerate(standalone_indices):
+                look_from = standalone_indices[k - 1] + 1 if k > 0 else 0
+                for j in range(look_from, idx):
+                    gm = re.search(r'\(cc:(\d{8,10})\)', lines[j])
+                    if gm:
+                        last_group_hs = gm.group(1)
+
                 # Try Layout A: standalone total price on line before item number
                 total_value = ""
                 unit_value = ""
@@ -3588,12 +3599,18 @@ class LineItemParser:
                 desc_parts: List[str] = []
 
                 for bl in block_lines:
+                    # Next shipment / order ref starts a new group — stop desc
+                    if re.match(r'^[A-Z]{2,}\d{2}-\d{2}-\d+', bl):
+                        break
+                    if re.match(r'^(Total|Packing|Signed|We hereby)', bl, re.IGNORECASE):
+                        break
                     cc_m = re.search(r'\(cc:(\d{8,10})\)', bl)
                     # Only look for price pair in Layout C (total_value still empty)
                     pair_m = _price_pair_re.search(bl) if not total_value else None
 
                     if cc_m:
                         hs_code = cc_m.group(1)
+                        last_group_hs = hs_code
                         desc_text = (bl[:cc_m.start()] + bl[cc_m.end():]).strip()
                         if desc_text:
                             desc_parts.append(desc_text)
@@ -3612,6 +3629,9 @@ class LineItemParser:
                     # footer lines (Total Ex Works, Packing...) as description text
                     if hs_code and total_value and qty and uom:
                         break
+
+                if not hs_code and last_group_hs:
+                    hs_code = last_group_hs
 
                 description = " ".join(desc_parts).strip()
                 if not description or not hs_code or not total_value:
