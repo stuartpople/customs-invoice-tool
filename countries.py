@@ -189,6 +189,60 @@ _VALID_ALPHA2 = set(COUNTRY_TO_ISO.values()) | {
     'GB', 'XI',  # XI used in some NI trade contexts
 }
 
+# Regions / blocs that appear on invoices as "country of origin" but are NOT
+# ISO 3166-1 countries (and cannot be sent to CDS as DE 5/15 etc.).
+_NON_COUNTRY_ORIGIN_CODES = {
+    'EU': 'European Union — not a country; pick the specific Member State',
+    'EEC': 'European Economic Community — not a country; pick the Member State',
+    'EC': 'European Community — not a country; pick the Member State',
+    'EEA': 'European Economic Area — not a country; pick the specific country',
+    'EFTA': 'EFTA — not a country; pick the specific country',
+    'EUR': 'EUR is a currency, not a country of origin',
+    'ROW': 'Rest of World — not a country; pick the specific country',
+    'WW': 'Worldwide — not a country; pick the specific country',
+}
+
+_NON_COUNTRY_ORIGIN_NAMES = {
+    'european union': 'EU',
+    'europe': 'EU',
+    'eu member state': 'EU',
+    'eu member states': 'EU',
+    'european community': 'EC',
+    'european economic area': 'EEA',
+    'rest of world': 'ROW',
+    'rest of the world': 'ROW',
+    'worldwide': 'WW',
+}
+
+
+def is_valid_country_iso(code: str | None) -> bool:
+    """True for a real ISO/HMRC 2-letter country (not EU / region blocs)."""
+    if not code:
+        return False
+    token = str(code).strip().upper()
+    if token == 'UK':
+        return True
+    return len(token) == 2 and token.isalpha() and token in _VALID_ALPHA2
+
+
+def non_country_origin_reason(value: str | None) -> str:
+    """Human-readable reason when *value* is a region/bloc, else ''."""
+    if value is None:
+        return ''
+    raw = str(value).strip()
+    if not raw:
+        return ''
+    token = raw.upper().replace('.', '').replace('  ', ' ')
+    if token in _NON_COUNTRY_ORIGIN_CODES:
+        return _NON_COUNTRY_ORIGIN_CODES[token]
+    key = raw.lower().strip()
+    mapped = _NON_COUNTRY_ORIGIN_NAMES.get(key)
+    if mapped:
+        return _NON_COUNTRY_ORIGIN_CODES.get(mapped, f'{raw} is not a valid country code')
+    if len(token) == 2 and token.isalpha() and token not in _VALID_ALPHA2 and token != 'UK':
+        return f"'{token}' is not a valid ISO country code — pick the correct country"
+    return ''
+
 
 def looks_like_country_token(value: str | None) -> bool:
     """True when *value* is an ISO code or known country name — not free text.
@@ -205,6 +259,9 @@ def looks_like_country_token(value: str | None) -> bool:
         return False
     token = raw.upper().replace('.', '').replace('  ', ' ')
     if token in ('UK', 'U K'):
+        return True
+    # Region labels on COO columns (EU) — recognise so we can flag for review
+    if token in _NON_COUNTRY_ORIGIN_CODES or raw.lower().strip() in _NON_COUNTRY_ORIGIN_NAMES:
         return True
     if len(token) == 2 and token.isalpha():
         return token in _VALID_ALPHA2 or token == 'UK'
@@ -230,6 +287,8 @@ def normalize_country_iso(value: str | None) -> str:
     Normalise country of origin / destination to ISO 3166-1 alpha-2 for HMRC/CDS.
 
     Handles: 3-letter (CHN→CN), 2-letter (uk→GB), full country names, and common aliases.
+    Region blocs like EU are preserved as-is (not silently dropped) so the UI can
+    flag them for the user to pick a real country.
     """
     if value is None:
         return ''
@@ -244,16 +303,25 @@ def normalize_country_iso(value: str | None) -> str:
         return ', '.join(dict.fromkeys(parts))  # preserve order, dedupe
 
     token = raw.upper().replace('.', '').replace('  ', ' ')
+    key = raw.lower().strip()
+
+    # Region / bloc labels first — keep a stable code so review can flag them
+    if token in _NON_COUNTRY_ORIGIN_CODES:
+        return token
+    if key in _NON_COUNTRY_ORIGIN_NAMES:
+        return _NON_COUNTRY_ORIGIN_NAMES[key]
 
     if token in ('UK', 'U K'):
         return 'GB'
 
-    # Already 2-letter
+    # Already 2-letter — ONLY accept real ISO/HMRC codes (EU must not slip through)
     if len(token) == 2 and token.isalpha():
         if token == 'UK':
             return 'GB'
-        if token in _VALID_ALPHA2 or token.isalpha():
+        if token in _VALID_ALPHA2:
             return token
+        # Unknown 2-letter (e.g. EU slipped past the set above) — keep for review
+        return token
 
     # 3-letter (ISO alpha-3 on commercial invoices)
     if len(token) == 3 and token.isalpha():
@@ -264,7 +332,6 @@ def normalize_country_iso(value: str | None) -> str:
         return token
 
     # Full name (any case)
-    key = raw.lower().strip()
     if key in _NAME_TO_ISO:
         return _NAME_TO_ISO[key]
     key_compact = key.replace(',', '')
@@ -276,7 +343,42 @@ def normalize_country_iso(value: str | None) -> str:
     if titled.lower() in _NAME_TO_ISO:
         return _NAME_TO_ISO[titled.lower()]
 
-    return raw.upper()[:2] if len(raw) >= 2 and raw[:2].isalpha() else raw
+    # Do NOT truncate arbitrary text to 2 letters ("European Union" → "EU" was wrong
+    # when treated as a valid country; regions are handled above).
+    return raw
+
+
+def flag_invalid_origin_countries(item: dict) -> dict:
+    """Mark line items whose origin is EU/region/unknown for manual choice."""
+    if not isinstance(item, dict):
+        return item
+    for field in ('country_of_origin', 'country_origin'):
+        val = item.get(field)
+        if not val:
+            continue
+        reasons = []
+        for part in str(val).split(','):
+            part = part.strip()
+            if not part:
+                continue
+            reason = non_country_origin_reason(part)
+            if reason:
+                reasons.append(reason)
+                continue
+            norm = normalize_country_iso(part)
+            if not is_valid_country_iso(norm):
+                reasons.append(
+                    f"Country of origin '{part}' is not a valid ISO country "
+                    "— choose the correct country"
+                )
+        if not reasons:
+            continue
+        item['needs_review'] = True
+        note = '; '.join(dict.fromkeys(reasons))
+        existing = item.get('review_notes') or ''
+        if note not in existing:
+            item['review_notes'] = f"{existing}; {note}".strip('; ').strip()
+    return item
 
 
 def normalize_item_country_fields(item: dict) -> dict:
@@ -286,11 +388,12 @@ def normalize_item_country_fields(item: dict) -> dict:
     for field in ('country_of_origin', 'country_origin'):
         if field in item and item[field]:
             item[field] = normalize_country_iso(item[field])
+    flag_invalid_origin_countries(item)
     return item
 
 
 def normalize_items_country_fields(items: list) -> list:
-    """Normalise country fields on every line item (in place)."""
+    """Normalise country fields on every line item (in place) and flag invalid origins."""
     for it in items or []:
         normalize_item_country_fields(it)
     return items

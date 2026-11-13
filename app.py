@@ -81,7 +81,7 @@ import shutil
 
 
 # Version tracking for cache busting
-APP_VERSION = "v3.61"
+APP_VERSION = "v3.62"
 
 
 def _normalize_items_hs_for_direction(items: list, direction: str) -> list:
@@ -870,11 +870,29 @@ if st.session_state.get('non_pdf_processed', False):
         needs_review = [item for item in items if item.get('needs_review')]
         if needs_review:
             st.warning(f"⚠️ **{len(needs_review)} items need manual review**")
-            with st.expander("📋 Items Needing Review", expanded=False):
+            bad_origin = [
+                it for it in needs_review
+                if 'not a country' in (it.get('review_notes') or '').lower()
+                or 'not a valid iso country' in (it.get('review_notes') or '').lower()
+                or 'member state' in (it.get('review_notes') or '').lower()
+            ]
+            if bad_origin:
+                codes = sorted({
+                    str(it.get('country_of_origin') or it.get('country_origin') or '').strip()
+                    for it in bad_origin
+                } - {''})
+                st.error(
+                    "🌍 **Invalid country of origin** on "
+                    f"{len(bad_origin)} line(s): `{', '.join(codes) or 'unknown'}`. "
+                    "EU / regions are not CDS country codes — edit the origin to the "
+                    "specific country before export."
+                )
+            with st.expander("📋 Items Needing Review", expanded=bool(bad_origin)):
                 for item in needs_review:
                     st.markdown(
                         f"**{item.get('description', 'N/A')[:60]}** — "
                         f"HS `{item.get('commodity_code', 'N/A')}` — "
+                        f"Origin `{item.get('country_of_origin') or item.get('country_origin') or '—'}` — "
                         f"⚠️ *{item.get('review_notes', 'Low confidence')}*"
                     )
                     st.divider()
@@ -1506,18 +1524,36 @@ elif st.session_state.processing_started and st.session_state.current_job_id:
                 needs_review = [item for item in items if item.get('needs_review')]
                 if needs_review:
                     st.warning(f"⚠️ **{len(needs_review)} items need review** (low confidence or HMRC validation issues)")
-                    
+                    bad_origin = [
+                        it for it in needs_review
+                        if 'not a country' in (it.get('review_notes') or '').lower()
+                        or 'not a valid iso country' in (it.get('review_notes') or '').lower()
+                        or 'member state' in (it.get('review_notes') or '').lower()
+                    ]
+                    if bad_origin:
+                        codes = sorted({
+                            str(it.get('country_of_origin') or it.get('country_origin') or '').strip()
+                            for it in bad_origin
+                        } - {''})
+                        st.error(
+                            "🌍 **Invalid country of origin** on "
+                            f"{len(bad_origin)} line(s): `{', '.join(codes) or 'unknown'}`. "
+                            "EU / regions are not CDS country codes — edit the origin to the "
+                            "specific country before export."
+                        )
+
                     # Show expandable details for review items
-                    with st.expander("📋 View Items Needing Review", expanded=False):
+                    with st.expander("📋 View Items Needing Review", expanded=bool(bad_origin)):
                         for item in needs_review:
                             item_num = item.get('item_number', 'N/A')
                             page = item.get('pages', [1])[0]
                             hs_code = item.get('commodity_code', 'N/A')
                             desc = item.get('description', 'N/A')[:50]
+                            origin = item.get('country_of_origin') or item.get('country_origin') or '—'
                             notes = item.get('review_notes', 'Low confidence')
                             
                             st.markdown(f"""
-                            **Item #{item_num}** (Page {page}) - HS Code: `{hs_code}`  
+                            **Item #{item_num}** (Page {page}) - HS Code: `{hs_code}` — Origin: `{origin}`  
                             Description: {desc}...  
                             ⚠️ *{notes}*
                             """)
