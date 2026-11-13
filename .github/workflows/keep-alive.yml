@@ -1,9 +1,9 @@
 name: Keep Streamlit App Awake
 
 # Runs every 3 hours around the clock.
-# Streamlit Community Cloud sleeps after ~7 days of no real traffic;
-# this workflow opens a genuine browser session (WebSocket + JS execution)
-# which Streamlit counts as an active viewer — preventing the sleep.
+# Streamlit Community Cloud sleeps after inactivity; plain HTTP pings are not
+# enough. This workflow opens a genuine browser session (WebSocket + JS) so
+# Streamlit counts an active viewer — and clicks the wake button if asleep.
 on:
   schedule:
     - cron: '0 */3 * * *'   # every 3 hours
@@ -26,19 +26,29 @@ jobs:
           import time
           from playwright.sync_api import sync_playwright
 
-          url = "https://uscnappjlbdwmvemivjxzm4.streamlit.app/"
+          # Must match the live Streamlit subdomain (not customs.logisticoreapp.com
+          # — that custom domain SSL is broken; not the old random hash URL).
+          url = "https://customs-invoice-tool.streamlit.app/"
           print(f"Waking: {url}")
           with sync_playwright() as p:
               browser = p.chromium.launch()
               page = browser.new_page()
-              # Navigate and wait for Streamlit's root element to appear
-              page.goto(url, timeout=60000)
-              # Wait up to 30 s for the app to finish loading
+              page.goto(url, timeout=90000)
+              # If Streamlit put the app to sleep, wake it
               try:
-                  page.wait_for_selector("div[data-testid='stApp']", timeout=30000)
+                  import re
+                  wake = page.get_by_role("button", name=re.compile(r"get this app back up", re.I))
+                  if wake.count() > 0:
+                      print("Sleep screen detected — clicking wake button.")
+                      wake.first.click(timeout=10000)
+                      time.sleep(45)
+              except Exception as exc:
+                  print(f"Wake-button check skipped: {exc}")
+              try:
+                  page.wait_for_selector("div[data-testid='stApp']", timeout=60000)
                   print("App loaded successfully — WebSocket session established.")
               except Exception:
                   print("Timed out waiting for stApp — app may still be waking.")
-              time.sleep(5)   # hold connection briefly so Streamlit registers it
+              time.sleep(10)   # hold connection so Streamlit registers the visit
               browser.close()
           EOF
