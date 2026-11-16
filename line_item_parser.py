@@ -5350,27 +5350,42 @@ class LineItemParser:
                     item_num = int(ln)
                     i += 1
 
-                    # Collect stock_no — lines until a COC or HS code is found.
+                    # Collect stock_no + optional embedded description until COC/HS.
+                    # RS622 (and similar) put the product text in the wide data
+                    # block: stock on the first line, description on following
+                    # lines, then COC. Older ATI layouts may leave description
+                    # empty here and fill it from the narrow desc column instead.
                     # Stock numbers can themselves be 8 digits (e.g. 49162771).
                     # Disambiguate: digits + COC + digits ⇒ stock then HS.
-                    stock_parts: List[str] = []
-                    while i < len(lines) and len(stock_parts) < 3:
+                    stock_no = ''
+                    embedded_desc_parts: List[str] = []
+                    _stock_desc_budget = 6
+                    while i < len(lines) and (1 if stock_no else 0) + len(embedded_desc_parts) < _stock_desc_budget:
                         nxt = lines[i]
                         if nxt in self._ATI_COC_SET:
                             break
                         if self._ATI_HS_RE.match(nxt):
                             if self._ati_is_stock_before_hs(lines, i):
-                                stock_parts.append(nxt)
+                                if not stock_no:
+                                    stock_no = nxt
+                                else:
+                                    embedded_desc_parts.append(nxt)
                                 i += 1
                                 continue
                             break
                         # UoM line signals no stock no was present
-                        if re.match(r'^\d+\s+(OF|METER|METRE|SET|PACK|KIT|REEL)\b',
-                                    nxt, re.IGNORECASE):
+                        if re.match(
+                            r'^\d+\s+(OF|METER|METRE|SET|PACK|KIT|REEL|MREEL|BAG|PAIR)\b',
+                            nxt,
+                            re.IGNORECASE,
+                        ):
                             break
-                        stock_parts.append(nxt)
+                        if not stock_no:
+                            stock_no = nxt
+                        else:
+                            embedded_desc_parts.append(nxt)
                         i += 1
-                    stock_no = ' '.join(stock_parts).strip()
+                    embedded_desc = ' '.join(embedded_desc_parts).strip()
 
                     if i >= len(lines):
                         break
@@ -5381,22 +5396,35 @@ class LineItemParser:
                         coc = lines[i]
                         i += 1
 
-                    # HS code (8 digits)
-                    if i >= len(lines) or not self._ATI_HS_RE.match(lines[i]):
+                    # HS code (8 digits). Sometimes PyMuPDF glues UoM onto the same
+                    # line: "40169300 1 MREEL OF 10" (RS622 items 81–82).
+                    if i >= len(lines):
                         continue
-                    hs_code = lines[i]
+                    _hs_m = re.match(r'^(\d{8})(?:\s+(.+))?$', lines[i])
+                    if not _hs_m:
+                        continue
+                    hs_code = _hs_m.group(1)
+                    _glued_uom = (_hs_m.group(2) or '').strip()
                     i += 1
 
-                    # UoM — "1 OF 1" / "1 BOX OF 12" or bare "Box" (ATI TacTiles etc.)
+                    # UoM — "1 OF 1" / "1 BOX OF 12" / bare "Box" / glued remainder
                     uom = '1 OF 1'
-                    if i < len(lines):
+                    if _glued_uom:
+                        _uom_first = _glued_uom.split()[0].upper()
+                        if (
+                            self._ATI_UOM_RE.match(_glued_uom)
+                            or _uom_first in self._ATI_BARE_UOM
+                            or re.match(r'^\d+\s+', _glued_uom)
+                        ):
+                            uom = _glued_uom
+                    elif i < len(lines):
                         _uom_tok = lines[i]
                         _uom_first = _uom_tok.split()[0].upper() if _uom_tok else ''
                         if self._ATI_UOM_RE.match(_uom_tok) or _uom_first in self._ATI_BARE_UOM:
                             uom = _uom_tok
                             i += 1
 
-                    # Collect 4-5 numeric values: qty, unit_price, total, unit_wt, [line_wt]
+                    # Collect 4-5 numeric values: qty, unit_price, total, unit_wt, line_wt
                     nums: List[str] = []
                     while i < len(lines) and len(nums) < 5:
                         cleaned = lines[i].replace(',', '')
@@ -5413,6 +5441,9 @@ class LineItemParser:
                     unit_price = nums[1]
                     total      = nums[2]
                     unit_wt    = nums[3] if len(nums) > 3 else ''
+                    # Line Weight is the net weight for the row (unit × qty);
+                    # Unit Weight alone under-sums when quantity > 1.
+                    line_wt    = nums[4] if len(nums) > 4 else ''
 
                     country = self._ATI_ORIGIN_MAP.get(coc, coc)
                     hs10 = self._pad_hs_code(hs_code, direction.lower() == 'import')
@@ -5427,11 +5458,13 @@ class LineItemParser:
                         'unit_price':  unit_price,
                         'total':       total,
                         'unit_wt':     unit_wt,
+                        'line_wt':     line_wt,
                         'country':     country,
                         'y_block':     by0,
                         'y_block_end': by1,  # bottom of data block
                         'page':        page_num,
                         'description': '',
+                        'embedded_desc': embedded_desc,
                     })
 
             page_items.sort(key=lambda x: x['item_num'])
@@ -5562,17 +5595,25 @@ class LineItemParser:
         all_page_items.sort(key=lambda x: x['item_num'])
         result: List[Dict] = []
         for it in all_page_items:
-            # Ensure the fallback description has at least 3 letters so it passes
-            # the _is_valid_item letter-count guard even for numeric-only stock codes.
+            # Prefer narrow-column description; else text embedded in the data
+            # block (RS622); else stock / item label. Prefix digit-heavy short
+            # part codes so _is_valid_item Rule 11 does not drop real lines.
             _sn = it['stock_no']
-            _raw_desc = it['description']
+            _raw_desc = (it.get('description') or '').strip()
+            _emb = (it.get('embedded_desc') or '').strip()
             if _raw_desc:
                 desc = _raw_desc
+            elif _emb:
+                desc = _emb
             elif _sn:
-                # Use stock number directly; prefix only if too short for _is_valid_item
-                desc = _sn if len(_sn) >= 3 else f"Item {it['item_num']}: {_sn}"
+                desc = _sn
             else:
                 desc = f"Item {it['item_num']}"
+            _letters = len(re.findall(r'[a-zA-Z]', desc))
+            _digits = len(re.findall(r'\d', desc))
+            if _letters < 3 or (len(desc) <= 15 and _digits > len(desc) * 0.6):
+                desc = f"Item {it['item_num']}: {desc}" if desc else f"Item {it['item_num']}"
+            _net = it.get('line_wt') or it.get('unit_wt') or ''
             result.append({
                 'line_number':        str(it['item_num']),
                 'stock_number':       it['stock_no'],
@@ -5584,8 +5625,8 @@ class LineItemParser:
                 'currency':           currency,
                 'commodity_code':     it['hs_code'],
                 'country_of_origin':  it['country'],
-                'net_weight':         it['unit_wt'],
-                'unit_weight':        it['unit_wt'],
+                'net_weight':         _net,
+                'unit_weight':        it.get('unit_wt') or '',
                 'hs_code':            it['hs_code'],
                 'pages':              [it['page']],
                 'confidence':         0.90,

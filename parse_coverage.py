@@ -149,6 +149,9 @@ def invoice_total_hint(text: str) -> Optional[float]:
         r'Total\s+(?:GBP|USD|EUR)\s+Incl\.?\s*VAT\s*([\d,]+(?:\.\d{2})?)',
         r'Tax\s+Exclusive(?:\s+Value)?[^\d]{0,40}([\d,]+(?:\.\d{2})?)',
         r'(?:Grand\s+)?Invoice\s+Total[^\d]{0,20}([\d,]+(?:\.\d{2})?)',
+        # ATI: amount often printed on the line above the "Invoice Total" label
+        r'([\d,]+(?:\.\d{2})?)\s*(?:\n|\r\n?)\s*Invoice\s+Total\b',
+        r'Goods\s+Value[^\d]{0,20}([\d,]+(?:\.\d{2})?)',
         r'Total\s+(?:GBP|USD|EUR)\s*:?\s*([\d,]+\.\d{2})',
         r'Tax Exclusive\s+([\d,]+(?:\.\d{2})?)',
     )
