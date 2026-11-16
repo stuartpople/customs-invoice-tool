@@ -103,7 +103,7 @@ class HMRCTariffAPI:
     # Bump when lookup semantics change so hot-reloaded Streamlit workers cannot
     # reuse results produced by older code.
     # Bump when lookup / validation semantics change so process-wide caches refresh.
-    CACHE_SCHEMA_VERSION = "heading-declarable-remap-v8"
+    CACHE_SCHEMA_VERSION = "heading-declarable-remap-v9"
 
     @classmethod
     def clear_caches(cls) -> None:
@@ -234,9 +234,16 @@ class HMRCTariffAPI:
 
         # Pad to 10 digits
         padded = clean.ljust(10, '0')
+        saw_unavailable = False
+
+        def _note_unavailable(res: Optional[Dict]) -> None:
+            nonlocal saw_unavailable
+            if self._commodity_unavailable(res):
+                saw_unavailable = True
 
         # 1) Try exact padded code — honour declarable (leaf is often null)
         result = self._try_commodity(padded)
+        _note_unavailable(result)
         if self._commodity_usable(result):
             out = {"valid": True, "code": clean, "resolved_code": padded,
                    "description": result.get('description', '')}
@@ -254,6 +261,7 @@ class HMRCTariffAPI:
                 if variant == padded:
                     continue
                 res = self._try_commodity(variant)
+                _note_unavailable(res)
                 if self._commodity_usable(res):
                     if is_export:
                         out = {"valid": True, "code": clean,
@@ -277,6 +285,7 @@ class HMRCTariffAPI:
                            '60', '70', '80', '90', '91', '99']:
                 variant = base8 + suffix
                 res = self._try_commodity(variant)
+                _note_unavailable(res)
                 if self._commodity_usable(res):
                     out = {"valid": False, "code": clean,
                            "resolved_code": variant,
@@ -286,6 +295,24 @@ class HMRCTariffAPI:
                                      f"({res.get('description', '')[:60]})?")}
                     self._validation_cache[cache_key] = out
                     return out
+
+        # Transient HMRC failures (429/5xx/timeout) look like "not found" if we
+        # keep going into heading remaps — that falsely auto-corrects good CN8s
+        # and floods the UI with "needs review". Keep the invoice code instead.
+        if saw_unavailable:
+            out = {
+                "valid": True,
+                "code": clean,
+                "resolved_code": padded,
+                "unverified": True,
+                "description": "",
+                "warning": (
+                    f"{code}: HMRC tariff temporarily unavailable — "
+                    "kept invoice code; re-run Validate HS codes"
+                ),
+            }
+            self._validation_cache[cache_key] = out
+            return out
 
         # 4) Code doesn't resolve under its own CN8 — explore the heading for
         #    suggestions. IMPORTANT: do not auto-rewrite to a different CN8
@@ -471,7 +498,14 @@ class HMRCTariffAPI:
         raise last_exc
 
     def _try_commodity(self, ten_digit_code: str) -> Optional[Dict]:
-        """Hit the commodities endpoint; return attrs dict or None on 404."""
+        """Hit the commodities endpoint.
+
+        Returns:
+          - attrs dict on HTTP 200
+          - None on a true 404 (code not in tariff)
+          - ``{'_unavailable': True, ...}`` on timeout / 429 / 5xx so callers
+            do not treat transient HMRC failures as "obsolete CN8"
+        """
         try:
             r = self._http_get(
                 f"{self.base_url}/uk/api/commodities/{ten_digit_code}")
@@ -486,14 +520,20 @@ class HMRCTariffAPI:
                     'declarable': attrs.get('declarable'),
                     'code': attrs.get('goods_nomenclature_item_id', ten_digit_code),
                 }
-        except requests.RequestException:
-            pass
-        return None
+            if r.status_code == 404:
+                return None
+            return {'_unavailable': True, '_http_status': r.status_code}
+        except requests.RequestException as exc:
+            return {'_unavailable': True, '_error': str(exc)}
+
+    @staticmethod
+    def _commodity_unavailable(result: Optional[Dict]) -> bool:
+        return bool(result and result.get('_unavailable'))
 
     @staticmethod
     def _commodity_usable(result: Optional[Dict]) -> bool:
         """True when a commodity API hit can be used for validation/doc lookup."""
-        if not result:
+        if not result or result.get('_unavailable'):
             return False
         if result.get('declarable') is True:
             return True

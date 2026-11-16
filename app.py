@@ -81,7 +81,7 @@ import shutil
 
 
 # Version tracking for cache busting
-APP_VERSION = "v3.64"
+APP_VERSION = "v3.65"
 
 
 def _normalize_items_hs_for_direction(items: list, direction: str) -> list:
@@ -183,52 +183,61 @@ def _run_hs_validation(items: list, direction: str) -> dict:
 def _safe_hs_autocorrections(items: list, hs_validation: dict, direction: str) -> tuple:
     """Apply safe HS corrections.
 
-    1) Same-CN8 expansions (padding / TARIC leaf under the invoice CN8).
-    2) Obsolete CN8 reclassification when HMRC validation provides a suggested
-       replacement (prefer residual "Other" under the same HS6). Marked for
-       review so the declarant can confirm.
+    Returns ``(same_cn8, obsolete, still_invalid, descs)`` where:
+      - same_cn8: TARIC pad / leaf under the same CN8 (silent — not review)
+      - obsolete: different-CN8 tariff replacements (needs confirm)
+      - still_invalid: no safe replacement
+      - descs: old_code → tariff description for UI
     """
     is_export = direction.lower() == 'export'
     invalid_codes = {c: v for c, v in (hs_validation or {}).items()
                      if not v.get('valid', True)}
-    auto_fixed: dict = {}
-    auto_fixed_desc: dict = {}
+    same_cn8: dict = {}
+    obsolete: dict = {}
+    descs: dict = {}
     still_invalid: dict = {}
 
     for code, result in invalid_codes.items():
+        # Skip inconclusive lookups (rate-limit / timeout) — treat as ok
+        if result.get('unverified'):
+            continue
         resolved = (result.get('resolved_code') or '').replace(' ', '')
         suggested = (result.get('suggested_code') or '').replace(' ', '')
         clean = (code or '').replace(' ', '').replace('-', '').replace('.', '')
         if resolved and clean and len(clean) >= 8 and resolved[:8] == clean[:8]:
             new_code = resolved[:8] if is_export else resolved
             if new_code != code:
-                auto_fixed[code] = new_code
-                auto_fixed_desc[code] = result.get('description', '')
+                same_cn8[code] = new_code
+                descs[code] = result.get('description', '')
             continue
         if suggested and clean and suggested != clean[:len(suggested)]:
-            # Obsolete CN — reclassify to suggested replacement
             new_code = suggested[:8] if is_export else suggested[:10].ljust(10, '0')
-            auto_fixed[code] = new_code
-            auto_fixed_desc[code] = result.get('suggested_description') or result.get('description', '')
+            obsolete[code] = new_code
+            descs[code] = (
+                result.get('suggested_description') or result.get('description', '')
+            )
             continue
         still_invalid[code] = result
 
-    if auto_fixed:
+    # Same-CN8 expansions are routine (8→10 for import) — apply quietly
+    if same_cn8:
         for item in items:
             cc = item.get('commodity_code', '')
-            if cc not in auto_fixed:
+            if cc in same_cn8:
+                item['commodity_code'] = same_cn8[cc]
+
+    if obsolete:
+        for item in items:
+            cc = item.get('commodity_code', '')
+            if cc not in obsolete:
                 continue
             old = cc
-            item['commodity_code'] = auto_fixed[cc]
-            # Obsolete remaps always need human confirmation
-            if old[:8] != auto_fixed[cc][:8]:
-                item['needs_review'] = True
-                note = (
-                    f"Obsolete HS {old} reclassified to {auto_fixed[cc]} "
-                    f"({auto_fixed_desc.get(old, 'tariff replacement')}) — confirm"
-                )
-            else:
-                note = f"HS code auto-corrected: {old} → {auto_fixed[cc]}"
+            item['commodity_code'] = obsolete[cc]
+            item['needs_review'] = True
+            note = (
+                f"Obsolete HS {old} reclassified to {obsolete[cc]} "
+                f"({descs.get(old, 'tariff replacement')}) — confirm"
+            )
             existing = item.get('review_notes', '')
             if note not in (existing or ''):
                 item['review_notes'] = f"{existing}; {note}" if existing else note
@@ -243,7 +252,7 @@ def _safe_hs_autocorrections(items: list, hs_validation: dict, direction: str) -
             if msg not in (existing or ''):
                 item['review_notes'] = f"{existing}; {msg}" if existing else msg
 
-    return auto_fixed, auto_fixed_desc, still_invalid
+    return same_cn8, obsolete, still_invalid, descs
 
 
 st.set_page_config(
@@ -836,15 +845,28 @@ if st.session_state.get('non_pdf_processed', False):
 
         hs_validation = st.session_state.get('hs_validation_results', {})
 
-        auto_fixed, auto_fixed_desc, still_invalid = _safe_hs_autocorrections(
+        same_cn8, obsolete, still_invalid, hs_descs = _safe_hs_autocorrections(
             items, hs_validation, direction
         )
 
-        if auto_fixed:
-            st.warning(f"🔄 **{len(auto_fixed)} HS code(s) auto-corrected** (same CN8 only):")
-            with st.expander("Auto-correction Details", expanded=True):
-                for old_c, new_c in sorted(auto_fixed.items()):
-                    desc = auto_fixed_desc.get(old_c, '')
+        if same_cn8:
+            st.info(
+                f"ℹ️ **{len(same_cn8)} HS code(s) expanded to a declarable TARIC leaf** "
+                "(same CN8 — no review needed)"
+            )
+            with st.expander("TARIC expansion details", expanded=False):
+                for old_c, new_c in sorted(same_cn8.items()):
+                    desc = hs_descs.get(old_c, '')
+                    desc_short = f" — {desc[:60]}" if desc else ""
+                    st.markdown(f"- `{old_c}` → `{new_c}`{desc_short}")
+
+        if obsolete:
+            st.warning(
+                f"🔄 **{len(obsolete)} obsolete HS code(s) reclassified** — confirm below:"
+            )
+            with st.expander("Reclassification details", expanded=True):
+                for old_c, new_c in sorted(obsolete.items()):
+                    desc = hs_descs.get(old_c, '')
                     desc_short = f" — {desc[:60]}" if desc else ""
                     st.markdown(f"- `{old_c}` → `{new_c}`{desc_short}")
 
@@ -864,7 +886,21 @@ if st.session_state.get('non_pdf_processed', False):
                             + ", ".join(f"{x['code'][:8]} ({x['description'][:40]})" for x in cands[:6])
                         )
 
-        if not still_invalid and not auto_fixed and hs_validation:
+        unverified = [
+            c for c, v in (hs_validation or {}).items() if v.get('unverified')
+        ]
+        if unverified:
+            st.info(
+                f"⏳ **{len(unverified)} HS code(s) could not be checked** "
+                "(HMRC tariff busy) — invoice codes kept. Click Validate again."
+            )
+
+        if (
+            not still_invalid
+            and not obsolete
+            and not unverified
+            and hs_validation
+        ):
             st.success(f"✅ All {len(hs_validation)} HS codes validated against HMRC tariff")
 
         needs_review = [item for item in items if item.get('needs_review')]
@@ -1483,17 +1519,28 @@ elif st.session_state.processing_started and st.session_state.current_job_id:
 
                 hs_validation = st.session_state.get('hs_validation_results', {})
 
-                auto_fixed, auto_fixed_desc, still_invalid = _safe_hs_autocorrections(
+                same_cn8, obsolete, still_invalid, hs_descs = _safe_hs_autocorrections(
                     items, hs_validation, direction
                 )
 
-                if auto_fixed:
-                    st.warning(
-                        f"🔄 **{len(auto_fixed)} HS code(s) auto-corrected** (same CN8 only):"
+                if same_cn8:
+                    st.info(
+                        f"ℹ️ **{len(same_cn8)} HS code(s) expanded to a declarable TARIC leaf** "
+                        "(same CN8 — no review needed)"
                     )
-                    with st.expander("Auto-correction Details", expanded=True):
-                        for old_c, new_c in sorted(auto_fixed.items()):
-                            desc = auto_fixed_desc.get(old_c, '')
+                    with st.expander("TARIC expansion details", expanded=False):
+                        for old_c, new_c in sorted(same_cn8.items()):
+                            desc = hs_descs.get(old_c, '')
+                            desc_short = f" — {desc[:60]}" if desc else ""
+                            st.markdown(f"- `{old_c}` → `{new_c}`{desc_short}")
+
+                if obsolete:
+                    st.warning(
+                        f"🔄 **{len(obsolete)} obsolete HS code(s) reclassified** — confirm below:"
+                    )
+                    with st.expander("Reclassification details", expanded=True):
+                        for old_c, new_c in sorted(obsolete.items()):
+                            desc = hs_descs.get(old_c, '')
                             desc_short = f" — {desc[:60]}" if desc else ""
                             st.markdown(f"- `{old_c}` → `{new_c}`{desc_short}")
 
@@ -1516,7 +1563,21 @@ elif st.session_state.processing_started and st.session_state.current_job_id:
                                     )
                                 )
 
-                if not still_invalid and not auto_fixed and hs_validation:
+                unverified = [
+                    c for c, v in (hs_validation or {}).items() if v.get('unverified')
+                ]
+                if unverified:
+                    st.info(
+                        f"⏳ **{len(unverified)} HS code(s) could not be checked** "
+                        "(HMRC tariff busy) — invoice codes kept. Click Validate again."
+                    )
+
+                if (
+                    not still_invalid
+                    and not obsolete
+                    and not unverified
+                    and hs_validation
+                ):
                     st.success(f"✅ All {len(hs_validation)} HS codes validated against HMRC tariff")
 
                 
@@ -1545,8 +1606,13 @@ elif st.session_state.processing_started and st.session_state.current_job_id:
                     # Show expandable details for review items
                     with st.expander("📋 View Items Needing Review", expanded=bool(bad_origin)):
                         for item in needs_review:
-                            item_num = item.get('item_number', 'N/A')
-                            page = item.get('pages', [1])[0]
+                            item_num = (
+                                item.get('line_number')
+                                or item.get('item_number')
+                                or 'N/A'
+                            )
+                            pages = item.get('pages') or [1]
+                            page = pages[0] if isinstance(pages, list) else pages
                             hs_code = item.get('commodity_code', 'N/A')
                             desc = item.get('description', 'N/A')[:50]
                             origin = item.get('country_of_origin') or item.get('country_origin') or '—'
