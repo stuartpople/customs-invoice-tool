@@ -5165,6 +5165,9 @@ class LineItemParser:
         'LU', 'IE', 'IS', 'LI', 'MK', 'RS', 'BA', 'ME', 'AL', 'MD', 'BY',
         'AZ', 'AM', 'GE', 'KZ', 'UZ', 'TM', 'TJ', 'KG', 'MN', 'HK', 'TN',
         'MA', 'DZ', 'LY', 'ET', 'KE', 'TZ', 'GH', 'NG', 'ZM', 'ZW',
+        # Region labels that appear in the COC column (not valid CDS countries —
+        # kept so the row still parses; country normaliser flags for review).
+        'EU', 'EC', 'EEA',
     }
     _ATI_ORIGIN_MAP = {
         'UK': 'GB', 'CN': 'CN', 'DE': 'DE', 'NL': 'NL', 'US': 'US',
@@ -5174,9 +5177,15 @@ class LineItemParser:
         'TW': 'TW', 'KR': 'KR', 'BR': 'BR', 'MX': 'MX', 'ZA': 'ZA',
         'AE': 'AE', 'SA': 'SA', 'TR': 'TR', 'TH': 'TH', 'MY': 'MY',
         'HK': 'HK', 'CZ': 'CZ', 'HU': 'HU', 'RO': 'RO', 'RU': 'RU',
+        'EU': 'EU', 'EC': 'EC', 'EEA': 'EEA',
     }
     _ATI_HS_RE  = re.compile(r'^\d{8}$')
+    # "1 OF 1", "1 KIT OF 1", "1 BOX OF 12", "1 MREEL OF 50" — and bare "Box"
     _ATI_UOM_RE = re.compile(r'^\d+\s+\w+', re.IGNORECASE)
+    _ATI_BARE_UOM = frozenset({
+        'BOX', 'EA', 'EACH', 'SET', 'PACK', 'KIT', 'REEL', 'BAG', 'PC', 'PCS',
+        'PAIR', 'PAIRS', 'LOT', 'ROLL', 'CAN', 'TUBE', 'CASE', 'PKT', 'PK',
+    })
     _ATI_NUM_RE = re.compile(r'^[\d,]+\.?\d*$')
     _ATI_HDR_RE = re.compile(
         r'^(Item|Stock\s+No\.|Description|Unit\s+of\s+Measure|Quantity|Unit\s+Price|'
@@ -5378,11 +5387,14 @@ class LineItemParser:
                     hs_code = lines[i]
                     i += 1
 
-                    # UoM
+                    # UoM — "1 OF 1" / "1 BOX OF 12" or bare "Box" (ATI TacTiles etc.)
                     uom = '1 OF 1'
-                    if i < len(lines) and self._ATI_UOM_RE.match(lines[i]):
-                        uom = lines[i]
-                        i += 1
+                    if i < len(lines):
+                        _uom_tok = lines[i]
+                        _uom_first = _uom_tok.split()[0].upper() if _uom_tok else ''
+                        if self._ATI_UOM_RE.match(_uom_tok) or _uom_first in self._ATI_BARE_UOM:
+                            uom = _uom_tok
+                            i += 1
 
                     # Collect 4-5 numeric values: qty, unit_price, total, unit_wt, [line_wt]
                     nums: List[str] = []

@@ -356,13 +356,16 @@ def coverage_warnings(
 
 
 def _carriage_charges_sum(text: str) -> Optional[float]:
-    """Sum Dil Chrg / Carriage amounts from Tintometer-style footers."""
+    """Sum Dil Chrg / Carriage / packing amounts from invoice footers."""
     if not text:
         return None
     vals = []
     for pat in (
         r'Dil\s*Chrg[^0-9]{0,20}([\d,]+(?:\.\d{1,3})?)',
         r'\bCarriage\s+([\d,]+(?:\.\d{2})?)',
+        # ATI / similar: "Packing & Handling Charges      337.27"
+        r'Packing\s*(?:&|and)?\s*Handling\s*(?:Charges?)?[^0-9]{0,20}([\d,]+(?:\.\d{2})?)',
+        r'\bFreight\s*(?:Charges?)?[^0-9]{0,20}([\d,]+(?:\.\d{2})?)',
     ):
         for m in re.finditer(pat, text, re.IGNORECASE):
             v = parse_money(m.group(1))
