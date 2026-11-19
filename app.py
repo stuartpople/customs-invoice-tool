@@ -81,7 +81,7 @@ import shutil
 
 
 # Version tracking for cache busting
-APP_VERSION = "v3.65"
+APP_VERSION = "v3.66"
 
 
 def _normalize_items_hs_for_direction(items: list, direction: str) -> list:

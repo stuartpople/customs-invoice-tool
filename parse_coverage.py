@@ -18,6 +18,8 @@ _JUNK_LINE_RE = re.compile(
     r'consignee|exporter:|page\s+\d+\s+of|tax\s+exclusive|'
     r'total\s+(gbp|usd|eur)\s+incl|grand\s+total|payment\s+terms|'
     r'barclays|hsbc|natwest|lloyds|approved\s+exporter|'
+    # Air waybill / flight refs (e.g. Mawb 235-77355633) are not HS codes
+    r'\bmawb\b|\bhawb\b|air\s*waybill|flight\s*no\.?|'
     # Tintometer remittance: "GBP: 40-42-18 32871957, USD: 40-12-76 74882967"
     r'\b(?:GBP|USD|EUR)\s*[:;]\s*\d{2}-\d{2}-\d{2}\b',
     re.IGNORECASE,
@@ -65,6 +67,9 @@ def is_commodity_hs(code: str) -> bool:
         return False
     chapter = int(digits[:2])
     if not (1 <= chapter <= 97 or chapter == 99):
+        return False
+    # HS chapter 77 is reserved/empty — AWB tails like 77355633 are not tariff codes
+    if chapter == 77:
         return False
     # Chapter 70 (glass) ends at heading 7020 — 70216529 is a bank account, not HS
     heading = int(digits[:4])
@@ -152,11 +157,24 @@ def invoice_total_hint(text: str) -> Optional[float]:
         # ATI: amount often printed on the line above the "Invoice Total" label
         r'([\d,]+(?:\.\d{2})?)\s*(?:\n|\r\n?)\s*Invoice\s+Total\b',
         r'Goods\s+Value[^\d]{0,20}([\d,]+(?:\.\d{2})?)',
+        r'Total\s+Ex\s+Works[^\d]{0,20}([\d,]+(?:\.\d{2})?)',
+        r'Total\s+CPT[^\d]{0,20}([\d,]+(?:\.\d{2})?)',
         r'Total\s+(?:GBP|USD|EUR)\s*:?\s*([\d,]+\.\d{2})',
         r'Tax Exclusive\s+([\d,]+(?:\.\d{2})?)',
     )
     found: List[float] = []
     blob = text or ''
+    # Arrow Export footer: packing / ex-works / CPT stacked above their labels
+    arrow_tot = re.search(
+        r'(?im)^([\d,]+\.\d{2})\s*$\n^([\d,]+\.\d{2})\s*$\n^([\d,]+\.\d{2})\s*$\n'
+        r'^Total\s+CPT\b.*$\n^Total\s+Ex\s+Works\s*$\n^Packing\s*/\s*Delivery',
+        blob,
+    )
+    if arrow_tot:
+        for g in (2, 3):  # ex-works + CPT (prefer max later)
+            val = parse_money(arrow_tot.group(g))
+            if val and val > 0:
+                found.append(val)
     for pat in patterns:
         for m in re.finditer(pat, blob, re.IGNORECASE):
             val = parse_money(m.group(1))
@@ -365,15 +383,27 @@ def _carriage_charges_sum(text: str) -> Optional[float]:
     vals = []
     for pat in (
         r'Dil\s*Chrg[^0-9]{0,20}([\d,]+(?:\.\d{1,3})?)',
-        r'\bCarriage\s+([\d,]+(?:\.\d{2})?)',
+        r'\bCarriage\s+([\d,]+\.\d{2})',
         # ATI / similar: "Packing & Handling Charges      337.27"
-        r'Packing\s*(?:&|and)?\s*Handling\s*(?:Charges?)?[^0-9]{0,20}([\d,]+(?:\.\d{2})?)',
-        r'\bFreight\s*(?:Charges?)?[^0-9]{0,20}([\d,]+(?:\.\d{2})?)',
+        r'Packing\s*(?:&|and)?\s*Handling\s*(?:Charges?)?[^0-9]{0,20}([\d,]+\.\d{2})',
+        # Require "Freight charge(s)" — plain "Air Freight" is a shipment method
+        # and the next digits are often a MAWB prefix (235-77355633), not money.
+        r'\bFreight\s+Charges?[^0-9]{0,20}([\d,]+\.\d{2})',
     ):
         for m in re.finditer(pat, text, re.IGNORECASE):
             v = parse_money(m.group(1))
             if v and v > 0:
                 vals.append(v)
+    # Arrow: packing / ex-works / CPT amounts stacked above their labels
+    arrow = re.search(
+        r'(?im)^([\d,]+\.\d{2})\s*$\n^([\d,]+\.\d{2})\s*$\n^([\d,]+\.\d{2})\s*$\n'
+        r'^Total\s+CPT\b.*$\n^Total\s+Ex\s+Works\s*$\n^Packing\s*/\s*Delivery',
+        text,
+    )
+    if arrow:
+        v = parse_money(arrow.group(1))
+        if v and v > 0:
+            vals.append(v)
     if not vals:
         return None
     # Dedupe OCR echoes of the same charge (838.500 vs 838.50)

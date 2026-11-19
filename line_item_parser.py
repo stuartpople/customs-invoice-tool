@@ -205,7 +205,12 @@ class LineItemParser:
             print("[Parser] Arrow Export '(cc:...)' bracket HS code format detected — using dedicated parser")
             lines = all_text.split('\n')
             items = self._parse_arrow_export_format(lines, direction, page_map)
-            return self._pack_result(items, pages_data, direction, "arrow_export", all_text, page_map)
+            # Dedicated parser owns this layout — AI merge only invents duplicates
+            # when page footers / MAWB digits look like "missing" HS codes.
+            return self._pack_result(
+                items, pages_data, direction, "arrow_export", all_text, page_map,
+                allow_ai=False,
+            )
 
         # ── X-OSIL (Ocean Scientific) / "HS DDDD DDDD DD" spaced HS code format ─
         # Invoices from Ocean Scientific International have HS codes formatted as
@@ -3595,14 +3600,35 @@ class LineItemParser:
             #   "UNIT  TOTAL" pair on one line WITHIN the block; block starts idx+1.
             #
             # Group HS headers: "Parts (cc:8418999099)" can sit above several
-            # numbered lines that share that code (INV00017388). Carry the last
-            # seen (cc:) forward when a child block has no code of its own.
+            # numbered lines that share that code (INV00017388). Carry ONLY
+            # group-header (cc:) forward — never the previous line item's code
+            # (that wrongly assigned washi-tape HS to crayons across a page break).
+            _group_hs_pre = re.compile(
+                r'^(?:parts?|goods?|items?|products?|accessories|hardware|spares?)?\s*$',
+                re.IGNORECASE,
+            )
+            _arrow_skip_line = re.compile(
+                r'^(?:We hereby|Signed\s*:|for\s+ARROW|EORI\s+No|VAT\s+Registration|'
+                r'INV\d+|Page\s+\d+\s+of|Arrow Export|Unit\s+\d+|Test Valley|'
+                r'Test Lane|Nursling|Southampton|SO\d{2}|SOURCE|Date:|British Pound|'
+                r'Currency:|Invoice No|Consignee|Method Shipment|Payment Terms|'
+                r'Bankers\s*:|HSBC Bank|Dorset|Flight No|Mawb\s*:|Description Of Product|'
+                r'Total Price$|Item$|Unit Price$|Qty$|Sent$|Unit$|'
+                r't:\s*\+|f:\s*\+|e:\s*|www\.|Tel:|30 Days from|Air Freight$|Page:|'
+                r'\d{1,2}\s+of\s+\d{1,2}$|Gemma |c/o |Maison |Victoria|Seychelles|'
+                r'Pool & Patel)',
+                re.IGNORECASE,
+            )
             last_group_hs = ""
             for k, idx in enumerate(standalone_indices):
                 look_from = standalone_indices[k - 1] + 1 if k > 0 else 0
                 for j in range(look_from, idx):
-                    gm = re.search(r'\(cc:(\d{8,10})\)', lines[j])
-                    if gm:
+                    raw_j = lines[j].strip()
+                    gm = re.search(r'\(cc:(\d{8,10})\)', raw_j)
+                    if not gm:
+                        continue
+                    pre = raw_j[:gm.start()].strip()
+                    if _group_hs_pre.match(pre):
                         last_group_hs = gm.group(1)
 
                 # Try Layout A: standalone total price on line before item number
@@ -3644,15 +3670,25 @@ class LineItemParser:
                     # Next shipment / order ref starts a new group — stop desc
                     if re.match(r'^[A-Z]{2,}\d{2}-\d{2}-\d+', bl):
                         break
-                    if re.match(r'^(Total|Packing|Signed|We hereby)', bl, re.IGNORECASE):
+                    # Real end-of-invoice footers — stop. Page "We hereby declare"
+                    # footers are skipped below so (cc:) on the next page is kept.
+                    if re.match(
+                        r'^(Total\s+Ex\s+Works|Total\s+CPT|Packing\s+Spec|Packing\s*/)',
+                        bl,
+                        re.IGNORECASE,
+                    ):
                         break
+                    if _arrow_skip_line.match(bl):
+                        continue
                     cc_m = re.search(r'\(cc:(\d{8,10})\)', bl)
                     # Only look for price pair in Layout C (total_value still empty)
                     pair_m = _price_pair_re.search(bl) if not total_value else None
 
                     if cc_m:
                         hs_code = cc_m.group(1)
-                        last_group_hs = hs_code
+                        pre = bl[:cc_m.start()].strip()
+                        if _group_hs_pre.match(pre):
+                            last_group_hs = hs_code
                         desc_text = (bl[:cc_m.start()] + bl[cc_m.end():]).strip()
                         if desc_text:
                             desc_parts.append(desc_text)
