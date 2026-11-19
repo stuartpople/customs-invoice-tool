@@ -81,7 +81,7 @@ import shutil
 
 
 # Version tracking for cache busting
-APP_VERSION = "v3.67"
+APP_VERSION = "v3.68"
 
 
 def _normalize_items_hs_for_direction(items: list, direction: str) -> list:
@@ -171,6 +171,49 @@ def _hs_codes_from_items(items: list) -> list:
         for it in (items or [])
         if it.get('commodity_code')
     })
+
+
+def _remember_layout_parse(result: dict, items: list) -> None:
+    """Snapshot parsed rows + supplier fingerprint for export correction learning."""
+    import copy
+    st.session_state.parsed_items_snapshot = copy.deepcopy(items or [])
+    fp = (result or {}).get('supplier_fingerprint') or {}
+    st.session_state.layout_fingerprint = fp.get('fingerprint') or ''
+    st.session_state.layout_fingerprint_info = fp
+    st.session_state.layout_parser_id = (result or {}).get('format_type') or ''
+    st.session_state.layout_cache_hit = bool((result or {}).get('layout_cache_hit'))
+
+
+def _log_export_layout_corrections(items: list) -> None:
+    """When the user exports, learn from Step-2 edits against the parse snapshot."""
+    fp = st.session_state.get('layout_fingerprint') or ''
+    if not fp:
+        return
+    try:
+        from supplier_layout_cache import (
+            count_item_field_edits,
+            record_export_corrections,
+        )
+        snap = st.session_state.get('parsed_items_snapshot') or []
+        stats = count_item_field_edits(snap, items or [])
+        if not stats.get('fields_changed'):
+            return
+        out = record_export_corrections(
+            fp,
+            parser_id=st.session_state.get('layout_parser_id') or '',
+            fields_changed=int(stats['fields_changed']),
+            sample=stats.get('sample') or [],
+        )
+        st.caption(
+            f"📝 Recorded {stats['fields_changed']} corrected line(s) for layout learning"
+        )
+        if out.get('flagged'):
+            st.info(
+                "🔁 This supplier’s cached layout is flagged to re-learn on the next "
+                "successful dedicated parse (repeated manual edits)."
+            )
+    except Exception as exc:
+        print(f"[LayoutCache] export correction log failed: {exc}")
 
 
 def _run_hs_validation(items: list, direction: str) -> dict:
@@ -413,6 +456,8 @@ if 'app_version' not in st.session_state or st.session_state.app_version != APP_
         'hmrc_results', 'hmrc_consolidate_state', 'hmrc_dest_country',
         'parsed_items', 'parsed_job_ids', 'hs_validation_results',
         'invoice_metadata', 'invoice_number_field', 'invoice_number_input',
+        'parsed_items_snapshot', 'layout_fingerprint', 'layout_fingerprint_info',
+        'layout_parser_id', 'layout_cache_hit',
     ]
     for key in keys_to_clear:
         if key in st.session_state:
@@ -1037,6 +1082,7 @@ if st.session_state.get('non_pdf_processed', False):
                          key="excel_export_btn"):
                 # Create comprehensive Excel export with HMRC data
                 _inv_meta = _export_invoice_metadata(current_direction)
+                _log_export_layout_corrections(display_items)
                 excel_bytes = create_comprehensive_export(
                     items=display_items,
                     hmrc_data=_apply_selected_doc_codes(hmrc_results),
@@ -1061,6 +1107,7 @@ if st.session_state.get('non_pdf_processed', False):
                          help="Export in CDS Customs Entry Worksheet format (auto-splits over 99 lines)."):
                 # FCL export uses the same consolidation as standard Excel
                 _inv_meta = _export_invoice_metadata(current_direction)
+                _log_export_layout_corrections(display_items)
                 _parts = create_cds_excel_parts(
                     items=display_items,
                     direction=current_direction,
@@ -1294,6 +1341,7 @@ elif st.session_state.processing_started and st.session_state.current_job_id:
                     errors = []
                     warnings_acc = []
                     fmt = 'unknown'
+                    last_result: dict = {}
                     
                     # Parse each PDF and combine items
                     for idx, job_id in enumerate(pdf_job_ids, 1):
@@ -1304,6 +1352,7 @@ elif st.session_state.processing_started and st.session_state.current_job_id:
                         
                         try:
                             result = parser.parse_job_items(job_id, job_dir, direction)
+                            last_result = result if isinstance(result, dict) else {}
                             
                             if 'error' in result:
                                 errors.append(f"PDF {idx} ({filename}): {result['error']}")
@@ -1367,7 +1416,10 @@ elif st.session_state.processing_started and st.session_state.current_job_id:
                         'items': all_items,
                         'format_type': fmt,
                         'parse_warning': ' '.join(warnings_acc) if warnings_acc else None,
+                        'supplier_fingerprint': last_result.get('supplier_fingerprint') or {},
+                        'layout_cache_hit': bool(last_result.get('layout_cache_hit')),
                     }
+                    _remember_layout_parse(st.session_state.parsed_items, all_items)
                     st.session_state.parsed_job_ids = pdf_job_ids
                     st.session_state.pop('hs_validation_results', None)
                     st.rerun()
@@ -1477,6 +1529,18 @@ elif st.session_state.processing_started and st.session_state.current_job_id:
                 }
                 fmt_label = fmt_labels.get(fmt_type, fmt_labels['unknown'])
                 st.caption(f"Format detected: {fmt_label}")
+                _fp_info = result.get('supplier_fingerprint') or st.session_state.get('layout_fingerprint_info') or {}
+                if result.get('layout_cache_hit') or st.session_state.get('layout_cache_hit'):
+                    st.info(
+                        f"⚡ Used cached supplier layout `{fmt_type}` "
+                        f"({_fp_info.get('fingerprint') or 'known supplier'}) — no AI"
+                    )
+                elif _fp_info.get('fingerprint'):
+                    st.caption(
+                        f"Supplier fingerprint: `{_fp_info.get('fingerprint')}`"
+                        + (f" — {_fp_info['label']}" if _fp_info.get('label') else "")
+                    )
+                _remember_layout_parse(result, items)
 
                 # Show raw items in a collapsible expander (useful for debugging)
                 with st.expander("📋 View raw parsed items (before consolidation)", expanded=False):
@@ -1875,6 +1939,7 @@ elif st.session_state.processing_started and st.session_state.current_job_id:
                             
                             # Get invoice metadata if available
                             invoice_metadata = _export_invoice_metadata(metadata.get('direction', 'export'))
+                            _log_export_layout_corrections(items)
                             
                             # Create comprehensive Excel export
                             excel_bytes = create_comprehensive_export(
@@ -1899,6 +1964,7 @@ elif st.session_state.processing_started and st.session_state.current_job_id:
                             metadata = processor.get_job_metadata(job_id)
                             hmrc_results = st.session_state.get('hmrc_results', None)
                             invoice_metadata = _export_invoice_metadata(metadata.get('direction', 'export'))
+                            _log_export_layout_corrections(items)
                             
                             # Export respects the consolidation choice:
                             # - If consolidated: pass consolidated df with consolidate=False

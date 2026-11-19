@@ -43,7 +43,146 @@ class LineItemParser:
             if offset >= start:
                 result = num
         return result
-    
+
+    def _dispatch_dedicated_parser(
+        self,
+        parser_id: str,
+        all_text: str,
+        direction: str,
+        page_map: Dict,
+        pages_data: Dict,
+        job_dir: Optional[Path] = None,
+    ) -> Optional[Dict]:
+        """Run one known layout parser by id. Returns packed result or None."""
+        from supplier_layout_cache import DEDICATED_PARSERS
+
+        if parser_id not in DEDICATED_PARSERS:
+            return None
+        lines = all_text.split("\n")
+        pad_to_10 = direction.lower() == "import"
+        items: List[Dict] = []
+        allow_ai = False
+
+        try:
+            if parser_id == "rs_sitpro":
+                items = self._parse_pattern_format(
+                    lines, direction, page_map, explicit_only=True
+                )
+            elif parser_id == "solarlux":
+                items = self._parse_solarlux_format(lines, direction, page_map)
+            elif parser_id == "marlow":
+                items = self._parse_marlow_format(lines, direction, page_map)
+            elif parser_id == "vertical_table_ikf":
+                data_start = 0
+                for i, line in enumerate(lines):
+                    tok = line.strip()
+                    if (
+                        tok.isdigit()
+                        and int(tok) == 1
+                        and i + 1 < len(lines)
+                        and self._is_ikf_stock_number(lines[i + 1])
+                    ):
+                        data_start = i
+                        break
+                items = (
+                    self._parse_vertical_table_ikf(
+                        lines, data_start, 12, direction, page_map, pad_to_10
+                    )
+                    if data_start
+                    else []
+                )
+            elif parser_id == "arrow_export":
+                items = self._parse_arrow_export_format(lines, direction, page_map)
+            elif parser_id == "xosil":
+                items = self._parse_xosil_format(all_text, direction, page_map)
+            elif parser_id == "sugatsune":
+                items = self._finalize_parsed_items(
+                    self._parse_sugatsune_format(lines, direction, page_map),
+                    all_text,
+                )
+            elif parser_id == "tintometer":
+                items = self._finalize_parsed_items(
+                    self._parse_tintometer_format(lines, direction, page_map),
+                    all_text,
+                )
+            elif parser_id == "yacht_package":
+                items = self._finalize_parsed_items(
+                    self._parse_yacht_package_format(lines, direction, page_map),
+                    all_text,
+                )
+            elif parser_id == "noc_scientific":
+                items = self._finalize_parsed_items(
+                    self._parse_noc_scientific_format(lines, direction, page_map),
+                    all_text,
+                )
+            elif parser_id in ("bas_commercial", "goods_description_commodity"):
+                items = self._finalize_parsed_items(
+                    self._parse_bas_commercial_format(lines, direction, page_map),
+                    all_text,
+                )
+                parser_id = "bas_commercial"
+            elif parser_id == "ati":
+                pdf_path = ""
+                if job_dir:
+                    metadata_path = Path(job_dir) / "metadata.json"
+                    if metadata_path.exists():
+                        with open(metadata_path) as _mf:
+                            pdf_path = (json.load(_mf) or {}).get("pdf_path", "")
+                if pdf_path and Path(pdf_path).exists():
+                    import fitz as _fitz_ati
+                    _ati_doc = _fitz_ati.open(pdf_path)
+                    items = self._parse_ati_format(_ati_doc, direction, page_map)
+                    _ati_doc.close()
+                else:
+                    return None
+            else:
+                return None
+        except Exception as exc:
+            print(f"[LayoutCache] dispatch {parser_id} failed: {exc}")
+            return None
+
+        if not items:
+            return None
+        return self._pack_result(
+            items,
+            pages_data,
+            direction,
+            parser_id,
+            all_text,
+            page_map,
+            allow_ai=allow_ai,
+        )
+
+    def _attach_layout_cache(
+        self,
+        packed: Dict,
+        fingerprint_info: Dict,
+        *,
+        cache_hit: bool = False,
+        source: str = "detect",
+    ) -> Dict:
+        """Stamp fingerprint on the result and remember successful dedicated parses."""
+        if not isinstance(packed, dict):
+            return packed
+        packed["supplier_fingerprint"] = fingerprint_info or {}
+        packed["layout_cache_hit"] = bool(cache_hit)
+        try:
+            from supplier_layout_cache import (
+                DEDICATED_PARSERS,
+                record_parse_success,
+            )
+            fmt = packed.get("format_type") or ""
+            if (
+                fmt in DEDICATED_PARSERS
+                and packed.get("items")
+                and not packed.get("parse_warning")
+                and (fingerprint_info or {}).get("fingerprint")
+            ):
+                record_parse_success(fingerprint_info, fmt, source=source)
+        except Exception as exc:
+            print(f"[LayoutCache] record failed: {exc}")
+        return packed
+
     def parse_job_items(self, job_id: str, job_dir: Path, direction: str = "export") -> Dict:
         """
         Parse line items from a completed job's pages.json
@@ -83,6 +222,43 @@ class LineItemParser:
 
         # Clean up OCR text before extraction
         ocr_text = clean_ocr_text(all_text)
+
+        # ── Supplier layout cache: reuse the dedicated parser that worked before ─
+        from supplier_layout_cache import (
+            classify_layout_hint,
+            extract_supplier_fingerprint,
+            get_cached_parser,
+        )
+        fp_info = extract_supplier_fingerprint(all_text)
+        self._current_fingerprint = fp_info
+        self._layout_source = "detect"
+        self._layout_cache_hit = False
+        _fp_key = (fp_info or {}).get("fingerprint")
+        if _fp_key:
+            _cached = get_cached_parser(_fp_key)
+            if _cached and not int(_cached.get("needs_regen") or 0):
+                _pid = _cached.get("parser_id") or ""
+                print(
+                    f"[LayoutCache] hit {_fp_key} → {_pid} "
+                    f"(successes={_cached.get('success_count')})"
+                )
+                self._layout_source = "cache"
+                self._layout_cache_hit = True
+                _cached_packed = self._dispatch_dedicated_parser(
+                    _pid, all_text, direction, page_map, pages_data, job_dir
+                )
+                if (
+                    _cached_packed
+                    and _cached_packed.get("items")
+                    and not _cached_packed.get("parse_warning")
+                ):
+                    return _cached_packed
+                print(
+                    "[LayoutCache] cached parser returned gaps — "
+                    "falling through to detectors"
+                )
+                self._layout_source = "detect"
+                self._layout_cache_hit = False
 
         # ── Format pre-detection: skip AI for known regex-handled formats ─────
         # RS Components SITPRO invoices have "HS export code XXXXXXXX" on its own
@@ -404,6 +580,42 @@ class LineItemParser:
         # 1. Google Gemini Flash — free tier, 1,500 req/day, no credit card needed
         google_key = self._get_secret("GOOGLE_API_KEY")
         if google_key:
+            # Cheap layout classify first: one tiny request → dedicated parser,
+            # instead of extracting every line item with AI.
+            try:
+                _first_page = ""
+                for _pg in pages_data.get("pages") or []:
+                    if _pg.get("status") == "success" and (_pg.get("text") or "").strip():
+                        _first_page = _pg.get("text") or ""
+                        break
+                if not _first_page:
+                    _first_page = all_text[:6000]
+                _hint = classify_layout_hint(_first_page, google_key)
+                if (
+                    _hint
+                    and _hint.get("parser_id")
+                    and float(_hint.get("confidence") or 0) >= 0.75
+                ):
+                    print(
+                        f"[LayoutCache] Gemini hint → {_hint.get('parser_id')} "
+                        f"(conf={_hint.get('confidence')}) — {_hint.get('reason', '')}"
+                    )
+                    self._layout_source = "gemini_hint"
+                    _hint_packed = self._dispatch_dedicated_parser(
+                        _hint["parser_id"],
+                        all_text,
+                        direction,
+                        page_map,
+                        pages_data,
+                        job_dir,
+                    )
+                    if _hint_packed and _hint_packed.get("items"):
+                        _hint_packed["layout_hint"] = _hint
+                        return _hint_packed
+                    self._layout_source = "detect"
+            except Exception as _hint_err:
+                print(f"[LayoutCache] classify skipped: {_hint_err}")
+
             try:
                 from llm_extractor import extract_with_gemini
                 llm_items, llm_meta = extract_with_gemini(all_text, google_key)
@@ -417,7 +629,6 @@ class LineItemParser:
                     print(f"[Gemini extractor] returned {len(llm_items)} items but failed quality/grounding — falling back to regex")
             except Exception as _err:
                 print(f"[Gemini extractor] failed, trying OpenAI: {_err}")
-
         # 2. OpenAI GPT-4o-mini — ~£0.001 per invoice
         openai_key = self._get_secret("OPENAI_API_KEY")
         if openai_key:
@@ -681,7 +892,12 @@ class LineItemParser:
         if warnings:
             result["parse_warning"] = " ".join(warnings)
             print(f"[Coverage] {result['parse_warning']}")
-        return result
+        return self._attach_layout_cache(
+            result,
+            getattr(self, "_current_fingerprint", {}) or {},
+            cache_hit=bool(getattr(self, "_layout_cache_hit", False)),
+            source=str(getattr(self, "_layout_source", "detect") or "detect"),
+        )
 
     def _get_secret(self, key_name: str) -> Optional[str]:
         """

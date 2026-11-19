@@ -131,6 +131,8 @@ test_job_rs605/
 
 # Cache files
 countries_cache.json
+supplier_layout_cache.db
+conversion_history.db
 
 # Miniconda installer
 Miniconda3-*.exe
