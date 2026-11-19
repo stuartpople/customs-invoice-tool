@@ -44,6 +44,13 @@ def test_inv17403_pdf_if_available():
     assert len(items) == 41
     assert by['37']['commodity_code'].startswith('96099090')
     assert 'crayon' in by['37']['description'].lower()
+    assert 'gift for boys' in by['37']['description'].lower()
+    assert 'we hereby' not in by['37']['description'].lower()
+    assert '235-77355633' not in by['37']['description']
+    # Item 19 description continues onto page 2 with size + (cc:)
+    assert by['19']['commodity_code'].startswith('63049200')
+    assert '50x50cm' in by['19']['description']
+    assert 'uk origin' not in by['19']['description'].lower()
     assert by['38']['commodity_code'].startswith('39191019')
     assert abs(items_total(items) - 872.51) < 0.05
     _, _, warnings = coverage_warnings(items, text)

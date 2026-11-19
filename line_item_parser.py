@@ -3608,7 +3608,9 @@ class LineItemParser:
                 re.IGNORECASE,
             )
             _arrow_skip_line = re.compile(
-                r'^(?:We hereby|Signed\s*:|for\s+ARROW|EORI\s+No|VAT\s+Registration|'
+                r'^(?:'
+                r'We hereby|and that the goods|Signed\s*:|for\s+ARROW|'
+                r'EORI\s+No|VAT\s+Registration|'
                 r'INV\d+|Page\s+\d+\s+of|Arrow Export|Unit\s+\d+|Test Valley|'
                 r'Test Lane|Nursling|Southampton|SO\d{2}|SOURCE|Date:|British Pound|'
                 r'Currency:|Invoice No|Consignee|Method Shipment|Payment Terms|'
@@ -3616,7 +3618,10 @@ class LineItemParser:
                 r'Total Price$|Item$|Unit Price$|Qty$|Sent$|Unit$|'
                 r't:\s*\+|f:\s*\+|e:\s*|www\.|Tel:|30 Days from|Air Freight$|Page:|'
                 r'\d{1,2}\s+of\s+\d{1,2}$|Gemma |c/o |Maison |Victoria|Seychelles|'
-                r'Pool & Patel)',
+                r'Pool & Patel|'
+                r'\d{1,2}\s+[A-Z]{3}\s+20\d{2}$|'  # invoice date "19 NOV 2026"
+                r'\d{3}-\d{8}$'  # MAWB "235-77355633"
+                r')',
                 re.IGNORECASE,
             )
             last_group_hs = ""
